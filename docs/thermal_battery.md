@@ -243,10 +243,13 @@ The temperature dynamics in hot water tank mode:
 
 ```
 conversion = 3600 / (density * heat_capacity * volume)
+thermal_loss_energy = thermal_loss * dt   # kW rate -> kWh for this timestep
 
 predicted_temp[t+1] = predicted_temp[t]
-    + conversion * (cop[t] * p_deferrable[t] / 1000 * dt - draw_off_demand[t] - thermal_loss)
+    + conversion * (cop[t] * p_deferrable[t] / 1000 * dt - draw_off_demand[t] - thermal_loss_energy)
 ```
+
+`thermal_loss` is configured and documented as a constant **kW** rate; `draw_off_demand[t]` and the heater term are already **kWh** for that timestep. The `thermal_loss * dt` conversion above is applied internally so the standby-loss energy removed each timestep scales correctly with the optimisation timestep duration - a 5-minute timestep removes 1/12th the standby-loss energy of a 60-minute timestep, not the same fixed amount. You do not need to pre-scale `thermal_loss` yourself; always supply it in kW regardless of your configured timestep.
 
 ### Weather-compensated minimum temperature (radiator emission floor)
 
@@ -892,6 +895,8 @@ Loss = thermal_loss  (constant, not dependent on outdoor temperature)
 ```
 
 This is appropriate because a tank sits indoors at roughly constant ambient temperature.
+
+In both modes, `Loss` above is a **kW** magnitude; it is converted internally to kWh for the current timestep (`Loss × dt`) before being subtracted in the temperature balance, exactly as shown in the hot-water-tank dynamics equation earlier in this document. This keeps `thermal_loss` timestep-invariant: the same kW value produces proportionally less standby-loss energy at a 5-minute timestep than at a 60-minute one.
 
 ### 3. Heating demand / draw-off demand
 
