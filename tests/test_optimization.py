@@ -4707,6 +4707,215 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         # Heating energy should be at least the draw-off demand (COP amplifies electrical input)
         self.assertGreater(total_heating, 0, "Heat pump must run to compensate draw-off demand")
 
+    def test_thermal_loss_timestep_invariant(self):
+        """thermal_loss (documented as a constant kW rate) must produce a
+        timestep-invariant standby-loss RATE in DHW/draw_off_demand mode.
+
+        Regression test for the fix where thermal_loss was used directly as a
+        fixed per-timestep energy subtraction (kWh), making the effective
+        standby-loss power scale inversely with timestep length (5-min steps
+        removed 12x more power than intended; 30-min steps removed 2x more).
+
+        Test plant matches the installed Thermann Smart Electric Storage
+        250THMW130 Phase-1 physical model constants (259 L, water properties,
+        direct-electric efficiency=1.0).
+
+        The primary assertion exercises the REAL constraint-construction
+        method (_resolve_draw_off_demand, called from
+        _add_thermal_battery_constraints on both the fresh-build and
+        parameterized/cache-hit paths, and from
+        _add_shared_thermal_tank_constraints) at full CVXPY-input precision.
+        perform_optimization's `predicted_temp_heater{k}` output column is
+        rounded to 2 decimal places (see optimization.py, "Thermal Details"
+        section), which would mask the defect entirely at the 5-minute
+        timestep (expected delta_T=0.0097 rounds to 0.01) - so a secondary,
+        coarser end-to-end solve is used only as a sanity check with a
+        tolerance appropriate to that rounding, not as the precise check.
+        """
+        base_loss_kw = 0.035
+        density, heat_capacity, volume = 1000, 4.186, 0.259
+        conversion = 3600 / (density * heat_capacity * volume)
+
+        # (timestep_minutes, expected_first_step_delta_T_degC)
+        cases = [
+            (5, -0.0096848),
+            (30, -0.0581088),
+            (60, -0.1162175),
+        ]
+
+        for timestep_min, expected_delta_t in cases:
+            with self.subTest(timestep_min=timestep_min):
+                retrieve_hass_conf = dict(self.retrieve_hass_conf)
+                retrieve_hass_conf["optimization_time_step"] = pd.Timedelta(
+                    minutes=timestep_min
+                )
+                opt = self.create_optimization(retrieve_hass_conf=retrieve_hass_conf)
+                dt_hours = timestep_min / 60.0
+                self.assertAlmostEqual(opt.time_step, dt_hours, places=9)
+
+                hc = {
+                    "thermal_loss": base_loss_kw,
+                    "draw_off_demand": [0.0] * 6,
+                }
+                hot_water = opt._resolve_draw_off_demand(hc, base_loss_kw, 6)
+                self.assertIsNotNone(hot_water)
+                demand_arr, loss_arr = hot_water
+
+                # Exact-precision check of the quantity the bug affected directly.
+                expected_loss_energy_kwh = base_loss_kw * dt_hours
+                np.testing.assert_allclose(
+                    loss_arr,
+                    np.full(6, expected_loss_energy_kwh),
+                    atol=1e-9,
+                    err_msg=f"timestep={timestep_min}min: thermal_losses is not "
+                    "scaled by dt_hours (kW rate -> kWh/timestep conversion missing)",
+                )
+
+                # First-step temperature decrement implied by this exact loss
+                # value, via the same equation used in the real constraint
+                # (predicted_temp[1] = predicted_temp[0] + conversion*(0 - 0 - loss)).
+                implied_delta_t = -conversion * expected_loss_energy_kwh
+                self.assertAlmostEqual(implied_delta_t, expected_delta_t, places=6)
+
+                # Core invariant: inferred continuous heat-loss power equals the
+                # configured thermal_loss regardless of timestep.
+                inferred_loss_kw = -implied_delta_t / conversion / dt_hours
+                self.assertAlmostEqual(inferred_loss_kw, base_loss_kw, places=9)
+
+        # Secondary coarse end-to-end sanity check (30-minute case only,
+        # tolerance-adjusted for the output column's 2-decimal-place rounding):
+        # a real solve should still show a negative first-step temperature
+        # change of roughly the expected magnitude when nothing else drives it.
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        n_periods = 6
+        self.optim_conf["def_load_config"] = [
+            {
+                "thermal_battery": {
+                    "start_temperature": 50.0,
+                    "volume": volume,
+                    "density": density,
+                    "heat_capacity": heat_capacity,
+                    "efficiency": 1.0,
+                    "thermal_loss": base_loss_kw,
+                    "draw_off_demand": [0.0] * n_periods,
+                    "min_temperatures": [0.0] * n_periods,
+                    "max_temperatures": [100.0] * n_periods,
+                }
+            }
+        ]
+        opt = self.create_optimization()
+        data = self.df_input_data_dayahead.iloc[:n_periods].copy()
+        unit_load_cost = data[opt.var_load_cost].values
+        unit_prod_price = data[opt.var_prod_price].values
+        opt_res = opt.perform_optimization(
+            data,
+            self.p_pv_forecast.values.ravel()[:n_periods],
+            self.p_load_forecast.values.ravel()[:n_periods],
+            unit_load_cost,
+            unit_prod_price,
+        )
+        self.assertEqual(opt_res["optim_status"].unique()[0], "Optimal")
+        self.assertIn("predicted_temp_heater0", opt_res.columns)
+        dispatch_t0 = opt_res["P_deferrable0"].iloc[0]
+        self.assertAlmostEqual(
+            dispatch_t0,
+            0.0,
+            places=4,
+            msg="Test precondition violated: heater dispatched at t=0",
+        )
+        predicted_temp = opt_res["predicted_temp_heater0"]
+        actual_delta_t = predicted_temp.iloc[1] - predicted_temp.iloc[0]
+        # 30-minute expected delta_T is -0.058 degC; the 2-decimal-place output
+        # rounds this to -0.06 (or occasionally -0.05 depending on solver noise
+        # at the boundary) - assert only that it is small, negative, and not
+        # the old buggy per-timestep-energy value (-0.12, which would round to
+        # -0.12, clearly distinguishable at this tolerance).
+        self.assertLess(actual_delta_t, 0.0)
+        self.assertGreaterEqual(actual_delta_t, -0.09)
+
+    def test_thermal_loss_timestep_scaling_survives_cache_hit(self):
+        """update_thermal_params (the cache-hit / rolling-MPC runtime-update
+        path) must apply the same kW->kWh/timestep conversion as the initial
+        constraint build, not silently retain an unscaled loss vector.
+        """
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        base_loss_kw = 0.035
+
+        config = {
+            "start_temperature": 50.0,
+            "volume": 0.259,
+            "density": 1000,
+            "heat_capacity": 4.186,
+            "efficiency": 1.0,
+            "thermal_loss": base_loss_kw,
+            "draw_off_demand": [0.0] * 48,
+            "min_temperatures": [0.0] * 48,
+            "max_temperatures": [100.0] * 48,
+        }
+        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
+        opt = self.create_optimization()
+
+        # Initial solve establishes opt.param_thermal[0] (the CVXPY-parameterized
+        # cache entry reused on subsequent rolling-MPC calls).
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+        opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+        self.assertIn(0, opt.param_thermal)
+
+        # Deliberately corrupt the cached loss vector to the OLD buggy
+        # (unscaled) value, so the assertion below only passes if
+        # update_thermal_params actually rewrites it correctly rather than
+        # leaving a stale/incorrect vector untouched.
+        opt.param_thermal[0]["thermal_losses"].value = np.full(48, base_loss_kw)
+
+        # Simulate a cache-hit runtime update (as performed each rolling-MPC step).
+        opt.update_thermal_params(
+            self.optim_conf, self.df_input_data_dayahead, self.p_load_forecast.values.ravel()
+        )
+
+        expected_loss_energy = base_loss_kw * opt.time_step
+        actual = opt.param_thermal[0]["thermal_losses"].value
+        np.testing.assert_allclose(
+            actual,
+            np.full(48, expected_loss_energy),
+            atol=1e-9,
+            err_msg="update_thermal_params (cache-hit path) did not apply the "
+            "kW->kWh/timestep conversion to thermal_losses",
+        )
+
+    def test_shared_thermal_tank_dhw_thermal_loss_timestep_scaled(self):
+        """Shared thermal tanks resolve draw_off_demand mode through the same
+        _resolve_draw_off_demand helper as single-source thermal_battery; verify
+        that path also returns a correctly timestep-scaled standby-loss array.
+        """
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        base_loss_kw = 0.035
+        opt = self.create_optimization()
+
+        tank_config = {
+            "thermal_loss": base_loss_kw,
+            "draw_off_demand": [0.0] * 6,
+        }
+        hot_water = opt._resolve_draw_off_demand(tank_config, base_loss_kw, 6)
+        self.assertIsNotNone(hot_water)
+        _, loss_arr = hot_water
+
+        expected_loss_energy = base_loss_kw * opt.time_step
+        np.testing.assert_allclose(
+            loss_arr,
+            np.full(6, expected_loss_energy),
+            atol=1e-9,
+            err_msg="Shared-tank DHW mode's standby loss is not timestep-scaled "
+            "(_resolve_draw_off_demand is the shared helper used by "
+            "_add_shared_thermal_tank_constraints)",
+        )
+
     def test_inverter_stress_cost_discharge_spread(self):
         """Test that inverter stress cost encourages spreading discharge over time."""
         # Setup plant configuration for hybrid inverter with battery
