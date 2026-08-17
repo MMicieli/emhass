@@ -37,21 +37,21 @@
     },
     "current_period_peak": {
       "friendly_name": "Current billing-period peak grid import",
-      "Description": "Optional billed peak already incurred in the current billing period, in Watts. With capacity_charge_interval_timesteps=1 use the highest eligible positive-import timestep; with N>1 use the highest eligible completed tariff-interval average. The currently open interval belongs in capacity_charge_current_interval_history. Only used by naive-mpc-optim when capacity_cost_per_kw > 0; invalid values are ignored with a warning.",
+      "Description": "Optional billed peak already incurred in the current billing period, in Watts. With capacity_charge_interval_timesteps=1 use the highest eligible positive-import timestep; with N>1 use the highest eligible completed tariff-interval average. The currently open interval belongs in capacity_charge_current_interval_history. Only used by naive-mpc-optim when capacity_cost_per_kw > 0; invalid values are ignored with a warning. When capacity_cost_per_kw is a list of K rates (issue #540 Part B), this must be a list of exactly K entries (one incumbent per component, independently validated) rather than a single value; a wrong-length list is ignored for every component with a warning, never partially applied.",
       "input": "float",
       "default_value": null,
       "unit": "W"
     },
     "capacity_charge_window": {
       "friendly_name": "Capacity charge demand-window mask",
-      "Description": "Optional prediction_horizon-length mask of weights in [0, 1] selecting the tariff demand window. With N=1 it applies per timestep; with N>1 the weight at each completed interval endpoint is used, so tariff-window boundaries should align with measurement-interval boundaries. The caller owns calendar rules. Only used by naive-mpc-optim when capacity_cost_per_kw > 0; invalid short or non-finite masks are ignored with a warning.",
+      "Description": "Optional prediction_horizon-length mask of weights in [0, 1] selecting the tariff demand window. With N=1 it applies per timestep; with N>1 the weight at each completed interval endpoint is used, so tariff-window boundaries should align with measurement-interval boundaries. The caller owns calendar rules. Only used by naive-mpc-optim when capacity_cost_per_kw > 0; invalid short or non-finite masks are ignored with a warning. When capacity_cost_per_kw is a list of K rates (issue #540 Part B), this must be a list of exactly K independent prediction_horizon-length masks (one per component, never shared or reused between components) rather than a single mask; a wrong-length outer list is ignored for every component with a warning.",
       "input": "array.float",
       "default_value": null,
       "unit": "none"
     },
     "capacity_charge_current_interval_history": {
       "friendly_name": "Realised import history for the open tariff interval",
-      "Description": "Optional average positive grid-import power in Watts for native timesteps already elapsed in the currently open tariff interval, oldest to newest. Length 0..capacity_charge_interval_timesteps-1 encodes the interval phase. Only used by naive-mpc-optim when capacity_cost_per_kw > 0 and N>1; invalid history is ignored with a warning and treated as empty.",
+      "Description": "Optional average positive grid-import power in Watts for native timesteps already elapsed in the currently open tariff interval, oldest to newest. Length 0..capacity_charge_interval_timesteps-1 encodes the interval phase. Only used by naive-mpc-optim when capacity_cost_per_kw > 0 and N>1; invalid history is ignored with a warning and treated as empty. When capacity_cost_per_kw is a list of K rates (issue #540 Part B), this must be a list of exactly K independent histories (one per component, against that component's own capacity_charge_interval_timesteps) rather than a single history; a wrong-length outer list is ignored for every component with a warning.",
       "input": "array.float",
       "default_value": null,
       "unit": "W"

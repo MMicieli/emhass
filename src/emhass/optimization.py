@@ -311,27 +311,64 @@ class Optimization:
         # Optional intermediate SOC target parameters (issue #553)
         self._init_soc_target_params()
 
-        # Peak grid import already incurred this billing period (issue #623, Phase 2)
-        self._init_current_period_peak_param()
-
-        # Per-timestep demand-window mask for the capacity charge (issue #623, Phase 3)
-        self._init_capacity_window_param()
-
-        # Tariff measurement-interval aggregation for the capacity charge (#540).
-        # Structural (part of optim_conf, so it is automatically covered by
-        # OptimizationCacheKey's generic optim_conf_structural_hash - see
-        # command_line.py._compute_cache_key): read once here, not re-read per
-        # call, and a change to it goes through a brand-new Optimization object.
-        self.capacity_charge_interval_timesteps = self._get_capacity_charge_interval_timesteps()
-        # Active only when the capacity charge is on AND N > 1 is requested;
-        # gates whether the A @ p_grid_pos + c interval-matrix machinery
-        # (below) is ever created, updated or read - see
-        # _initialize_decision_variables for the N == 1 / off legacy path.
-        self._capacity_interval_aggregation_active = (
-            self._get_capacity_cost_per_kw() > 0 and self.capacity_charge_interval_timesteps > 1
+        # Capacity / demand charge (issue #623, #540, #540 Part B). Structural
+        # routing decided once here, from the SHAPE of capacity_cost_per_kw:
+        # a bare scalar (or the key absent) is the untouched legacy K=1 path
+        # below; a list/tuple explicitly opts into the multi-component path
+        # (issue #540 Part B), with K = len(list). This is part of optim_conf
+        # so it is automatically covered by OptimizationCacheKey's generic
+        # optim_conf_structural_hash (see command_line.py._compute_cache_key):
+        # a change to the shape or length goes through a brand-new
+        # Optimization object, exactly like number_of_batteries /
+        # number_of_deferrable_loads.
+        self._capacity_multi = isinstance(
+            self.optim_conf.get("capacity_cost_per_kw", 0.0), (list, tuple)
         )
-        if self._capacity_interval_aggregation_active:
-            self._init_capacity_interval_params()
+        if not self._capacity_multi:
+            # ---- K=1 legacy path (#623/#1066/#540), UNCHANGED ----
+            # Peak grid import already incurred this billing period (issue #623, Phase 2)
+            self._init_current_period_peak_param()
+
+            # Per-timestep demand-window mask for the capacity charge (issue #623, Phase 3)
+            self._init_capacity_window_param()
+
+            # Tariff measurement-interval aggregation for the capacity charge (#540).
+            self.capacity_charge_interval_timesteps = self._get_capacity_charge_interval_timesteps()
+            # Active only when the capacity charge is on AND N > 1 is requested;
+            # gates whether the A @ p_grid_pos + c interval-matrix machinery
+            # (below) is ever created, updated or read - see
+            # _initialize_decision_variables for the N == 1 / off legacy path.
+            self._capacity_interval_aggregation_active = (
+                self._get_capacity_cost_per_kw() > 0 and self.capacity_charge_interval_timesteps > 1
+            )
+            if self._capacity_interval_aggregation_active:
+                self._init_capacity_interval_params()
+        else:
+            # ---- K>1 multi-component path (issue #540 Part B) ----
+            raw_cost = self.optim_conf.get("capacity_cost_per_kw", [0.0])
+            self.n_capacity_components = len(raw_cost) if len(raw_cost) > 0 else 1
+            self._capacity_cost_per_kw_list = self._get_capacity_cost_per_kw_list()
+            self._capacity_charge_interval_timesteps_list = (
+                self._get_capacity_charge_interval_timesteps_list()
+            )
+            # Per-component gate, mirroring the K=1 gate exactly but applied
+            # independently per component: a component with cost <= 0 gets no
+            # peak_import variable, no Parameters, no objective term, and its
+            # own interval-aggregation machinery (if N_k > 1) is never built -
+            # "a component with zero capacity cost must have no economic
+            # effect" (issue #540 Part B).
+            self._capacity_interval_aggregation_active_list = [
+                (
+                    self._capacity_cost_per_kw_list[k] > 0
+                    and self._capacity_charge_interval_timesteps_list[k] > 1
+                )
+                for k in range(self.n_capacity_components)
+            ]
+            self._init_capacity_window_params_multi()
+            self._init_current_period_peak_params_multi()
+            for k in range(self.n_capacity_components):
+                if self._capacity_interval_aggregation_active_list[k]:
+                    self._init_capacity_interval_params_k(k)
 
         # Initialize deferrable load parameters (window masks and energy constraints)
         self._init_deferrable_load_params()
@@ -479,6 +516,134 @@ class Optimization:
             k_max, nonneg=True, name="capacity_realised_contribution"
         )
         self.param_capacity_realised_contribution.value = np.zeros(k_max)
+
+    def _validate_capacity_window(self, mask, context: str = "") -> np.ndarray:
+        """Shared implementation of ``capacity_charge_window`` validation:
+        the K=1 legacy inline logic in ``perform_optimization``, factored out
+        so the K>1 per-component path (issue #540 Part B) can reuse it
+        without duplicating ~25 lines of validation. Returns a validated
+        length-``num_timesteps`` array of weights in [0, 1]; any invalid
+        input (non-numeric, NaN/inf, too short) falls back to all-ones
+        (full-horizon peak pricing) with a warning. ``context`` is an
+        optional message prefix for K>1 callers; empty for the legacy K=1
+        caller so existing log text is byte-identical. Callers are
+        responsible for the outer ``capacity_cost_per_kw > 0 and mask is not
+        None`` gate - this function does not skip validation on its own.
+        """
+        window_mask = np.ones(self.num_timesteps)
+        try:
+            mask_arr = np.asarray(mask, dtype=float).ravel()
+        except (TypeError, ValueError):
+            self.logger.warning(
+                f"{context}Invalid capacity_charge_window (non-numeric entries): "
+                f"{mask!r}; ignoring it (full-horizon peak pricing)."
+            )
+            return window_mask
+        if not np.all(np.isfinite(mask_arr)):
+            self.logger.warning(
+                f"{context}capacity_charge_window contains NaN/inf entries; "
+                "ignoring it (full-horizon peak pricing)."
+            )
+            return window_mask
+        if len(mask_arr) < self.num_timesteps:
+            self.logger.warning(
+                f"{context}capacity_charge_window has {len(mask_arr)} entries but the "
+                f"horizon is {self.num_timesteps}; ignoring it "
+                "(full-horizon peak pricing)."
+            )
+            return window_mask
+        if len(mask_arr) > self.num_timesteps:
+            self.logger.debug(
+                f"{context}capacity_charge_window has {len(mask_arr)} entries; "
+                f"truncating to the {self.num_timesteps}-step horizon."
+            )
+            mask_arr = mask_arr[: self.num_timesteps]
+        if np.any(mask_arr < 0) or np.any(mask_arr > 1):
+            self.logger.warning(
+                f"{context}capacity_charge_window entries outside [0, 1]; clipping."
+            )
+            mask_arr = np.clip(mask_arr, 0.0, 1.0)
+        self.logger.debug(
+            f"{context}Capacity charge: demand-window mask active on "
+            f"{int(np.count_nonzero(mask_arr))}/{self.num_timesteps} timesteps."
+        )
+        return mask_arr
+
+    def _validate_current_period_peak(self, value, context: str = "") -> float:
+        """Shared implementation of ``current_period_peak`` coercion: the K=1
+        legacy inline logic in ``perform_optimization``, factored out so the
+        K>1 per-component path (issue #540 Part B) can reuse it. Returns a
+        finite, non-negative Watts float; any invalid input (non-numeric,
+        NaN/inf, negative) falls back to 0.0 (no incurred-peak floor) with a
+        warning. ``context`` is an optional message prefix for K>1 callers;
+        empty for the legacy K=1 caller so existing log text is
+        byte-identical. Callers are responsible for the outer
+        ``capacity_cost_per_kw > 0 and value is not None`` gate.
+        """
+        try:
+            peak_floor_w = float(value)
+        except (TypeError, ValueError):
+            self.logger.warning(
+                f"{context}Invalid current_period_peak value ({value!r}); "
+                "ignoring it (no incurred-peak floor applied)."
+            )
+            return 0.0
+        if not isfinite(peak_floor_w) or peak_floor_w < 0:
+            self.logger.warning(
+                f"{context}current_period_peak must be a finite number >= 0 (Watts), got "
+                f"{value!r}; ignoring it (no incurred-peak floor applied)."
+            )
+            return 0.0
+        return peak_floor_w
+
+    def _init_capacity_window_params_multi(self) -> None:
+        """Multi-component (issue #540 Part B) analogue of
+        ``_init_capacity_window_param``: one independent per-horizon window
+        Parameter per component, each defaulting to all-ones. A component's
+        window is never shared with, copied from, or influenced by any other
+        component's window (Part B invalid-input requirement: never
+        silently reuse one component's window as another's)."""
+        self.param_capacity_window_k = [
+            cp.Parameter(self.num_timesteps, nonneg=True, name=f"capacity_window_mask_{k}")
+            for k in range(self.n_capacity_components)
+        ]
+        for k in range(self.n_capacity_components):
+            self.param_capacity_window_k[k].value = np.ones(self.num_timesteps)
+
+    def _init_current_period_peak_params_multi(self) -> None:
+        """Multi-component (issue #540 Part B) analogue of
+        ``_init_current_period_peak_param``: one independent scalar incumbent
+        Parameter per component, each defaulting to 0.0. Scalar, so (like
+        the legacy K=1 Parameter) it is NOT re-created on horizon resize."""
+        self.param_current_period_peak_k = [
+            cp.Parameter(nonneg=True, name=f"current_period_peak_{k}")
+            for k in range(self.n_capacity_components)
+        ]
+        for k in range(self.n_capacity_components):
+            self.param_current_period_peak_k[k].value = 0.0
+
+    def _init_capacity_interval_params_k(self, k: int) -> None:
+        """Multi-component (issue #540 Part B) analogue of
+        ``_init_capacity_interval_params`` for one component ``k`` whose own
+        interval-aggregation path is active
+        (``self._capacity_interval_aggregation_active_list[k]``). Shape
+        depends on horizon length and that component's own structural N -
+        never another component's."""
+        if not hasattr(self, "param_capacity_interval_matrix_k"):
+            self.param_capacity_interval_matrix_k = [None] * self.n_capacity_components
+            self.param_capacity_realised_contribution_k = [None] * self.n_capacity_components
+        interval_n = self._capacity_charge_interval_timesteps_list[k]
+        k_max = ceil(self.num_timesteps / interval_n)
+        matrix_param = cp.Parameter(
+            (k_max, self.num_timesteps), nonneg=True, name=f"capacity_interval_matrix_{k}"
+        )
+        matrix_param.value = np.zeros((k_max, self.num_timesteps))
+        contribution_param = cp.Parameter(
+            k_max, nonneg=True, name=f"capacity_realised_contribution_{k}"
+        )
+        contribution_param.value = np.zeros(k_max)
+        self.param_capacity_interval_matrix_k[k] = matrix_param
+        self.param_capacity_realised_contribution_k[k] = contribution_param
 
     def _init_deferrable_load_params(self) -> None:
         """
@@ -1633,6 +1798,151 @@ class Optimization:
             return 1
         return int(value)
 
+    def _get_capacity_cost_per_kw_list(self) -> list:
+        """Multi-component (issue #540 Part B) capacity-cost rates, currency
+        per kW, one per component. Only called when ``capacity_cost_per_kw``
+        is a list/tuple (``self._capacity_multi``); a bare scalar routes
+        through the untouched legacy ``_get_capacity_cost_per_kw`` /
+        K=1 path instead.
+
+        Each entry is validated exactly like the legacy scalar getter
+        (finite, >= 0; invalid falls back to 0.0, which for that component
+        alone means "off" - the component's ``peak_import`` variable and all
+        of its Parameters are simply never created, see
+        ``_initialize_decision_variables``). Validation is fully
+        per-component: one bad entry can never disable, zero or reuse
+        another component's cost.
+        """
+        raw = self.optim_conf.get("capacity_cost_per_kw", [0.0])
+        raw_list = list(raw) if len(raw) > 0 else [0.0]
+        out = []
+        for k, item in enumerate(raw_list):
+            try:
+                value = float(item)
+            except (TypeError, ValueError):
+                self.logger.warning(
+                    f"Invalid capacity_cost_per_kw[{k}] value ({item!r}); "
+                    "ignoring it (component disabled)."
+                )
+                out.append(0.0)
+                continue
+            if not isfinite(value) or value < 0:
+                self.logger.warning(
+                    f"capacity_cost_per_kw[{k}] must be a finite number >= 0, got "
+                    f"{item!r}; ignoring it (component disabled)."
+                )
+                out.append(0.0)
+                continue
+            out.append(value)
+        return out
+
+    def _get_capacity_charge_interval_timesteps_list(self) -> list:
+        """Multi-component (issue #540 Part B) tariff measurement-interval
+        lengths, one per component. Only called when
+        ``capacity_cost_per_kw`` is a list (``self._capacity_multi``).
+
+        ``capacity_charge_interval_timesteps`` may be:
+        - absent / a bare scalar: broadcast the same validated N to every
+          component (this is the "may broadcast if that is clean" case -
+          most multi-component tariffs share one native measurement basis,
+          e.g. 30-minute demand intervals, even with different windows/rates);
+        - a list: must have exactly ``self.n_capacity_components`` entries.
+          A mismatched length is a structural, whole-setting error - it is
+          NOT partially applied or silently zero-padded/truncated per
+          component (issue #540 Part B invalid-input requirement); the
+          entire setting falls back to broadcasting the default (1) to every
+          component, with one explicit warning naming the mismatch.
+
+        Each entry is otherwise validated exactly like the legacy scalar
+        getter (positive integer; invalid entries individually fall back to
+        1 with a component-indexed warning, independent of every other
+        component).
+        """
+        raw = self.optim_conf.get("capacity_charge_interval_timesteps", 1)
+        if isinstance(raw, (list, tuple)):
+            if len(raw) != self.n_capacity_components:
+                self.logger.warning(
+                    f"capacity_charge_interval_timesteps has {len(raw)} entries but "
+                    f"capacity_cost_per_kw has {self.n_capacity_components}; these must "
+                    "match exactly for K>1. Falling back to "
+                    "capacity_charge_interval_timesteps=1 (no tariff-interval "
+                    "aggregation) for every component rather than guessing a "
+                    "partial mapping."
+                )
+                return [1] * self.n_capacity_components
+            raw_list = list(raw)
+        else:
+            raw_list = [raw] * self.n_capacity_components
+
+        out = []
+        for k, item in enumerate(raw_list):
+            try:
+                value = float(item)
+            except (TypeError, ValueError):
+                self.logger.warning(
+                    f"Invalid capacity_charge_interval_timesteps[{k}] value ({item!r}); "
+                    "falling back to 1 for this component (no tariff-interval "
+                    "aggregation)."
+                )
+                out.append(1)
+                continue
+            if not isfinite(value) or value < 1 or value != int(value):
+                self.logger.warning(
+                    f"capacity_charge_interval_timesteps[{k}] must be a positive "
+                    f"integer, got {item!r}; falling back to 1 for this component "
+                    "(no tariff-interval aggregation)."
+                )
+                out.append(1)
+                continue
+            out.append(int(value))
+        return out
+
+    def _validate_capacity_interval_history_generic(
+        self, history, interval_n: int, context: str = ""
+    ) -> np.ndarray:
+        """Shared implementation behind ``_validate_capacity_interval_history``
+        (K=1 legacy path) and the K>1 per-component validator
+        (issue #540 Part B, see ``_validate_capacity_interval_history_k``).
+
+        ``interval_n`` is the (component's own) ``capacity_charge_interval_timesteps``.
+        ``context`` is an optional message prefix (e.g. ``"component 1: "``);
+        empty for the legacy K=1 caller so existing log text is byte-identical.
+        """
+        max_len = interval_n - 1
+        empty = np.array([], dtype=float)
+        if history is None:
+            return empty
+        try:
+            hist_arr = np.asarray(history, dtype=float).ravel()
+        except (TypeError, ValueError):
+            self.logger.warning(
+                f"{context}Invalid capacity_charge_current_interval_history (non-numeric "
+                f"entries): {history!r}; ignoring it (empty history assumed)."
+            )
+            return empty
+        if hist_arr.size > 0 and not np.all(np.isfinite(hist_arr)):
+            self.logger.warning(
+                f"{context}capacity_charge_current_interval_history contains NaN/inf "
+                "entries; ignoring it (empty history assumed)."
+            )
+            return empty
+        if np.any(hist_arr < 0):
+            self.logger.warning(
+                f"{context}capacity_charge_current_interval_history must contain only "
+                "non-negative (import) power values; ignoring it (empty "
+                "history assumed)."
+            )
+            return empty
+        if len(hist_arr) > max_len:
+            self.logger.warning(
+                f"{context}capacity_charge_current_interval_history has {len(hist_arr)} "
+                f"entries but capacity_charge_interval_timesteps="
+                f"{interval_n} allows at most "
+                f"{max_len}; ignoring it (empty history assumed)."
+            )
+            return empty
+        return hist_arr
+
     def _validate_capacity_interval_history(self, history) -> np.ndarray:
         """Validate the runtime ``capacity_charge_current_interval_history``
         (issue #540): positive-import power samples (W), oldest -> newest,
@@ -1645,54 +1955,42 @@ class Optimization:
         i.e. the horizon start (t0) is assumed to sit exactly on an interval
         boundary, matching behaviour with the key omitted.
         """
-        max_len = self.capacity_charge_interval_timesteps - 1
-        empty = np.array([], dtype=float)
-        if history is None:
-            return empty
-        try:
-            hist_arr = np.asarray(history, dtype=float).ravel()
-        except (TypeError, ValueError):
-            self.logger.warning(
-                f"Invalid capacity_charge_current_interval_history (non-numeric "
-                f"entries): {history!r}; ignoring it (empty history assumed)."
-            )
-            return empty
-        if hist_arr.size > 0 and not np.all(np.isfinite(hist_arr)):
-            self.logger.warning(
-                "capacity_charge_current_interval_history contains NaN/inf "
-                "entries; ignoring it (empty history assumed)."
-            )
-            return empty
-        if np.any(hist_arr < 0):
-            self.logger.warning(
-                "capacity_charge_current_interval_history must contain only "
-                "non-negative (import) power values; ignoring it (empty "
-                "history assumed)."
-            )
-            return empty
-        if len(hist_arr) > max_len:
-            self.logger.warning(
-                f"capacity_charge_current_interval_history has {len(hist_arr)} "
-                f"entries but capacity_charge_interval_timesteps="
-                f"{self.capacity_charge_interval_timesteps} allows at most "
-                f"{max_len}; ignoring it (empty history assumed)."
-            )
-            return empty
-        return hist_arr
+        return self._validate_capacity_interval_history_generic(
+            history, self.capacity_charge_interval_timesteps
+        )
 
-    def _build_capacity_interval_arrays(
-        self, window_mask: np.ndarray, history
+    def _validate_capacity_interval_history_k(self, history, k: int) -> np.ndarray:
+        """Per-component (issue #540 Part B) validation of one component's
+        ``capacity_charge_current_interval_history`` entry, against that
+        component's own ``capacity_charge_interval_timesteps``. Never reads
+        or writes any other component's state."""
+        return self._validate_capacity_interval_history_generic(
+            history,
+            self._capacity_charge_interval_timesteps_list[k],
+            context=f"capacity_cost_per_kw[{k}]: ",
+        )
+
+    def _build_capacity_interval_arrays_generic(
+        self,
+        window_mask: np.ndarray,
+        history,
+        interval_n: int,
+        k_max: int,
+        context: str = "",
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Build the numeric ``(A, c)`` pair implementing tariff
-        measurement-interval aggregation for the capacity charge (issue #540):
-        ``Q = A @ p_grid_pos + c`` prices the (window-masked) average import
-        power over each completed tariff interval. See
-        ``_init_capacity_interval_params`` for the DPP rationale.
+        """Shared implementation behind ``_build_capacity_interval_arrays``
+        (K=1 legacy path) and the K>1 per-component builder (issue #540 Part
+        B, see ``_build_capacity_interval_arrays_k``). Build the numeric
+        ``(A, c)`` pair implementing tariff measurement-interval aggregation
+        for one capacity/demand-charge component: ``Q = A @ p_grid_pos + c``
+        prices the (window-masked) average import power over each completed
+        tariff interval. See ``_init_capacity_interval_params`` for the DPP
+        rationale.
 
-        With ``N = capacity_charge_interval_timesteps``, ``n = num_timesteps``
-        and a validated history of length ``m`` (0..N-1), the first completed
-        interval's decision-index endpoint is ``e0 = N - 1 - m`` (the history's
-        ``m`` already-elapsed samples plus the ``N - m`` planned samples at
+        With ``N = interval_n``, ``n = num_timesteps`` and a validated
+        history of length ``m`` (0..N-1), the first completed interval's
+        decision-index endpoint is ``e0 = N - 1 - m`` (the history's ``m``
+        already-elapsed samples plus the ``N - m`` planned samples at
         decision indices ``0..e0`` make up its ``N`` samples); every
         subsequent completed interval is the next ``N`` consecutive planned
         samples, ending every ``N`` steps after that (``e0 + N``,
@@ -1701,24 +1999,23 @@ class Optimization:
         ``peak_import``.
 
         Logs a warning (without altering behaviour) when ``e0 >= n`` (no
-        tariff interval completes within this solve) and when
-        ``capacity_charge_window`` changes within the planned samples of a
-        completed interval (endpoint sampling then determines the applied
-        weight).
+        tariff interval completes within this solve) and when the window
+        changes within the planned samples of a completed interval (endpoint
+        sampling then determines the applied weight). ``context`` is an
+        optional message prefix for K>1 callers; empty for the legacy K=1
+        caller so existing log text is byte-identical.
         """
         n = self.num_timesteps
-        interval_n = self.capacity_charge_interval_timesteps
-        k_max = self.param_capacity_interval_matrix.shape[0]
         matrix = np.zeros((k_max, n))
         contribution = np.zeros(k_max)
 
-        hist_arr = self._validate_capacity_interval_history(history)
+        hist_arr = self._validate_capacity_interval_history_generic(history, interval_n, context)
         m = len(hist_arr)
         e0 = interval_n - 1 - m
 
         if e0 >= n:
             self.logger.warning(
-                f"Capacity charge: with capacity_charge_interval_timesteps={interval_n}, "
+                f"{context}Capacity charge: with capacity_charge_interval_timesteps={interval_n}, "
                 f"capacity_charge_current_interval_history length={m} and a "
                 f"prediction horizon of {n}, no tariff measurement interval "
                 "completes within this solve; no prospective aggregated interval "
@@ -1744,7 +2041,7 @@ class Optimization:
 
         if window_misaligned:
             self.logger.warning(
-                "capacity_charge_window changes within a completed tariff "
+                f"{context}capacity_charge_window changes within a completed tariff "
                 "measurement interval; capacity_charge_window boundaries should "
                 "align with the tariff measurement interval when "
                 "capacity_charge_interval_timesteps > 1, otherwise endpoint "
@@ -1752,6 +2049,38 @@ class Optimization:
             )
 
         return matrix, contribution
+
+    def _build_capacity_interval_arrays(
+        self, window_mask: np.ndarray, history
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build the numeric ``(A, c)`` pair implementing tariff
+        measurement-interval aggregation for the capacity charge (issue #540):
+        ``Q = A @ p_grid_pos + c`` prices the (window-masked) average import
+        power over each completed tariff interval. See
+        ``_init_capacity_interval_params`` for the DPP rationale. See
+        ``_build_capacity_interval_arrays_generic`` for the full formulation.
+        """
+        return self._build_capacity_interval_arrays_generic(
+            window_mask,
+            history,
+            self.capacity_charge_interval_timesteps,
+            self.param_capacity_interval_matrix.shape[0],
+        )
+
+    def _build_capacity_interval_arrays_k(
+        self, window_mask: np.ndarray, history, k: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Per-component (issue #540 Part B) build of one component's
+        ``(A, c)`` interval-aggregation pair, against that component's own
+        interval length, matrix shape and window - never reads or writes any
+        other component's state."""
+        return self._build_capacity_interval_arrays_generic(
+            window_mask,
+            history,
+            self._capacity_charge_interval_timesteps_list[k],
+            self.param_capacity_interval_matrix_k[k].shape[0],
+            context=f"capacity_cost_per_kw[{k}]: ",
+        )
 
     def _initialize_decision_variables(self):
         """
@@ -1932,33 +2261,62 @@ class Optimization:
         # N=1 uses the #1066 per-timestep epigraph below; N>1 (issue #540)
         # instead uses completed tariff-interval averages built as
         # Q = A @ p_grid_pos + c.
-        if self._get_capacity_cost_per_kw() > 0:
-            vars_dict["peak_import"] = cp.Variable(nonneg=True, name="peak_import")
-            if self._capacity_interval_aggregation_active:
-                # N > 1 (issue #540): epigraph over completed tariff-interval
-                # averages, Q = A @ p_grid_pos + c. See
-                # _init_capacity_interval_params for the DPP rationale.
-                constraints.append(
-                    vars_dict["peak_import"]
-                    >= self.param_capacity_interval_matrix @ vars_dict["p_grid_pos"]
-                    + self.param_capacity_realised_contribution
-                )
-            else:
-                # N == 1 (default): the exact pre-#540 #1066 epigraph,
-                # semantically identical to before this feature existed.
-                constraints.append(
-                    vars_dict["peak_import"]
-                    >= cp.multiply(self.param_capacity_window, vars_dict["p_grid_pos"])
-                )
-            # Floor peak_import at any demand already incurred this billing period
-            # (issue #623, Phase 2). With the floor binding, shaving below it has
-            # zero marginal value, so the solver does not waste battery /
-            # deferrable flexibility on a peak already locked in for the billing period.
-            # The value is a cp.Parameter (W, default 0.0) so it is updated per
-            # call without a rebuild (DPP / warm-start safe); default 0.0 makes
-            # this redundant with the nonneg bound and the epigraph above, so the
-            # plan is identical to Phase 1.
-            constraints.append(vars_dict["peak_import"] >= self.param_current_period_peak)
+        if not self._capacity_multi:
+            if self._get_capacity_cost_per_kw() > 0:
+                vars_dict["peak_import"] = cp.Variable(nonneg=True, name="peak_import")
+                if self._capacity_interval_aggregation_active:
+                    # N > 1 (issue #540): epigraph over completed tariff-interval
+                    # averages, Q = A @ p_grid_pos + c. See
+                    # _init_capacity_interval_params for the DPP rationale.
+                    constraints.append(
+                        vars_dict["peak_import"]
+                        >= self.param_capacity_interval_matrix @ vars_dict["p_grid_pos"]
+                        + self.param_capacity_realised_contribution
+                    )
+                else:
+                    # N == 1 (default): the exact pre-#540 #1066 epigraph,
+                    # semantically identical to before this feature existed.
+                    constraints.append(
+                        vars_dict["peak_import"]
+                        >= cp.multiply(self.param_capacity_window, vars_dict["p_grid_pos"])
+                    )
+                # Floor peak_import at any demand already incurred this billing period
+                # (issue #623, Phase 2). With the floor binding, shaving below it has
+                # zero marginal value, so the solver does not waste battery /
+                # deferrable flexibility on a peak already locked in for the billing period.
+                # The value is a cp.Parameter (W, default 0.0) so it is updated per
+                # call without a rebuild (DPP / warm-start safe); default 0.0 makes
+                # this redundant with the nonneg bound and the epigraph above, so the
+                # plan is identical to Phase 1.
+                constraints.append(vars_dict["peak_import"] >= self.param_current_period_peak)
+        else:
+            # Multi-component capacity/demand charge (issue #540 Part B): one
+            # INDEPENDENT peak_import[k] epigraph per component with
+            # capacity_cost_per_kw[k] > 0. Components share the same
+            # p_grid_pos decision (there is still only ONE optimisation) but
+            # never share incumbent state, window, cost, or interval
+            # aggregation/history - each references only its own
+            # param_*_k[k] Parameters. A component with cost <= 0 gets no
+            # variable, no constraint, no Parameters at all: "no economic
+            # effect" is structural, not just a zero price.
+            vars_dict["peak_import_k"] = [None] * self.n_capacity_components
+            for k in range(self.n_capacity_components):
+                if self._capacity_cost_per_kw_list[k] <= 0:
+                    continue
+                peak_k = cp.Variable(nonneg=True, name=f"peak_import_{k}")
+                vars_dict["peak_import_k"][k] = peak_k
+                if self._capacity_interval_aggregation_active_list[k]:
+                    constraints.append(
+                        peak_k
+                        >= self.param_capacity_interval_matrix_k[k] @ vars_dict["p_grid_pos"]
+                        + self.param_capacity_realised_contribution_k[k]
+                    )
+                else:
+                    constraints.append(
+                        peak_k
+                        >= cp.multiply(self.param_capacity_window_k[k], vars_dict["p_grid_pos"])
+                    )
+                constraints.append(peak_k >= self.param_current_period_peak_k[k])
 
         # Sum of deferrable loads ON THE ELECTRIC BUS. A load flagged with
         # is_electric_load[k] = False (gas boiler, oil burner, district
@@ -2227,9 +2585,21 @@ class Optimization:
         # time_step the way the per-timestep energy terms are; peak_import is in W
         # and divided by 1000 to price it in kW. Subtracted because the objective
         # is maximised.
-        capacity_cost_per_kw = self._get_capacity_cost_per_kw()
-        if capacity_cost_per_kw > 0 and "peak_import" in self.vars:
-            objective_terms.append(-capacity_cost_per_kw * (self.vars["peak_import"] / 1000.0))
+        if not self._capacity_multi:
+            capacity_cost_per_kw = self._get_capacity_cost_per_kw()
+            if capacity_cost_per_kw > 0 and "peak_import" in self.vars:
+                objective_terms.append(-capacity_cost_per_kw * (self.vars["peak_import"] / 1000.0))
+        elif "peak_import_k" in self.vars:
+            # Multi-component (issue #540 Part B): each component's peak is
+            # priced independently at its OWN rate and summed into the same
+            # single objective - K independent charges, still one
+            # optimisation. A component with cost <= 0 has no variable (see
+            # _initialize_decision_variables) so it contributes nothing here.
+            for k in range(self.n_capacity_components):
+                cost_k = self._capacity_cost_per_kw_list[k]
+                peak_k = self.vars["peak_import_k"][k]
+                if cost_k > 0 and peak_k is not None:
+                    objective_terms.append(-cost_k * (peak_k / 1000.0))
 
         # Curtailment timing tie-break (issue #342). p_pv_curtailment carries no cost
         # of its own, so among equal-cost optima the solver may curtail early in the
@@ -4525,21 +4895,29 @@ class Optimization:
             # Re-initialize the intermediate SOC target mask with the new horizon (#553)
             self._init_soc_target_params()
 
-            # Re-initialize the capacity-charge window mask with the new horizon
-            # (issue #623, Phase 3) - it is a vector param, so unlike the scalar
-            # current_period_peak below it MUST be re-created on resize.
-            self._init_capacity_window_param()
+            # Re-initialize the capacity-charge window mask(s) with the new
+            # horizon (issue #623, Phase 3 / #540 Part B) - vector params, so
+            # unlike the scalar current_period_peak param(s) below they MUST
+            # be re-created on resize.
+            if not self._capacity_multi:
+                self._init_capacity_window_param()
+                # K_max depends on num_timesteps, so re-create on resize too -
+                # only when the N > 1 aggregation path is active (see __init__).
+                if self._capacity_interval_aggregation_active:
+                    self._init_capacity_interval_params()
+            else:
+                self._init_capacity_window_params_multi()
+                for k in range(self.n_capacity_components):
+                    if self._capacity_interval_aggregation_active_list[k]:
+                        self._init_capacity_interval_params_k(k)
 
-            # K_max depends on num_timesteps, so re-create on resize too - only
-            # when the N > 1 aggregation path is active (see __init__).
-            if self._capacity_interval_aggregation_active:
-                self._init_capacity_interval_params()
-
-            # NOTE: param_current_period_peak (issue #623, Phase 2) is a SCALAR
-            # cp.Parameter, horizon-independent, so it is intentionally NOT
-            # re-created on resize (unlike the soc_target vector floor above).
-            # _initialize_decision_variables (re-called below) re-appends its
-            # floor constraint against the same persistent scalar parameter.
+            # NOTE: param_current_period_peak / param_current_period_peak_k
+            # (issue #623 Phase 2 / #540 Part B) are SCALAR cp.Parameters,
+            # horizon-independent, so they are intentionally NOT re-created on
+            # resize (unlike the soc_target / window vector floors above).
+            # _initialize_decision_variables (re-called below) re-appends
+            # their floor constraint(s) against the same persistent scalar
+            # parameter(s).
 
             # Re-initialize deferrable load parameters (window masks and energy constraints)
             self._init_deferrable_load_params()
@@ -4646,90 +5024,107 @@ class Optimization:
         # in WATTS to match p_grid_pos / peak_import, so no scaling is needed. A
         # non-numeric, non-finite (NaN/inf) or negative runtime value falls back to 0.0 (prices
         # the full horizon peak == Phase 1) with a warning rather than crashing.
-        if self._get_capacity_cost_per_kw() > 0 and current_period_peak is not None:
-            try:
-                peak_floor_w = float(current_period_peak)
-            except (TypeError, ValueError):
-                self.logger.warning(
-                    f"Invalid current_period_peak value ({current_period_peak!r}); "
-                    "ignoring it (no incurred-peak floor applied)."
-                )
-                peak_floor_w = 0.0
-            # not isfinite(...) catches NaN and +/-inf; the second clause catches
-            # negatives. cp.Parameter(nonneg=True) rejects inf, so guard it here.
-            if not isfinite(peak_floor_w) or peak_floor_w < 0:
-                self.logger.warning(
-                    f"current_period_peak must be a finite number >= 0 (Watts), got "
-                    f"{current_period_peak!r}; ignoring it (no incurred-peak floor applied)."
-                )
-                peak_floor_w = 0.0
-            self.param_current_period_peak.value = peak_floor_w
-            if peak_floor_w > 0:
-                self.logger.debug(
-                    f"Capacity charge: flooring peak_import at already-incurred "
-                    f"current_period_peak = {peak_floor_w} W."
-                )
-        else:
-            self.param_current_period_peak.value = 0.0
-
-        # Demand-window mask for the capacity charge (issue #623, Phase 3).
-        # Reset to all-ones on EVERY call so a mask from a previous MPC tick
-        # does not leak; a valid runtime mask then overwrites it. Any invalid
-        # mask (non-numeric, NaN/inf, too short) falls back to all-ones - the
-        # unmasked Phase 2 epigraph - with a warning rather than crashing.
-        # Weights are clipped into [0, 1]; fractional weights pass through so a
-        # tariff could in principle weight timesteps, though 0/1 is the
-        # expected shape. A too-long mask is truncated to the horizon.
-        window_mask = np.ones(self.num_timesteps)
-        if self._get_capacity_cost_per_kw() > 0 and capacity_charge_window is not None:
-            try:
-                mask_arr = np.asarray(capacity_charge_window, dtype=float).ravel()
-            except (TypeError, ValueError):
-                self.logger.warning(
-                    f"Invalid capacity_charge_window (non-numeric entries): "
-                    f"{capacity_charge_window!r}; ignoring it (full-horizon peak pricing)."
-                )
-                mask_arr = None
-            if mask_arr is not None and not np.all(np.isfinite(mask_arr)):
-                self.logger.warning(
-                    "capacity_charge_window contains NaN/inf entries; "
-                    "ignoring it (full-horizon peak pricing)."
-                )
-                mask_arr = None
-            if mask_arr is not None and len(mask_arr) < self.num_timesteps:
-                self.logger.warning(
-                    f"capacity_charge_window has {len(mask_arr)} entries but the "
-                    f"horizon is {self.num_timesteps}; ignoring it "
-                    "(full-horizon peak pricing)."
-                )
-                mask_arr = None
-            if mask_arr is not None:
-                if len(mask_arr) > self.num_timesteps:
+        if not self._capacity_multi:
+            if self._get_capacity_cost_per_kw() > 0 and current_period_peak is not None:
+                peak_floor_w = self._validate_current_period_peak(current_period_peak)
+                self.param_current_period_peak.value = peak_floor_w
+                if peak_floor_w > 0:
                     self.logger.debug(
-                        f"capacity_charge_window has {len(mask_arr)} entries; "
-                        f"truncating to the {self.num_timesteps}-step horizon."
+                        f"Capacity charge: flooring peak_import at already-incurred "
+                        f"current_period_peak = {peak_floor_w} W."
                     )
-                    mask_arr = mask_arr[: self.num_timesteps]
-                if np.any(mask_arr < 0) or np.any(mask_arr > 1):
-                    self.logger.warning("capacity_charge_window entries outside [0, 1]; clipping.")
-                    mask_arr = np.clip(mask_arr, 0.0, 1.0)
-                window_mask = mask_arr
-                self.logger.debug(
-                    f"Capacity charge: demand-window mask active on "
-                    f"{int(np.count_nonzero(window_mask))}/{self.num_timesteps} timesteps."
-                )
-        self.param_capacity_window.value = window_mask
+            else:
+                self.param_current_period_peak.value = 0.0
 
-        # Tariff measurement-interval aggregation (#540). Only built when N > 1
-        # is active; otherwise this machinery doesn't exist on the instance at
-        # all (see _capacity_interval_aggregation_active, set in __init__) and
-        # the history is never inspected - the exact pre-#540 legacy path.
-        if self._capacity_interval_aggregation_active:
-            interval_matrix, realised_contribution = self._build_capacity_interval_arrays(
-                window_mask, capacity_charge_current_interval_history
+            # Demand-window mask for the capacity charge (issue #623, Phase 3).
+            # Reset to all-ones on EVERY call so a mask from a previous MPC tick
+            # does not leak; a valid runtime mask then overwrites it.
+            window_mask = np.ones(self.num_timesteps)
+            if self._get_capacity_cost_per_kw() > 0 and capacity_charge_window is not None:
+                window_mask = self._validate_capacity_window(capacity_charge_window)
+            self.param_capacity_window.value = window_mask
+
+            # Tariff measurement-interval aggregation (#540). Only built when N > 1
+            # is active; otherwise this machinery doesn't exist on the instance at
+            # all (see _capacity_interval_aggregation_active, set in __init__) and
+            # the history is never inspected - the exact pre-#540 legacy path.
+            if self._capacity_interval_aggregation_active:
+                interval_matrix, realised_contribution = self._build_capacity_interval_arrays(
+                    window_mask, capacity_charge_current_interval_history
+                )
+                self.param_capacity_interval_matrix.value = interval_matrix
+                self.param_capacity_realised_contribution.value = realised_contribution
+        else:
+            # Multi-component (issue #540 Part B) runtime updates. Each of
+            # the three runtime args, when the capacity charge is
+            # multi-component, is expected to be a list of exactly
+            # n_capacity_components independent entries (one per component,
+            # in the same order as capacity_cost_per_kw) - never a bare
+            # scalar/1-D value silently broadcast or reused across
+            # components. A wrong-length list is a whole-setting mismatch:
+            # it warns once and every component falls back to that
+            # setting's default (no incumbent / full-horizon window / empty
+            # history) rather than guessing a partial per-component mapping
+            # or reusing another component's value.
+            K = self.n_capacity_components
+
+            def _as_component_list(value, name):
+                if value is None:
+                    return [None] * K
+                if not isinstance(value, (list, tuple)):
+                    self.logger.warning(
+                        f"{name} must be a list of {K} entries (one per "
+                        f"capacity_cost_per_kw component) when capacity_cost_per_kw "
+                        f"is a list; got a bare {type(value).__name__}. Ignoring it "
+                        "for every component rather than guessing which component "
+                        "it belongs to."
+                    )
+                    return [None] * K
+                if len(value) != K:
+                    self.logger.warning(
+                        f"{name} has {len(value)} entries but capacity_cost_per_kw has "
+                        f"{K}; these must match exactly for K>1. Ignoring {name} for "
+                        "every component this solve rather than applying a partial "
+                        "mapping."
+                    )
+                    return [None] * K
+                return list(value)
+
+            peak_list = _as_component_list(current_period_peak, "current_period_peak")
+            window_list = _as_component_list(capacity_charge_window, "capacity_charge_window")
+            history_list = _as_component_list(
+                capacity_charge_current_interval_history,
+                "capacity_charge_current_interval_history",
             )
-            self.param_capacity_interval_matrix.value = interval_matrix
-            self.param_capacity_realised_contribution.value = realised_contribution
+
+            window_mask_k = [None] * K
+            for k in range(K):
+                cost_k = self._capacity_cost_per_kw_list[k]
+                context = f"capacity_cost_per_kw[{k}]: "
+
+                if cost_k > 0 and peak_list[k] is not None:
+                    peak_floor_w = self._validate_current_period_peak(peak_list[k], context)
+                    self.param_current_period_peak_k[k].value = peak_floor_w
+                    if peak_floor_w > 0:
+                        self.logger.debug(
+                            f"{context}Capacity charge: flooring peak_import[{k}] at "
+                            f"already-incurred current_period_peak = {peak_floor_w} W."
+                        )
+                else:
+                    self.param_current_period_peak_k[k].value = 0.0
+
+                mask_k = np.ones(self.num_timesteps)
+                if cost_k > 0 and window_list[k] is not None:
+                    mask_k = self._validate_capacity_window(window_list[k], context)
+                window_mask_k[k] = mask_k
+                self.param_capacity_window_k[k].value = mask_k
+
+                if self._capacity_interval_aggregation_active_list[k]:
+                    interval_matrix, realised_contribution = self._build_capacity_interval_arrays_k(
+                        mask_k, history_list[k], k
+                    )
+                    self.param_capacity_interval_matrix_k[k].value = interval_matrix
+                    self.param_capacity_realised_contribution_k[k].value = realised_contribution
 
         # Pad deferrable load lists
         if def_total_timestep is not None:

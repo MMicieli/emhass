@@ -156,18 +156,105 @@ assert round(billed_peak_w([3000, 1000], n=6, history=[2000, 4000, 0, 6000]), 1)
 
 Expected: comparisons between capacity-charge runs use the billed metric above, not the raw native-timestep maximum.
 
+## Step 5: Multiple independent capacity/demand components (K>1)
+
+<!-- source: src/emhass/optimization.py:324 -->
+<!-- source: src/emhass/optimization.py:1801 -->
+<!-- source: src/emhass/optimization.py:1839 -->
+<!-- source: src/emhass/optimization.py:2302 -->
+<!-- transport: direct EMHASS configuration/runtime JSON; adapter-specific transport untested -->
+
+Some tariffs bill more than one demand component in the same period - for
+example one component that applies across the whole day and a second,
+independently-rated component that applies only in a business-hours window.
+EMHASS models this as `K` independent capacity-charge components inside the
+SAME optimisation (still one solve, one `p_grid_pos`) rather than as a
+second optimiser or a second solve.
+
+Every step above is the `K=1` (legacy) form. Passing a **list** instead of a
+scalar for `capacity_cost_per_kw` opts into the `K>1` form, where `K` is the
+list's length - the type of the value routes between the two implementations,
+not its length, so a single-element list already uses the generic `K>1` code
+path (mathematically equivalent to the scalar form, but not the identical
+code):
+
+```yaml
+optim_conf:
+  capacity_cost_per_kw: [4.0, 9.0]           # two components, two rates
+  capacity_charge_interval_timesteps: 6      # scalar broadcasts to both (same 30-min basis)
+  # or, for independent measurement bases per component:
+  # capacity_charge_interval_timesteps: [6, 3]
+```
+
+```json
+{
+  "prediction_horizon": 24,
+  "current_period_peak": [6000, 2500],
+  "capacity_charge_window": [
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]
+  ],
+  "capacity_charge_current_interval_history": [
+    [2000, 4000, 0, 6000],
+    []
+  ]
+}
+```
+
+Rules, all enforced structurally (never silently guessed or cross-coupled):
+
+- `capacity_cost_per_kw` as a list is the ONLY way to opt in; every other
+  runtime input below is then interpreted per-component.
+- `current_period_peak`, `capacity_charge_window` and
+  `capacity_charge_current_interval_history` must each be a list of exactly
+  `K` entries (one independent value/mask/history per component, in the
+  same order as `capacity_cost_per_kw`) once `K>1` is active. A
+  wrong-length list is never partially applied or matched to the wrong
+  component - the whole setting falls back to its default (no incumbent,
+  full-horizon window, empty history) for every component that solve, with
+  a warning.
+- `capacity_charge_interval_timesteps` may stay a bare scalar (broadcasts
+  the same native measurement interval to every component - the common
+  case, e.g. all components clocked on the same 30-minute basis) or be a
+  list of exactly `K` entries for independent per-component measurement
+  bases.
+- A component with `capacity_cost_per_kw <= 0` has no economic effect at
+  all - not just a zero price: no variable, no constraint, no Parameter is
+  created for it, exactly like the `K=1` opt-in gate.
+- Components may legitimately overlap (the same import can raise more than
+  one component's priced peak); each component's cost is still applied
+  independently and summed into the one objective.
+
+Expected: with all `K` components at `capacity_cost_per_kw <= 0`, the plan
+is identical to the feature being fully off. With exactly one component
+active, the plan is mathematically identical to the equivalent `K=1` scalar
+configuration (though it solves through the generic, not the legacy, code
+path - see `test_list_of_one_matches_scalar_math` in
+`tests/test_capacity_charge_multi_component.py`).
+
+### Motivating shape (not a supported tariff database)
+
+A two-window demand tariff - one "anytime" component and one
+business-hours-only component, both measured on a clocked 30-minute basis -
+maps directly onto the `K=2` example above. EMHASS does not encode any
+tariff provider's actual rates, calendar, seasons or timezone conversion;
+the caller (Home Assistant, or whatever builds the runtime payload) owns
+all of that and supplies plain numbers, exactly as it already does for the
+`K=1` form.
+
 ## Caveats
 
 - `current_period_peak`, `capacity_charge_window` and `capacity_charge_current_interval_history` are MPC runtime inputs. The structural `capacity_charge_interval_timesteps` applies to the shared capacity-charge model.
 - `dayahead-optim` and `perfect-optim` have no elapsed-interval history. With `N>1`, start their horizon on a tariff measurement-interval boundary.
 - A tariff interval incomplete at the far end of the horizon is not priced until a later receding-horizon solve can see its completion. No terminal continuation model is added here.
 - Exact billing-period rollover with `N>1` assumes the billing-period boundary aligns with a tariff measurement-interval boundary. EMHASS does not split one aggregated interval across two billing periods.
-- This implementation represents one capacity-charge component per solve. Independent components with different rates, windows or incumbent peaks require separate future support.
-- `current_period_peak` and interval history are in Watts; `capacity_cost_per_kw` is currency/kW.
+- Independent capacity-charge components with different rates, windows or incumbent peaks are supported via the `K>1` list form in Step 5.
+- `current_period_peak` and interval history are in Watts; `capacity_cost_per_kw` is currency/kW (or a list of currency/kW rates for `K>1`).
 - The caller owns tariff calendar/state. EMHASS does not persist billing-period peaks or compute tariff seasons/timezones.
 
 ## Credits
 
 - Base capacity-charge feature: #623.
 - Demand-window feature: #1066.
-- Tariff measurement-interval aggregation: #540 discussion.
+- Tariff measurement-interval aggregation: #540 discussion (Part A).
+- Multiple independent capacity/demand components: #540 discussion (Part B).
