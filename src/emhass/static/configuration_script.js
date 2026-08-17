@@ -41,6 +41,26 @@ const BATTERY_ARRAY_PARAMS = [
   "battery_soc_surplus_cost",
 ];
 
+//#540 Part B: capacity_cost_per_kw / capacity_charge_interval_timesteps are
+//declared array.float / array.int (they accept a scalar OR a list of K
+//independent capacity/demand-charge components - see optimization.py
+//Optimization.__init__: routing between the untouched K=1 legacy path and
+//the generic K>1 path is decided purely by the VALUE'S TYPE, scalar vs
+//list, not by wrapping a length-1 list in an array). They live in the
+//"Battery" section (no +/- buttons - see BATTERY_ARRAY_PARAMS above), so
+//the ONLY way their rendered input count changes is the underlying config
+//value itself already being a list. For these two params specifically,
+//saveConfiguration's array/scalar decision below is based on how many
+//inputs are ACTUALLY rendered, not on the declared array.* metadata: a
+//single input (an untouched legacy scalar) must be saved back as a bare
+//scalar, never silently wrapped into a one-element array that would
+//reroute the config onto a different (mathematically equivalent, but not
+//byte-identical) code path the user never asked for.
+const CAPACITY_SINGLETON_SAFE_PARAMS = [
+  "capacity_cost_per_kw",
+  "capacity_charge_interval_timesteps",
+];
+
 //on page reload
 window.onload = async function () {
   ///fetch configuration parameters from definitions json file
@@ -851,6 +871,14 @@ async function saveConfiguration(param_definitions) {
           param_array = Boolean(
             !parameter_definition_object["input"].search("array")
           );
+          //#540 Part B: for the two capacity singleton-safe params, save as
+          //a scalar/array based on how many inputs were ACTUALLY rendered,
+          //not the declared array.* metadata - preserves an untouched
+          //legacy scalar exactly, independent of the OTHER capacity
+          //param's own cardinality (see CAPACITY_SINGLETON_SAFE_PARAMS).
+          if (CAPACITY_SINGLETON_SAFE_PARAMS.includes(parameter_definition_name)) {
+            param_array = param_values.length > 1;
+          }
 
           //build parameters using values extracted from param_inputs
 

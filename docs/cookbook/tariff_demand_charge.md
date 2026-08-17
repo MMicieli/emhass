@@ -229,6 +229,37 @@ Rules, all enforced structurally (never silently guessed or cross-coupled):
   one component's priced peak); each component's cost is still applied
   independently and summed into the one objective.
 
+### Web config editor (list-view) support
+
+<!-- source: src/emhass/static/configuration_script.js: BATTERY_ARRAY_PARAMS,
+     CAPACITY_SINGLETON_SAFE_PARAMS, saveConfiguration, buildParamContainers -->
+
+`capacity_cost_per_kw` and `capacity_charge_interval_timesteps` live in the
+config editor's "Battery" section, where the generic per-field `+`/`-`
+buttons are suppressed (the same exclusion every per-battery array
+parameter already has, so a stray click can't desync an array's length
+from `number_of_batteries`). Two direct consequences:
+
+- **Editing an existing value, `K=1` or `K>1`, through the list view and
+  clicking Save is safe.** A legacy scalar (one rendered input) saves back
+  as a scalar; an existing `K`-length list (`K` rendered inputs) saves back
+  as the same `K`-length list. Neither the OTHER capacity field's
+  cardinality nor the generic array-typed metadata forces an unwanted
+  wrap/unwrap - the save decision is based on how many inputs are actually
+  on the page for that field.
+- **The list view cannot CREATE or change `K` on its own** - there is no
+  `+`/`-` button to add a second `capacity_cost_per_kw` input where only
+  one exists. Moving from `K=1` to `K>1` (or changing `K` at all) requires
+  either the config editor's JSON box view or a direct `capacity_cost_per_kw`
+  list in a `/set-config` payload / `config.json` edit, exactly like the
+  runtime-only keys in the example above. This is a deliberate, minimum-
+  maintainable-contract choice, not an oversight: it avoids adding new K-
+  component-aware UI machinery (add/remove-row logic that would need to
+  keep `capacity_cost_per_kw`, `capacity_charge_interval_timesteps` and any
+  future component-scoped fields in lockstep) for a configuration action
+  expected to be rare (set once per tariff, not adjusted every cycle like
+  `current_period_peak`).
+
 Expected: with all `K` components at `capacity_cost_per_kw <= 0`, the plan
 is identical to the feature being fully off. With exactly one component
 active, the plan is mathematically identical to the equivalent `K=1` scalar

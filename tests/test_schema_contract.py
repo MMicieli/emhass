@@ -244,6 +244,15 @@ def _extract_function_src(js_src: str, fn_name: str) -> str:
     return js_src[fn_m.start() : i]
 
 
+def _extract_const_src(js_src: str, const_name: str) -> str:
+    """Extract a complete top-level ``const <const_name> = ... ;`` statement."""
+    m = re.search(rf"const\s+{re.escape(const_name)}\s*=", js_src)
+    if not m:
+        raise AssertionError(f"const {const_name!r} not found in JS source")
+    end = js_src.index(";", m.start())
+    return js_src[m.start() : end + 1]
+
+
 def _run_node(script: str) -> subprocess.CompletedProcess:
     """Write *script* to a temp file and run it with Node.js."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False, encoding="utf-8") as f:
@@ -458,7 +467,11 @@ def test_save_configuration_object_type_null_representations(js_src):
     the generic path and config.heat_topology becomes "".
     After fix: exits 0 for both "" and "null" inputs.
     """
-    save_fn_src = _extract_function_src(js_src, "saveConfiguration")
+    save_fn_src = (
+        _extract_const_src(js_src, "CAPACITY_SINGLETON_SAFE_PARAMS")
+        + "\n"
+        + _extract_function_src(js_src, "saveConfiguration")
+    )
 
     # document must be a script-level var so saveConfiguration (outer scope) can see it.
     # We reassign it (without var/let) for each test case inside the IIFE.
@@ -590,7 +603,11 @@ def test_save_configuration_object_type_invalid_json_shows_error(js_src):
     config gets garbage).
     After fix (errorAlert + return 0): fetch is NOT called, errorAlert is called.
     """
-    save_fn_src = _extract_function_src(js_src, "saveConfiguration")
+    save_fn_src = (
+        _extract_const_src(js_src, "CAPACITY_SINGLETON_SAFE_PARAMS")
+        + "\n"
+        + _extract_function_src(js_src, "saveConfiguration")
+    )
 
     node_script = (
         "var capturedBody = null;\n"
@@ -643,4 +660,309 @@ def test_save_configuration_object_type_invalid_json_shows_error(js_src):
     proc = _run_node(node_script)
     assert proc.returncode == 0, (
         f"saveConfiguration silently stored invalid JSON instead of showing error:\n{proc.stderr.strip()}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Issue #540 Part B, independent-review finding K1_LIST_VIEW_SCALAR_WRAP
+# ---------------------------------------------------------------------------
+#
+# capacity_cost_per_kw / capacity_charge_interval_timesteps are declared
+# array.float / array.int (to represent the K>1 list form, matching the
+# existing multi-battery scalar-or-list precedent - see
+# test_capacity_cost_per_kw_and_interval_timesteps_are_known_type_mismatches
+# above). They live in the "Battery" param_definitions.json section, where
+# the generic array +/- buttons are suppressed (see BATTERY_ARRAY_PARAMS and
+# the "section != 'Battery'" guard in configuration_script.js) and are NOT
+# in BATTERY_ARRAY_PARAMS themselves, so number_of_batteries never touches
+# them either. buildParamElement's render path is VALUE-driven (branches on
+# typeof value, not on the declared metadata type), so an existing scalar
+# value still renders as exactly one <input>. But saveConfiguration's
+# array/scalar decision (param_array) was METADATA-driven
+# (`!input.search("array")`), independent of how many inputs were actually
+# rendered - so a single rendered input for an array.*-typed field was
+# always wrapped into a one-element array on Save, regardless of whether
+# the loaded value was a bare scalar.
+#
+# capacity_cost_per_kw is a case where lengths carry real, differently-
+# routed meaning: Optimization.__init__ picks the K=1 legacy code path
+# purely from the TYPE of the value (scalar vs list/tuple), not its length
+# (see optimization.py: `self._capacity_multi = isinstance(..., (list,
+# tuple))`). So a routine list-view Save of an untouched legacy scalar
+# config would silently reroute it onto the generic K=1-via-list path -
+# mathematically equivalent, but not the byte-identical legacy
+# construction Part B guarantees, and not something the user asked for.
+
+
+def _run_save_list_view(js_src: str, param_defs: dict, rendered_inputs: dict) -> dict:
+    """Node replay of saveConfiguration in list-view mode.
+
+    `rendered_inputs` maps a param name to a list of currently-rendered
+    input values (mirrors what buildParamElement would have already put in
+    the DOM for that param's current config value) - this only exercises
+    the SAVE-side collection logic, not rendering itself (already covered
+    by the existing buildParamElement Node tests above).
+
+    Returns the resulting config dict.
+    """
+    save_fn_src = (
+        _extract_const_src(js_src, "CAPACITY_SINGLETON_SAFE_PARAMS")
+        + "\n"
+        + _extract_function_src(js_src, "saveConfiguration")
+    )
+
+    def _js_input(v):
+        if isinstance(v, bool):
+            return "{{ type: 'checkbox', checked: {} }}".format("true" if v else "false")
+        return f"{{ type: 'number', value: '{v}' }}"
+
+    elements_by_id = {}
+    for name, values in rendered_inputs.items():
+        js_values = ", ".join(_js_input(v) for v in values)
+        elements_by_id[name] = (
+            f"{{ tagName: 'DIV', getElementsByClassName: function(cls) "
+            f"{{ return cls === 'param_input' ? [{js_values}] : []; }} }}"
+        )
+
+    get_by_id_cases = "\n".join(
+        f"        if (id === '{name}') return {shim};" for name, shim in elements_by_id.items()
+    )
+
+    node_script = (
+        "var capturedBody = null;\n"
+        "var document = null;\n"
+        "var fetch = async function(url, opts) {\n"
+        "  capturedBody = opts.body;\n"
+        "  return { status: 200, json: async function() { return {}; } };\n"
+        "};\n"
+        "function showChangeStatus() {}\n"
+        "function errorAlert(msg) { throw new Error('errorAlert: ' + msg); }\n\n"
+        + save_fn_src
+        + "\n\n"
+        "(async () => {\n"
+        f"  const paramDefs = {json.dumps(param_defs)};\n"
+        "  document = {\n"
+        "    getElementsByClassName: function(cls) {\n"
+        "      return cls === 'section-card' ? { length: 1 } : { length: 0 };\n"
+        "    },\n"
+        "    getElementById: function(id) {\n"
+        "      if (id === 'config-box') return null;\n"
+        f"{get_by_id_cases}\n"
+        "      return null;\n"
+        "    }\n"
+        "  };\n"
+        "  await saveConfiguration(paramDefs);\n"
+        "  process.stdout.write(capturedBody === null ? 'null' : capturedBody);\n"
+        "  process.exit(0);\n"
+        "})().catch(e => { process.stderr.write('FAIL: ' + e + '\\n'); process.exit(1); });\n"
+    )
+
+    proc = _run_node(node_script)
+    assert proc.returncode == 0, f"saveConfiguration (list view) crashed:\n{proc.stderr.strip()}"
+    return json.loads(proc.stdout.strip())
+
+
+_CAPACITY_PARAM_DEFS = {
+    "Battery": {
+        "capacity_cost_per_kw": {
+            "input": "array.float",
+            "default_value": 0.0,
+            "friendly_name": "Capacity cost",
+            "Description": "test",
+        },
+        "capacity_charge_interval_timesteps": {
+            "input": "array.int",
+            "default_value": 1,
+            "friendly_name": "Capacity interval",
+            "Description": "test",
+        },
+        "battery_nominal_energy_capacity": {
+            "input": "array.int",
+            "default_value": 5000,
+            "friendly_name": "Battery capacity",
+            "Description": "test",
+        },
+    }
+}
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not in PATH")
+def test_k1_scalar_capacity_cost_survives_list_view_save():
+    """Reproduces K1_LIST_VIEW_SCALAR_WRAP, then proves the fix: a legacy
+    scalar capacity_cost_per_kw (one rendered input) must be saved back as
+    a bare scalar, not wrapped into a one-element array.
+
+    Before the fix: capacity_cost_per_kw saved as [3.0] (array-typed
+    metadata unconditionally wins) - reroutes Optimization onto the
+    generic K=1-via-list path instead of the untouched legacy scalar path.
+    After the fix: capacity_cost_per_kw saved as 3.0 (scalar), because
+    exactly one input was actually rendered for this specific field.
+    """
+    js_src = Path("src/emhass/static/configuration_script.js").read_text(encoding="utf-8")
+    config = _run_save_list_view(
+        js_src,
+        _CAPACITY_PARAM_DEFS,
+        {
+            "capacity_cost_per_kw": [3.0],
+            "capacity_charge_interval_timesteps": [6],
+            "battery_nominal_energy_capacity": [5000],
+        },
+    )
+    assert config["capacity_cost_per_kw"] == 3.0, (
+        f"legacy scalar capacity_cost_per_kw must survive a list-view Save unchanged, got "
+        f"{config['capacity_cost_per_kw']!r}"
+    )
+    # JSON/JS has no int/float distinction (3.0 round-trips as the bare
+    # number 3) - the meaningful assertion is "not a list", already covered
+    # by the equality check above.
+    assert not isinstance(config["capacity_cost_per_kw"], list)
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not in PATH")
+def test_k1_scalar_interval_timesteps_survives_list_view_save():
+    """Same fix, second field: capacity_charge_interval_timesteps."""
+    js_src = Path("src/emhass/static/configuration_script.js").read_text(encoding="utf-8")
+    config = _run_save_list_view(
+        js_src,
+        _CAPACITY_PARAM_DEFS,
+        {
+            "capacity_cost_per_kw": [3.0],
+            "capacity_charge_interval_timesteps": [6],
+            "battery_nominal_energy_capacity": [5000],
+        },
+    )
+    assert config["capacity_charge_interval_timesteps"] == 6, (
+        f"legacy scalar capacity_charge_interval_timesteps must survive a list-view Save "
+        f"unchanged, got {config['capacity_charge_interval_timesteps']!r}"
+    )
+    assert isinstance(config["capacity_charge_interval_timesteps"], int)
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not in PATH")
+def test_k2_capacity_cost_list_survives_list_view_save():
+    """An existing K=2 capacity_cost_per_kw (two rendered inputs) must still
+    be saved back as a two-element array, unchanged."""
+    js_src = Path("src/emhass/static/configuration_script.js").read_text(encoding="utf-8")
+    config = _run_save_list_view(
+        js_src,
+        _CAPACITY_PARAM_DEFS,
+        {
+            "capacity_cost_per_kw": [3.0, 7.0],
+            "capacity_charge_interval_timesteps": [6],
+            "battery_nominal_energy_capacity": [5000],
+        },
+    )
+    assert config["capacity_cost_per_kw"] == [3.0, 7.0]
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not in PATH")
+def test_k2_cost_list_with_scalar_interval_broadcast_survives_list_view_save():
+    """K=2 capacity_cost_per_kw alongside a SCALAR (broadcast-form)
+    capacity_charge_interval_timesteps: the cost list must stay a list, and
+    the interval value - independently rendered as a single input - must
+    stay a scalar, not be forced into a one-element list just because its
+    sibling field is K>1."""
+    js_src = Path("src/emhass/static/configuration_script.js").read_text(encoding="utf-8")
+    config = _run_save_list_view(
+        js_src,
+        _CAPACITY_PARAM_DEFS,
+        {
+            "capacity_cost_per_kw": [3.0, 7.0],
+            "capacity_charge_interval_timesteps": [6],
+            "battery_nominal_energy_capacity": [5000],
+        },
+    )
+    assert config["capacity_cost_per_kw"] == [3.0, 7.0]
+    assert config["capacity_charge_interval_timesteps"] == 6
+    assert isinstance(config["capacity_charge_interval_timesteps"], int)
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not in PATH")
+def test_k2_cost_and_interval_both_lists_survive_list_view_save():
+    """K=2 with BOTH fields already lists (independent per-component
+    measurement intervals) must round-trip unchanged."""
+    js_src = Path("src/emhass/static/configuration_script.js").read_text(encoding="utf-8")
+    config = _run_save_list_view(
+        js_src,
+        _CAPACITY_PARAM_DEFS,
+        {
+            "capacity_cost_per_kw": [3.0, 7.0],
+            "capacity_charge_interval_timesteps": [6, 3],
+            "battery_nominal_energy_capacity": [5000],
+        },
+    )
+    assert config["capacity_cost_per_kw"] == [3.0, 7.0]
+    assert config["capacity_charge_interval_timesteps"] == [6, 3]
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not in PATH")
+def test_unrelated_battery_array_param_unaffected_by_capacity_fix():
+    """The targeted fix must be scoped to exactly the two capacity
+    structural params - an ordinary Battery-section array.* param
+    (e.g. battery_nominal_energy_capacity) with a SINGLE rendered input
+    (number_of_batteries == 1) must still be saved as a one-element array,
+    matching existing multi-battery behaviour untouched."""
+    js_src = Path("src/emhass/static/configuration_script.js").read_text(encoding="utf-8")
+    config = _run_save_list_view(
+        js_src,
+        _CAPACITY_PARAM_DEFS,
+        {
+            "capacity_cost_per_kw": [3.0],
+            "capacity_charge_interval_timesteps": [6],
+            "battery_nominal_energy_capacity": [5000],
+        },
+    )
+    assert config["battery_nominal_energy_capacity"] == [5000], (
+        "unrelated Battery array.* params must keep their existing metadata-driven "
+        f"(always-array) save behaviour, got {config['battery_nominal_energy_capacity']!r}"
+    )
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not in PATH")
+def test_capacity_params_get_no_plus_minus_buttons_k2_creation_is_json_only():
+    """Section 3: prove, don't assume, that the list-view genuinely cannot
+    CREATE a K>1 capacity_cost_per_kw from a K=1 config - there is no +/-
+    button for it at all, because the "Battery" section is unconditionally
+    excluded from the generic array +/- button code (see
+    `section != "Battery"` in buildParamContainers), the same exclusion
+    that already applies to every per-battery array param. Creating (or
+    changing) K therefore requires the JSON config box or a direct
+    /set-config call - this is a documented, deliberate limitation, not an
+    oversight (see docs/cookbook/tariff_demand_charge.md Step 5)."""
+    js_src = Path("src/emhass/static/configuration_script.js").read_text(encoding="utf-8")
+    fn_src = "\n".join(
+        [
+            _extract_const_src(js_src, "BATTERY_ARRAY_PARAMS"),
+            _extract_function_src(js_src, "checkConfigParam"),
+            _extract_function_src(js_src, "buildParamElement"),
+            _extract_function_src(js_src, "buildParamContainers"),
+        ]
+    )
+
+    node_script = f"""\
+{fn_src}
+
+const paramDef = {{
+  capacity_cost_per_kw: {{
+    input: "array.float", default_value: 0.0,
+    friendly_name: "Capacity cost", Description: "test"
+  }}
+}};
+const sectionBody = {{ innerHTML: "" }};
+const sectionContainer = {{
+  getElementsByClassName: (cls) => cls === "section-body" ? [sectionBody] : [],
+  querySelectorAll: () => [],
+}};
+const document = {{ getElementById: (id) => id === "Battery" ? sectionContainer : null }};
+buildParamContainers("Battery", paramDef, {{ capacity_cost_per_kw: 3.0 }}, []);
+const hasButtons = sectionBody.innerHTML.includes("input-plus") || sectionBody.innerHTML.includes("input-minus");
+process.stdout.write(hasButtons ? "HAS_BUTTONS" : "NO_BUTTONS");
+process.exit(0);
+"""
+    proc = _run_node(node_script)
+    assert proc.returncode == 0, f"buildParamContainers crashed:\n{proc.stderr.strip()}"
+    assert proc.stdout.strip() == "NO_BUTTONS", (
+        "capacity_cost_per_kw unexpectedly got +/- buttons in the Battery section - "
+        "K2_CREATION_FROM_LIST_VIEW classification (JSON_ONLY_BY_DESIGN) is stale, "
+        "update docs/cookbook/tariff_demand_charge.md Step 5"
     )
