@@ -23,6 +23,8 @@ months or AEST conversion are encoded anywhere in this file or in
 optimization.py.
 """
 
+import asyncio
+import json
 import logging
 import pathlib
 import unittest
@@ -30,11 +32,19 @@ import unittest
 import numpy as np
 import pandas as pd
 
+from emhass import utils
 from emhass.optimization import Optimization
 
 TEST_ROOT = pathlib.Path(__file__).resolve().parents[1]
-
-VALID_OPTIMAL_STATUSES = ["Optimal", "Optimal (Relaxed)"]
+_EMHASS_CONF = {
+    "data_path": TEST_ROOT / "data",
+    "root_path": TEST_ROOT / "src" / "emhass",
+    "defaults_path": TEST_ROOT / "src" / "emhass" / "data" / "config_defaults.json",
+    "associations_path": TEST_ROOT / "src" / "emhass" / "data" / "associations.csv",
+}
+_config_logger, _ = utils.get_logger(
+    "capacity_multi_component_config_test", _EMHASS_CONF, save_to_file=False
+)
 
 
 def build_optimization(
@@ -178,11 +188,11 @@ class TestCapacityMultiComponentK1Parity(unittest.TestCase):
 
         opt_scalar = build_optimization(optim_overrides={"capacity_cost_per_kw": 2.0})
         res_scalar = opt_scalar.perform_naive_mpc_optim(df, pv, load_s, n)
-        self.assertIn(opt_scalar.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt_scalar.optim_status, "Optimal")
 
         opt_list = build_optimization(optim_overrides={"capacity_cost_per_kw": [2.0]})
         res_list = opt_list.perform_naive_mpc_optim(df, pv, load_s, n)
-        self.assertIn(opt_list.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt_list.optim_status, "Optimal")
 
         self.assertAlmostEqual(
             opt_scalar.vars["peak_import"].value,
@@ -220,7 +230,7 @@ class TestCapacityMultiComponentIndependence(unittest.TestCase):
             current_period_peak=[incumbent0, incumbent1],
             capacity_charge_window=[window0, window1],
         )
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
 
         peak0 = opt.vars["peak_import_k"][0].value
         peak1 = opt.vars["peak_import_k"][1].value
@@ -283,7 +293,7 @@ class TestCapacityMultiComponentEconomicIndependence(unittest.TestCase):
             soc_final=0.5,
             current_period_peak=[0.0, 0.0],
         )
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
 
         opt2 = build_optimization(optim_overrides=self._battery_optim_overrides([2.0, 2.0]))
         res_c0_floored = opt2.perform_naive_mpc_optim(
@@ -295,7 +305,7 @@ class TestCapacityMultiComponentEconomicIndependence(unittest.TestCase):
             soc_final=0.5,
             current_period_peak=[10000.0, 0.0],
         )
-        self.assertIn(opt2.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt2.optim_status, "Optimal")
         peak0_val = opt2.vars["peak_import_k"][0].value
         peak1_val = opt2.vars["peak_import_k"][1].value
 
@@ -324,7 +334,7 @@ class TestCapacityMultiComponentEconomicIndependence(unittest.TestCase):
             soc_final=0.5,
             current_period_peak=0.0,
         )
-        self.assertIn(opt_single.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt_single.optim_status, "Optimal")
         np.testing.assert_allclose(
             res_c0_floored["P_grid_pos"].to_numpy(),
             res_single["P_grid_pos"].to_numpy(),
@@ -347,7 +357,7 @@ class TestCapacityMultiComponentEconomicIndependence(unittest.TestCase):
             soc_final=0.5,
             current_period_peak=[0.0, 10000.0],
         )
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
         peak0_val = opt.vars["peak_import_k"][0].value
         peak1_val = opt.vars["peak_import_k"][1].value
 
@@ -377,7 +387,7 @@ class TestCapacityMultiComponentIntervalAggregation(unittest.TestCase):
             }
         )
         opt.perform_naive_mpc_optim(df, pv, load_s, n)
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
 
         self.assertTrue(opt._capacity_interval_aggregation_active_list[0])
         self.assertTrue(opt._capacity_interval_aggregation_active_list[1])
@@ -444,7 +454,7 @@ class TestCapacityMultiComponentPartialHistory(unittest.TestCase):
             n,
             capacity_charge_current_interval_history=[[500.0, 500.0], []],
         )
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
 
         # Component 0: interval endpoint at decision index e0 = 4-1-2 = 1.
         # Q0 = (500 + 500 + load[0] + load[1]) / 4 = (500+500+2000+2000)/4 = 1250 W
@@ -494,11 +504,11 @@ class TestCapacityMultiComponentDisabled(unittest.TestCase):
 
         opt_baseline = build_optimization(optim_overrides={"capacity_cost_per_kw": [3.0]})
         res_baseline = opt_baseline.perform_naive_mpc_optim(df, pv, load_s, n)
-        self.assertIn(opt_baseline.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt_baseline.optim_status, "Optimal")
 
         opt_with_disabled = build_optimization(optim_overrides={"capacity_cost_per_kw": [3.0, 0.0]})
         res_with_disabled = opt_with_disabled.perform_naive_mpc_optim(df, pv, load_s, n)
-        self.assertIn(opt_with_disabled.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt_with_disabled.optim_status, "Optimal")
 
         self.assertIsNone(
             opt_with_disabled.vars["peak_import_k"][1],
@@ -533,7 +543,7 @@ class TestCapacityMultiComponentDppCache(unittest.TestCase):
             current_period_peak=[100.0, 200.0],
             capacity_charge_window=[[1, 1, 1, 0, 0, 0], [0, 0, 0, 1, 1, 1]],
         )
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
         self.assertTrue(opt.prob.is_dpp())
         prob_id = id(opt.prob)
 
@@ -546,7 +556,7 @@ class TestCapacityMultiComponentDppCache(unittest.TestCase):
             current_period_peak=[500.0, 900.0],
             capacity_charge_window=[[0, 1, 1, 0, 0, 0], [0, 0, 1, 1, 1, 0]],
         )
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
         self.assertTrue(opt.prob.is_dpp())
         self.assertEqual(
             id(opt.prob),
@@ -563,10 +573,110 @@ class TestCapacityMultiComponentDppCache(unittest.TestCase):
         objs = []
         for _ in range(3):
             opt.perform_naive_mpc_optim(df, pv, load_s, n, current_period_peak=[100.0, 200.0])
-            self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+            self.assertEqual(opt.optim_status, "Optimal")
             objs.append(opt.prob.value)
         self.assertAlmostEqual(objs[0], objs[1], places=6)
         self.assertAlmostEqual(objs[1], objs[2], places=6)
+
+    def test_n_gt_1_partial_history_updates_do_not_rebuild(self):
+        """Remediation item 2: N>1 aggregated path, two active components, on
+        the SAME Optimization instance. Solve A supplies independent
+        incumbents/windows/partial histories; solve B changes all three.
+        Proves: id(opt.prob) unchanged, prob stays DPP, each component's
+        (A, c) Parameter values actually update, no component receives
+        another's history, resulting peaks change exactly as hand-computed,
+        and status is ordinary Optimal both times.
+        """
+        n = 12
+        load = np.zeros(n)
+        load[1] = 6000.0  # inside component 0's interval [0:6) and component 1's interval [0:3)
+        load[7] = 9000.0  # inside component 0's interval [6:12) and component 1's interval [6:9)
+        _, pv, load_s, df = make_scenario(n, load.tolist())
+
+        opt = build_optimization(
+            optim_overrides={
+                "capacity_cost_per_kw": [1.0, 1.0],
+                "capacity_charge_interval_timesteps": [6, 3],
+            }
+        )
+
+        # --- Solve A ---
+        opt.perform_naive_mpc_optim(
+            df,
+            pv,
+            load_s,
+            n,
+            current_period_peak=[50.0, 50.0],
+            capacity_charge_window=[[1] * n, [1] * n],
+            capacity_charge_current_interval_history=[[6000.0, 6000.0], [9000.0]],
+        )
+        self.assertEqual(opt.optim_status, "Optimal")
+        self.assertTrue(opt.prob.is_dpp())
+        prob_id = id(opt.prob)
+
+        matrix0_a = opt.param_capacity_interval_matrix_k[0].value.copy()
+        matrix1_a = opt.param_capacity_interval_matrix_k[1].value.copy()
+        contribution0_a = opt.param_capacity_realised_contribution_k[0].value.copy()
+        contribution1_a = opt.param_capacity_realised_contribution_k[1].value.copy()
+
+        peak0_a = opt.vars["peak_import_k"][0].value
+        peak1_a = opt.vars["peak_import_k"][1].value
+        # Hand-computed: component 0 (N=6), history=[6000,6000] -> e0=3.
+        # interval0 = (12000 + p[0..3]) / 6 = (12000 + 6000) / 6 = 3000.
+        # interval1 = p[4..9] / 6 = 9000 / 6 = 1500. peak0 = max(3000, 1500) = 3000.
+        self.assertAlmostEqual(peak0_a, 3000.0, places=3)
+        # component 1 (N=3), history=[9000] -> e0=1.
+        # interval0 = (9000 + p[0..1]) / 3 = (9000 + 6000) / 3 = 5000.
+        # interval2 = p[6..8] / 3 = 9000 / 3 = 3000. peak1 = max(5000, 0, 3000, 0) = 5000.
+        self.assertAlmostEqual(peak1_a, 5000.0, places=3)
+
+        # --- Solve B: change incumbents, windows (all-ones, unchanged value
+        # but re-supplied) and - the point of this test - partial histories. ---
+        opt.perform_naive_mpc_optim(
+            df,
+            pv,
+            load_s,
+            n,
+            current_period_peak=[80.0, 80.0],
+            capacity_charge_window=[[1] * n, [1] * n],
+            capacity_charge_current_interval_history=[[], []],
+        )
+        self.assertEqual(opt.optim_status, "Optimal")
+        self.assertTrue(opt.prob.is_dpp())
+        self.assertEqual(
+            id(opt.prob), prob_id, msg="N>1 partial-history updates must not rebuild the problem"
+        )
+
+        matrix0_b = opt.param_capacity_interval_matrix_k[0].value.copy()
+        matrix1_b = opt.param_capacity_interval_matrix_k[1].value.copy()
+        contribution0_b = opt.param_capacity_realised_contribution_k[0].value.copy()
+        contribution1_b = opt.param_capacity_realised_contribution_k[1].value.copy()
+
+        # Parameters actually changed between calls (not stale/cached values).
+        self.assertFalse(np.array_equal(matrix0_a, matrix0_b))
+        self.assertFalse(np.array_equal(matrix1_a, matrix1_b))
+        self.assertFalse(np.array_equal(contribution0_a, contribution0_b))
+        self.assertFalse(np.array_equal(contribution1_a, contribution1_b))
+        # No cross-component contamination: in solve A, component 0's first-row
+        # realised contribution reflects ONLY its own history ([6000, 6000] ->
+        # w*(12000/6)=2000.0), and component 1's reflects ONLY its own
+        # history ([9000] -> w*(9000/3)=3000.0). If either component had
+        # picked up the other's history, these would match by construction.
+        self.assertAlmostEqual(contribution0_a[0], 2000.0, places=3)
+        self.assertAlmostEqual(contribution1_a[0], 3000.0, places=3)
+        self.assertNotAlmostEqual(contribution0_a[0], contribution1_a[0], places=1)
+
+        peak0_b = opt.vars["peak_import_k"][0].value
+        peak1_b = opt.vars["peak_import_k"][1].value
+        # component 0, empty history -> e0=5. interval0 = p[0..5]/6 = 6000/6=1000.
+        # interval1 = p[6..11]/6 = 9000/6=1500. peak0 = max(1000, 1500) = 1500.
+        self.assertAlmostEqual(peak0_b, 1500.0, places=3)
+        # component 1, empty history -> e0=2. interval0 = p[0..2]/3 = 6000/3=2000.
+        # interval2 = p[6..8]/3 = 9000/3=3000. peak1 = max(2000, 0, 3000, 0) = 3000.
+        self.assertAlmostEqual(peak1_b, 3000.0, places=3)
+        # Peaks materially changed as hand-expected purely from the history change.
+        self.assertNotAlmostEqual(peak0_a, peak0_b, places=1)
+        self.assertNotAlmostEqual(peak1_a, peak1_b, places=1)
 
 
 class TestCapacityMultiComponentHorizonResize(unittest.TestCase):
@@ -584,7 +694,7 @@ class TestCapacityMultiComponentHorizonResize(unittest.TestCase):
             }
         )
         opt.perform_naive_mpc_optim(df, pv, load_s, horizon_a)
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
         shape0_a = opt.param_capacity_interval_matrix_k[0].value.shape
         shape1_a = opt.param_capacity_interval_matrix_k[1].value.shape
         self.assertEqual(shape0_a, (int(np.ceil(horizon_a / 6)), horizon_a))
@@ -592,7 +702,7 @@ class TestCapacityMultiComponentHorizonResize(unittest.TestCase):
         self.assertEqual(opt.param_capacity_window_k[0].value.shape, (horizon_a,))
 
         opt.perform_naive_mpc_optim(df, pv, load_s, horizon_b)
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
         shape0_b = opt.param_capacity_interval_matrix_k[0].value.shape
         shape1_b = opt.param_capacity_interval_matrix_k[1].value.shape
         self.assertEqual(shape0_b, (int(np.ceil(horizon_b / 6)), horizon_b))
@@ -628,7 +738,7 @@ class TestCapacityMultiComponentInvalidInput(unittest.TestCase):
                 n,
                 current_period_peak=5000.0,  # bare scalar, not a K-length list
             )
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
         self.assertTrue(any("current_period_peak" in line for line in logs.output))
         self.assertAlmostEqual(opt.param_current_period_peak_k[0].value, 0.0)
         self.assertAlmostEqual(opt.param_current_period_peak_k[1].value, 0.0)
@@ -646,7 +756,7 @@ class TestCapacityMultiComponentInvalidInput(unittest.TestCase):
                 n,
                 capacity_charge_window=[[1] * n],  # wrong outer length (1 vs K=2)
             )
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
         np.testing.assert_array_equal(opt.param_capacity_window_k[0].value, np.ones(n))
         np.testing.assert_array_equal(opt.param_capacity_window_k[1].value, np.ones(n))
 
@@ -671,7 +781,7 @@ class TestCapacityMultiComponentInvalidInput(unittest.TestCase):
                     [1.0],
                 ],
             )
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
         self.assertTrue(any("capacity_cost_per_kw[0]" in line for line in logs.output))
         # Component 0 (invalid) falls back to empty history; component 1 (valid) is unaffected.
         np.testing.assert_array_equal(
@@ -694,7 +804,7 @@ class TestCapacityMultiComponentOverlappingWindows(unittest.TestCase):
 
         opt = build_optimization(optim_overrides={"capacity_cost_per_kw": [2.0, 5.0]})
         opt.perform_naive_mpc_optim(df, pv, load_s, n, capacity_charge_window=[window0, window1])
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
         peak0 = opt.vars["peak_import_k"][0].value
         peak1 = opt.vars["peak_import_k"][1].value
         self.assertAlmostEqual(peak0, 6000.0, places=3)
@@ -756,7 +866,7 @@ class TestCapacityTariff023Fixture(unittest.TestCase):
             current_period_peak=[200.0, 350.0],  # placeholder incumbents
             capacity_charge_window=[window_w1, window_w2],
         )
-        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.optim_status, "Optimal")
 
         # Both components independently active and structurally distinct.
         self.assertEqual(opt.n_capacity_components, 2)
@@ -772,6 +882,211 @@ class TestCapacityTariff023Fixture(unittest.TestCase):
         # (sanity check that price columns actually reached the objective).
         self.assertIn("unit_load_cost", res.columns)
         self.assertTrue((res["unit_load_cost"].to_numpy() == np.array(unit_load_cost)).all())
+
+    def _run_price_scenario(self, unit_load_cost):
+        """Two demand components (N=6, 30-min clocked basis) with
+        NON-OVERLAPPING windows on the outer two intervals, each incumbent
+        set exactly at the flat load (1000 W) so peak-shaving has zero
+        marginal value on its own - any battery action is driven purely by
+        energy-price arbitrage in the middle interval, which neither
+        component's window covers at all (capacity-charge-neutral), plus a
+        caller-supplied import-price signal. Returns (opt, res)."""
+        n = 18
+        unit_prod_price = [0.02] * n
+        load = np.full(n, 1000.0)
+        index = pd.date_range("2026-06-01", periods=n, freq="5min", tz="Australia/Sydney")
+        p_pv = pd.Series(np.zeros(n), index=index)
+        p_load = pd.Series(load, index=index)
+        df_input = pd.DataFrame(index=index)
+        df_input["unit_load_cost"] = unit_load_cost
+        df_input["unit_prod_price"] = unit_prod_price
+
+        window_w1 = [1] * 6 + [0] * 12  # only the first interval
+        window_w2 = [0] * 12 + [1] * 6  # only the last interval
+
+        opt = build_optimization(
+            optim_overrides={
+                "set_use_battery": True,
+                "capacity_cost_per_kw": [4.0, 9.0],
+                "capacity_charge_interval_timesteps": [6, 6],
+                "weight_battery_charge": 0.01,
+                "weight_battery_discharge": 0.01,
+            },
+            plant_overrides={
+                "battery_nominal_energy_capacity": 8000,
+                "battery_discharge_power_max": 3000,
+                "battery_charge_power_max": 3000,
+                "battery_minimum_state_of_charge": 0.1,
+                "battery_maximum_state_of_charge": 0.9,
+            },
+        )
+        res = opt.perform_naive_mpc_optim(
+            df_input,
+            p_pv,
+            p_load,
+            n,
+            soc_init=0.5,
+            soc_final=0.5,
+            current_period_peak=[
+                1000.0,
+                1000.0,
+            ],  # exactly the flat load: shaving has no marginal value
+            capacity_charge_window=[window_w1, window_w2],
+        )
+        return opt, res
+
+    def test_energy_price_signal_changes_dispatch_with_both_demand_components_active(self):
+        """Remediation item 4: strengthen the tariff-023 fixture with a
+        controllable flexible resource (battery) and a genuinely
+        time-varying import-price signal, then flip that price signal and
+        prove:
+
+        - the energy-price objective still materially changes an
+          economically rational dispatch decision (the battery arbitrages a
+          cheap middle-interval price window it otherwise has no reason to
+          touch), while
+        - both independent demand components remain active (floored at
+          their own incumbent) throughout - this is one joint optimisation,
+          not demand overriding energy economics or vice versa.
+        """
+        # Scenario A: the middle interval (6:12) is cheap relative to the
+        # outer two - profitable to charge there and discharge into the
+        # (pricier) outer-interval load instead of importing for it directly.
+        price_a = [0.20] * 6 + [0.05] * 6 + [0.20] * 6
+        # Scenario B: the middle interval is instead the MOST expensive -
+        # charging there to discharge into 0.20-priced load is a losing
+        # trade even after the (small) wear cost, so no arbitrage is
+        # rational and the battery should sit idle.
+        price_b = [0.20] * 6 + [0.35] * 6 + [0.20] * 6
+
+        opt_a, res_a = self._run_price_scenario(price_a)
+        opt_b, res_b = self._run_price_scenario(price_b)
+
+        self.assertEqual(opt_a.optim_status, "Optimal")
+        self.assertEqual(opt_b.optim_status, "Optimal")
+
+        # Both components remain independently active (floored exactly at
+        # their own 1000 W incumbent) under BOTH price signals - the
+        # capacity charge is not being switched off or overridden by the
+        # energy-price change, and stays IDENTICAL between scenarios
+        # (proving the middle-interval arbitrage genuinely does not touch
+        # either component's window).
+        for opt in (opt_a, opt_b):
+            self.assertEqual(opt.n_capacity_components, 2)
+            self.assertAlmostEqual(opt.vars["peak_import_k"][0].value, 1000.0, places=3)
+            self.assertAlmostEqual(opt.vars["peak_import_k"][1].value, 1000.0, places=3)
+
+        # Economically rational dispatch decision flips with the price
+        # signal: the middle interval - covered by NEITHER component's
+        # window, so this comparison is fully isolated from peak-shaving -
+        # sees genuine battery charging activity when cheap (A) and none at
+        # all when expensive (B).
+        p_batt_a = res_a["P_batt"].to_numpy()
+        p_batt_b = res_b["P_batt"].to_numpy()
+        middle_a = p_batt_a[6:12]
+        middle_b = p_batt_b[6:12]
+
+        self.assertTrue(
+            (middle_a < -100.0).any(),
+            msg=f"expected genuine battery charging in the cheap middle interval (A), got {middle_a}",
+        )
+        self.assertTrue(
+            np.allclose(middle_b, 0.0),
+            msg=f"expected no battery activity in the expensive middle interval (B) - arbitrage is unprofitable there, got {middle_b}",
+        )
+        # The dispatch actually differs materially, not just numerically at
+        # the noise floor.
+        self.assertGreater(abs(middle_a.mean() - middle_b.mean()), 300.0)
+
+
+def _default_config() -> dict:
+    return json.loads(_EMHASS_CONF["defaults_path"].read_text(encoding="utf-8"))
+
+
+async def _build_params(overrides: dict | None = None) -> dict:
+    config = _default_config()
+    if overrides:
+        config.update(overrides)
+    _, secrets = await utils.build_secrets(_EMHASS_CONF, _config_logger, no_response=True)
+    params = await utils.build_params(_EMHASS_CONF, secrets, config, _config_logger)
+    assert params is not False, "build_params failed (see logged error)"
+    return params
+
+
+def _round_trip_config(overrides: dict) -> dict:
+    """config.json dict -> build_params -> param_to_config -> config.json dict,
+    exactly the two-step pipeline both /get-config and /set-config use
+    (see web_server.py parameter_get / parameter_set). No Optimization
+    object involved - this isolates the config-layer transport only."""
+    params = asyncio.run(_build_params(overrides))
+    return utils.param_to_config(params, _config_logger)
+
+
+class TestCapacityMultiComponentConfigRoundTrip(unittest.TestCase):
+    """Remediation item 1.B: the K>1 list form must survive the exact
+    build_params / param_to_config pipeline used by both
+    GET /get-config and POST /set-config - proven directly against that
+    pipeline, not inferred from the OpenAPI type declaration."""
+
+    def test_list_capacity_cost_survives_round_trip(self):
+        out = _round_trip_config({"capacity_cost_per_kw": [3.0, 7.5, 0.0]})
+        self.assertEqual(out["capacity_cost_per_kw"], [3.0, 7.5, 0.0])
+
+    def test_list_interval_timesteps_survives_round_trip(self):
+        out = _round_trip_config(
+            {
+                "capacity_cost_per_kw": [2.0, 2.0],
+                "capacity_charge_interval_timesteps": [6, 3],
+            }
+        )
+        self.assertEqual(out["capacity_cost_per_kw"], [2.0, 2.0])
+        self.assertEqual(out["capacity_charge_interval_timesteps"], [6, 3])
+
+    def test_scalar_legacy_form_still_survives_round_trip(self):
+        """K=1 legacy scalar form must round-trip unchanged (byte-identical
+        type), not get silently coerced to a list anywhere in the config
+        pipeline - only the UI's own array-typed metadata affects rendering/
+        saving in the browser (see docs/cookbook/tariff_demand_charge.md);
+        the JSON transport itself is fully type-preserving."""
+        out = _round_trip_config({"capacity_cost_per_kw": 8.0})
+        self.assertEqual(out["capacity_cost_per_kw"], 8.0)
+        self.assertIsInstance(out["capacity_cost_per_kw"], float)
+
+    def test_scalar_result_feeds_legacy_k1_optimization_path(self):
+        """End-to-end: a round-tripped scalar config value, fed straight into
+        Optimization, still takes the untouched K=1 legacy path (not the
+        generic K>1-with-K=1 path) - the config layer never silently
+        reshapes a scalar into a list."""
+        out = _round_trip_config({"capacity_cost_per_kw": 8.0})
+        opt = Optimization(
+            {
+                "optimization_time_step": pd.to_timedelta(5, "minutes"),
+                "time_zone": "Europe/Tallinn",
+                "sensor_power_photovoltaics": "pv",
+                "sensor_power_load_no_var_loads": "load",
+            },
+            {
+                **out,
+                "delta_forecast_daily": pd.Timedelta(hours=1),
+                "set_use_battery": False,
+                "set_use_pv": False,
+                "number_of_deferrable_loads": 0,
+                "set_nodischarge_to_grid": True,
+            },
+            {
+                "inverter_is_hybrid": False,
+                "compute_curtailment": False,
+                "maximum_power_from_grid": 50000,
+                "maximum_power_to_grid": 50000,
+            },
+            "unit_load_cost",
+            "unit_prod_price",
+            "profit",
+            {"root_path": TEST_ROOT / "src" / "emhass", "data_path": TEST_ROOT / "data"},
+            _config_logger,
+            opt_time_delta=5,
+        )
+        self.assertFalse(opt._capacity_multi)
 
 
 if __name__ == "__main__":

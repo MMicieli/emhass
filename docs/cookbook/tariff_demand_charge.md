@@ -219,8 +219,12 @@ Rules, all enforced structurally (never silently guessed or cross-coupled):
   list of exactly `K` entries for independent per-component measurement
   bases.
 - A component with `capacity_cost_per_kw <= 0` has no economic effect at
-  all - not just a zero price: no variable, no constraint, no Parameter is
-  created for it, exactly like the `K=1` opt-in gate.
+  all - not just a zero price: no `peak_import` variable, no epigraph
+  constraint, no interval-aggregation Parameters and no objective term are
+  created for it, exactly like the `K=1` opt-in gate. (Its window-mask and
+  incumbent-peak Parameter holders are still created, harmlessly unused,
+  since every component gets those uniformly - only the pieces that could
+  actually affect the solve are conditional on the rate.)
 - Components may legitimately overlap (the same import can raise more than
   one component's priced peak); each component's cost is still applied
   independently and summed into the one objective.

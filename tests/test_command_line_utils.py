@@ -567,6 +567,71 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(opt_res.isnull().sum().sum(), 0)
         self.assertEqual(len(opt_res), 10)
 
+    async def test_naive_mpc_optim_multi_capacity_component_runtime_transport(self):
+        """Issue #540 Part B, remediation item D: prove the FULL production
+        transport path (treat_runtimeparams -> command_line.naive_mpc_optim
+        -> Optimization.perform_naive_mpc_optim), not just a direct
+        Optimization call, forwards K>1 nested capacity-charge runtime
+        parameters intact - no flattening, truncation or cross-coupling
+        introduced anywhere in command_line.py / utils.py plumbing.
+        """
+        costfun = "profit"
+        action = "naive-mpc-optim"
+        params = copy.deepcopy(orjson.loads(self.params_json))
+        params["optim_conf"]["capacity_cost_per_kw"] = [3.0, 7.0]
+        params["optim_conf"]["capacity_charge_interval_timesteps"] = [1, 1]
+        runtimeparams = {
+            "pv_power_forecast": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "prediction_horizon": 10,
+            "soc_init": 0.5,
+            "soc_final": 0.5,
+            "current_period_peak": [100.0, 200.0],
+            "capacity_charge_window": [
+                [1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 1, 1, 1, 1, 1],
+            ],
+        }
+        runtimeparams_json = orjson.dumps(runtimeparams).decode("utf-8")
+        params["passed_data"] = runtimeparams
+        params["optim_conf"]["weather_forecast_method"] = "list"
+        params["optim_conf"]["load_forecast_method"] = "naive"
+        params["optim_conf"]["load_cost_forecast_method"] = "hp_hc_periods"
+        params["optim_conf"]["production_price_forecast_method"] = "constant"
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            costfun,
+            params_json,
+            runtimeparams_json,
+            action,
+            logger,
+            get_data_from_file=True,
+        )
+        opt_res = await naive_mpc_optim(input_data_dict, logger, debug=True)
+        self.assertIsInstance(opt_res, pd.DataFrame)
+        self.assertEqual(opt_res.isnull().sum().sum(), 0)
+
+        opt = input_data_dict["opt"]
+        self.assertTrue(opt._capacity_multi)
+        self.assertEqual(opt.n_capacity_components, 2)
+        self.assertEqual(opt.optim_status, "Optimal")
+        self.assertIn("peak_import_k", opt.vars)
+        self.assertIsNotNone(opt.vars["peak_import_k"][0])
+        self.assertIsNotNone(opt.vars["peak_import_k"][1])
+        # Independent incumbents/windows actually reached their OWN component
+        # Parameter, not each other's (no cross-coupling through the full
+        # production transport path).
+        self.assertAlmostEqual(opt.param_current_period_peak_k[0].value, 100.0, places=6)
+        self.assertAlmostEqual(opt.param_current_period_peak_k[1].value, 200.0, places=6)
+        np.testing.assert_array_equal(
+            opt.param_capacity_window_k[0].value,
+            np.array([1, 1, 1, 1, 1, 0, 0, 0, 0, 0], dtype=float),
+        )
+        np.testing.assert_array_equal(
+            opt.param_capacity_window_k[1].value,
+            np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1], dtype=float),
+        )
+
     # Test outputs of fit, predict and tune
     async def test_forecast_model_fit_predict_tune(self):
         costfun = "profit"
@@ -3131,6 +3196,96 @@ class TestOptimizationCache(unittest.TestCase):
             num_timesteps=668,
         )
 
+        self.assertIsNotNone(result)
+        self.assertIs(result, mock_opt)
+
+    # --- Issue #540 Part B, remediation item 3: structural cache-key proof ---
+
+    def test_cache_miss_capacity_cost_scalar_to_list_changed(self):
+        """Switching capacity_cost_per_kw from a scalar to a list (K=1
+        legacy path -> generic K>1-with-K=1 path) must invalidate the cache:
+        it is a different code path/model structure even at the same K."""
+        mock_opt = MagicMock()
+        base = {**self.optim_conf, "capacity_cost_per_kw": 3.0}
+        OptimizationCache.put(
+            mock_opt, base, self.plant_conf, self.costfun, self.retrieve_hass_conf, self.logger
+        )
+
+        changed = {**self.optim_conf, "capacity_cost_per_kw": [3.0]}
+        result = OptimizationCache.get(
+            changed, self.plant_conf, self.costfun, self.retrieve_hass_conf, self.logger
+        )
+        self.assertIsNone(result)
+
+    def test_cache_miss_capacity_component_count_changed(self):
+        """Changing K (list length) must invalidate the cache - a different
+        number of components means a different number of decision
+        variables/constraints."""
+        mock_opt = MagicMock()
+        base = {**self.optim_conf, "capacity_cost_per_kw": [3.0, 7.0]}
+        OptimizationCache.put(
+            mock_opt, base, self.plant_conf, self.costfun, self.retrieve_hass_conf, self.logger
+        )
+
+        changed = {**self.optim_conf, "capacity_cost_per_kw": [3.0, 7.0, 1.0]}
+        result = OptimizationCache.get(
+            changed, self.plant_conf, self.costfun, self.retrieve_hass_conf, self.logger
+        )
+        self.assertIsNone(result)
+
+    def test_cache_miss_capacity_interval_timesteps_structural_changed(self):
+        """Changing capacity_charge_interval_timesteps (structural N, scalar
+        or per-component list) must invalidate the cache - it changes
+        whether/how the interval-aggregation matrix Parameters exist."""
+        mock_opt = MagicMock()
+        base = {
+            **self.optim_conf,
+            "capacity_cost_per_kw": [2.0, 2.0],
+            "capacity_charge_interval_timesteps": [6, 3],
+        }
+        OptimizationCache.put(
+            mock_opt, base, self.plant_conf, self.costfun, self.retrieve_hass_conf, self.logger
+        )
+
+        changed = {
+            **self.optim_conf,
+            "capacity_cost_per_kw": [2.0, 2.0],
+            "capacity_charge_interval_timesteps": [6, 4],
+        }
+        result = OptimizationCache.get(
+            changed, self.plant_conf, self.costfun, self.retrieve_hass_conf, self.logger
+        )
+        self.assertIsNone(result)
+
+    def test_cache_hit_capacity_runtime_only_fields_unchanged(self):
+        """Ordinary runtime incumbent/window/history changes must NOT be
+        part of optim_conf at all (they are passed_data, resolved per-call
+        inside perform_optimization), so a config that is otherwise
+        identical except for capacity_cost_per_kw/capacity_charge_interval_timesteps
+        staying the SAME must still hit the cache - proving those two
+        structural keys don't spuriously churn the cache key when nothing
+        about them actually changed."""
+        mock_opt = MagicMock()
+        base = {
+            **self.optim_conf,
+            "capacity_cost_per_kw": [2.0, 2.0],
+            "capacity_charge_interval_timesteps": [6, 3],
+        }
+        OptimizationCache.put(
+            mock_opt, base, self.plant_conf, self.costfun, self.retrieve_hass_conf, self.logger
+        )
+
+        # Re-request with an identically-valued (but freshly constructed) dict -
+        # runtime incumbent/window/history are never part of optim_conf, so
+        # there is nothing here that could leak into the structural key.
+        same = {
+            **self.optim_conf,
+            "capacity_cost_per_kw": [2.0, 2.0],
+            "capacity_charge_interval_timesteps": [6, 3],
+        }
+        result = OptimizationCache.get(
+            same, self.plant_conf, self.costfun, self.retrieve_hass_conf, self.logger
+        )
         self.assertIsNotNone(result)
         self.assertIs(result, mock_opt)
 

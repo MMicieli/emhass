@@ -60,6 +60,16 @@ _KNOWN_TYPE_MISMATCHES = frozenset(
         # byte-identical.
         "sensor_power_battery",
         "sensor_battery_state_of_charge",
+        # #540 Part B: declared array.* because they accept K independent
+        # capacity/demand-charge components as a list, but their defaults stay
+        # bare scalars on purpose - a scalar routes through the untouched K=1
+        # legacy code path entirely (see Optimization.__init__), which a
+        # single-element list does NOT (it opts into the generic K>1 path
+        # instead - mathematically equivalent, but a different code path), so
+        # keeping the published default a bare scalar is deliberate, exactly
+        # mirroring the battery_* precedent above.
+        "capacity_cost_per_kw",
+        "capacity_charge_interval_timesteps",
     }
 )
 

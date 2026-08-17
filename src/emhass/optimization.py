@@ -2297,8 +2297,15 @@ class Optimization:
             # never share incumbent state, window, cost, or interval
             # aggregation/history - each references only its own
             # param_*_k[k] Parameters. A component with cost <= 0 gets no
-            # variable, no constraint, no Parameters at all: "no economic
-            # effect" is structural, not just a zero price.
+            # peak_import variable, no epigraph constraint, no interval-
+            # aggregation Parameters and no objective term: it is
+            # mathematically absent from the problem, so its "no economic
+            # effect" is structural, not just a zero price. (Its harmless,
+            # unused window-mask and incumbent-peak Parameter holders are
+            # still created in __init__ for every component uniformly - see
+            # _init_capacity_window_params_multi /
+            # _init_current_period_peak_params_multi - since nothing ever
+            # reads them without a peak_import[k] to constrain.)
             vars_dict["peak_import_k"] = [None] * self.n_capacity_components
             for k in range(self.n_capacity_components):
                 if self._capacity_cost_per_kw_list[k] <= 0:
