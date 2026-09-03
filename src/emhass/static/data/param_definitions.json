@@ -810,15 +810,15 @@
     },
     "capacity_cost_per_kw": {
       "friendly_name": "Capacity (demand) charge cost",
-      "Description": "Cost in currency per kW applied once to the modelled capacity/demand peak. 0 (default) disables the feature. With capacity_charge_interval_timesteps=1 the peak is the highest eligible positive-import timestep; with N>1 it is the highest eligible completed tariff-interval average. Set this to the marginal billed cost of increasing the applicable peak by 1 kW.",
-      "input": "float",
+      "Description": "Cost in currency per kW applied once to the modelled capacity/demand peak. 0 (default) disables the feature. With capacity_charge_interval_timesteps=1 the peak is the highest eligible positive-import timestep; with N>1 it is the highest eligible completed tariff-interval average. Set this to the marginal billed cost of increasing the applicable peak by 1 kW. A bare value models one capacity/demand component; a list of K rates (issue #540 Part B) models K independent capacity/demand components priced in the same single optimisation (e.g. a seasonal-demand and an off-peak-demand charge on one tariff), each with its own rate, measurement interval, eligibility window, MPC consideration and already-incurred incumbent peak. A component whose rate is 0 has no economic effect. With a list here, current_period_peak, capacity_charge_window, capacity_charge_consideration and capacity_charge_current_interval_history must each be passed as a list of exactly K entries; capacity_charge_interval_timesteps may be a bare value (shared measurement basis) or a list of K.",
+      "input": "array.float",
       "default_value": 0.0,
       "unit": "¤/kW"
     },
     "capacity_charge_interval_timesteps": {
       "friendly_name": "Capacity charge tariff measurement interval",
-      "Description": "Number of native optimisation timesteps in one tariff demand-measurement interval. 1 (default) preserves per-timestep capacity charging; N>1 prices completed N-timestep average import. Example: 30-minute demand with a 5-minute optimisation step uses 6. Only effective when capacity_cost_per_kw > 0.",
-      "input": "int",
+      "Description": "Number of native optimisation timesteps in one tariff demand-measurement interval. 1 (default) preserves per-timestep capacity charging; N>1 prices completed N-timestep average import. Example: 30-minute demand with a 5-minute optimisation step uses 6. Only effective when capacity_cost_per_kw > 0. When capacity_cost_per_kw is a list of K rates (issue #540 Part B) this may be a bare value (broadcast to every component, e.g. a shared 30-minute measurement basis) or a list of exactly K entries for independent per-component measurement intervals; a mismatched list length falls back to N=1 for every component with a warning.",
+      "input": "array.int",
       "default_value": 1,
       "unit": "timesteps"
     },
