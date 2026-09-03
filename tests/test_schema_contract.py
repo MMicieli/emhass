@@ -60,6 +60,13 @@ _KNOWN_TYPE_MISMATCHES = frozenset(
         # byte-identical.
         "sensor_power_battery",
         "sensor_battery_state_of_charge",
+        # #540 Part B: declared array.* because they accept a list of K
+        # independent capacity/demand components, but their defaults stay bare
+        # scalars on purpose - a scalar is the K=1 capacity charge and keeps
+        # existing single-component configs byte-identical (same pattern as the
+        # battery_* block above).
+        "capacity_cost_per_kw",
+        "capacity_charge_interval_timesteps",
     }
 )
 
