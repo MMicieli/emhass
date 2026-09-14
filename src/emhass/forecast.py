@@ -65,6 +65,7 @@ from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 
 from emhass.machine_learning_forecaster import MLForecaster
 from emhass.machine_learning_regressor import MLRegressor
+from emhass.pv_bias_calibration import blend_pv_quantiles
 from emhass.retrieve_hass import RetrieveHass
 from emhass.utils import add_date_features, get_days_list, set_df_index_freq
 
@@ -755,7 +756,7 @@ class Forecast:
                         if bias > 0.0:
                             p10 = elm.get("pv_estimate10")
                             if p10 is not None:
-                                est = bias * p10 + (1.0 - bias) * p50
+                                est = blend_pv_quantiles(p10, p50, bias)
                             else:
                                 est = p50
                         else:
@@ -864,7 +865,17 @@ class Forecast:
         return data
 
     def _get_weather_list(self) -> pd.DataFrame:
-        """Helper to retrieve weather data from a passed list."""
+        """Helper to retrieve weather data from a passed list.
+
+        Supports an optional caller-supplied PV P10 companion
+        (``pv_power_forecast_p10``, issue #1128) alongside the P50
+        ``pv_power_forecast``. When present, the two are blended with the same
+        ``weather_forecast_pv_quantile_bias`` semantics as the native Solcast
+        path (:func:`emhass.pv_bias_calibration.blend_pv_quantiles`). ``utils.
+        treat_runtimeparams`` already validated and aligned the P10 companion
+        onto the same forecast grid as ``pv_power_forecast`` (or discarded it
+        with a logged error), so no further alignment/validation happens here.
+        """
         data_list = self.params["passed_data"]["pv_power_forecast"]
         forecast_dates = self.forecast_dates_tz
         if data_list is None or (
@@ -874,6 +885,13 @@ class Forecast:
             self.logger.error(error_msg_list_not_long_enough)
             return None
         data_list = data_list[: len(forecast_dates)]
+        p10_list = self.params["passed_data"].get("pv_power_forecast_p10")
+        bias = self._parse_pv_quantile_bias()
+        if p10_list is not None and bias > 0.0:
+            p10_list = p10_list[: len(data_list)]
+            data_list = [
+                blend_pv_quantiles(p10, p50, bias) for p10, p50 in zip(p10_list, data_list)
+            ]
         data_dict = {"ts": forecast_dates, "yhat": data_list}
         data = pd.DataFrame.from_dict(data_dict)
         data.set_index("ts", inplace=True)
@@ -964,16 +982,22 @@ class Forecast:
                 "The scrapper method has been deprecated and the keyword is accepted just for backward compatibility, please change the PV forecast method to open-meteo"
             )
         self.weather_forecast_method = method
-        # The P50/P10 quantile-bias blend is only available from Solcast, the
-        # only provider that returns pv_estimate10. If the knob is set for any
-        # other method, warn and ignore it so the Solcast dependency is explicit
-        # rather than a silent no-op. (Short-circuits before parsing for solcast,
-        # so this never double-logs with the parse inside _get_weather_solcast.)
-        if method != "solcast" and self._parse_pv_quantile_bias() > 0.0:
+        # The P50/P10 quantile-bias blend applies to the 'solcast' method (the
+        # only provider returning pv_estimate10) and to the 'list' method when
+        # the caller also supplies a pv_power_forecast_p10 companion (issue
+        # #1128). If the knob is set for any other method/situation, warn and
+        # ignore it so the P10 dependency is explicit rather than a silent
+        # no-op. (Short-circuits before parsing for solcast/list, so this never
+        # double-logs with the parse inside _get_weather_solcast/_get_weather_list.)
+        has_external_p10 = (
+            method == "list" and self.params["passed_data"].get("pv_power_forecast_p10") is not None
+        )
+        if method not in ("solcast",) and not has_external_p10 and self._parse_pv_quantile_bias() > 0.0:
             self.logger.warning(
                 "weather_forecast_pv_quantile_bias is set but only applies to the "
-                "'solcast' weather_forecast_method (the only provider returning P10 "
-                "quantiles); ignoring it for weather_forecast_method=%r.",
+                "'solcast' weather_forecast_method or a 'list' method with a "
+                "pv_power_forecast_p10 companion supplied; ignoring it for "
+                "weather_forecast_method=%r.",
                 method,
             )
         if method in ["open-meteo", "scrapper"]:

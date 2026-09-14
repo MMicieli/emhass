@@ -1223,6 +1223,64 @@ def update_params_with_ha_config(
     return params
 
 
+def _align_timestamped_forecast_to_grid(
+    forecast_input: dict,
+    forecast_dates,
+    optimization_time_step: int,
+    time_zone,
+) -> list:
+    """Resample a timestamp -> value forecast mapping onto the optimization grid.
+
+    Shared alignment/time-grid machinery for every externally supplied forecast
+    series (``pv_power_forecast``, ``pv_power_forecast_p10`` and the other
+    ``list_forecast_key`` entries in :func:`treat_runtimeparams`) so a caller-fed
+    P10 companion is aligned exactly like its P50 counterpart rather than through
+    a second interpolation/resampling implementation.
+
+    :param forecast_input: mapping of ISO-8601 timestamp -> numeric value.
+    :param forecast_dates: the target forecast horizon (list of ISO strings).
+    :param optimization_time_step: optimization time step in minutes.
+    :param time_zone: the local time zone used for resampling.
+    :return: list of values aligned to ``forecast_dates``, same length/order.
+    """
+    forecast_data_df = pd.DataFrame.from_dict(forecast_input, orient="index").reset_index()
+    forecast_data_df.columns = ["time", "value"]
+    forecast_data_df["time"] = pd.to_datetime(
+        forecast_data_df["time"], format="ISO8601", utc=True
+    ).dt.tz_convert(time_zone)
+
+    # Aggregate any sub-step points to the optimization time step.
+    # Resample in the local time_zone so the buckets line up with the
+    # forecast grid, which get_forecast_dates floors in local time
+    # (this matters for sub-hour UTC offsets such as +05:30).
+    forecast_data_df = forecast_data_df.resample(
+        pd.to_timedelta(optimization_time_step, "minutes"),
+        on="time",
+    ).aggregate({"value": "mean"})
+    # Now move to UTC so the union/reindex below align by instant
+    # across DST edges without mixing two differently-localized
+    # indexes. forecast_dates is a list of ISO strings; parse it to
+    # the same UTC index. tz_convert only relabels, the instants are
+    # unchanged, so the local-time aggregation above is preserved.
+    forecast_data_df.index = forecast_data_df.index.tz_convert("UTC")
+    target_dates = pd.to_datetime(forecast_dates, utc=True)
+    # Align with forecast_dates using hold-last (step) semantics: each
+    # value holds until the next provided point. Union the provided
+    # index with the horizon first so points defined before
+    # forecast_dates[0] still anchor the forward-fill; reindexing
+    # straight onto forecast_dates with method="nearest" dropped that
+    # anchor and let the trailing bfill fill the leading slots with the
+    # NEXT value instead (issue #1003).
+    combined_index = forecast_data_df.index.union(target_dates)
+    forecast_data_df = forecast_data_df.reindex(combined_index)
+    # ffill applies the hold-last; bfill then covers any slots before
+    # the first provided point (a dict that starts after the window
+    # start) by extending that first value back over them.
+    forecast_data_df["value"] = forecast_data_df["value"].ffill().bfill()
+    forecast_data_df = forecast_data_df.reindex(target_dates)
+    return forecast_data_df["value"].tolist()
+
+
 async def treat_runtimeparams(
     runtimeparams: str,
     params: dict[str, dict],
@@ -1908,44 +1966,9 @@ async def treat_runtimeparams(
             if forecast_key in runtimeparams.keys():
                 forecast_input = runtimeparams[forecast_key]
                 if isinstance(forecast_input, dict):
-                    forecast_data_df = pd.DataFrame.from_dict(
-                        forecast_input, orient="index"
-                    ).reset_index()
-                    forecast_data_df.columns = ["time", "value"]
-                    forecast_data_df["time"] = pd.to_datetime(
-                        forecast_data_df["time"], format="ISO8601", utc=True
-                    ).dt.tz_convert(time_zone)
-
-                    # Aggregate any sub-step points to the optimization time step.
-                    # Resample in the local time_zone so the buckets line up with the
-                    # forecast grid, which get_forecast_dates floors in local time
-                    # (this matters for sub-hour UTC offsets such as +05:30).
-                    forecast_data_df = forecast_data_df.resample(
-                        pd.to_timedelta(optimization_time_step, "minutes"),
-                        on="time",
-                    ).aggregate({"value": "mean"})
-                    # Now move to UTC so the union/reindex below align by instant
-                    # across DST edges without mixing two differently-localized
-                    # indexes. forecast_dates is a list of ISO strings; parse it to
-                    # the same UTC index. tz_convert only relabels, the instants are
-                    # unchanged, so the local-time aggregation above is preserved.
-                    forecast_data_df.index = forecast_data_df.index.tz_convert("UTC")
-                    target_dates = pd.to_datetime(forecast_dates, utc=True)
-                    # Align with forecast_dates using hold-last (step) semantics: each
-                    # value holds until the next provided point. Union the provided
-                    # index with the horizon first so points defined before
-                    # forecast_dates[0] still anchor the forward-fill; reindexing
-                    # straight onto forecast_dates with method="nearest" dropped that
-                    # anchor and let the trailing bfill fill the leading slots with the
-                    # NEXT value instead (issue #1003).
-                    combined_index = forecast_data_df.index.union(target_dates)
-                    forecast_data_df = forecast_data_df.reindex(combined_index)
-                    # ffill applies the hold-last; bfill then covers any slots before
-                    # the first provided point (a dict that starts after the window
-                    # start) by extending that first value back over them.
-                    forecast_data_df["value"] = forecast_data_df["value"].ffill().bfill()
-                    forecast_data_df = forecast_data_df.reindex(target_dates)
-                    forecast_input = forecast_data_df["value"].tolist()
+                    forecast_input = _align_timestamped_forecast_to_grid(
+                        forecast_input, forecast_dates, optimization_time_step, time_zone
+                    )
                 if isinstance(forecast_input, list) and len(forecast_input) >= len(forecast_dates):
                     params["passed_data"][forecast_key] = forecast_input
                     params["optim_conf"][forecast_methods[method]] = "list"
@@ -1975,6 +1998,61 @@ async def treat_runtimeparams(
                         )
             else:
                 params["passed_data"][forecast_key] = None
+
+        # Optional PV P10 companion to the externally supplied pv_power_forecast
+        # (issue #1128). It reuses the same alignment/time-grid machinery as
+        # pv_power_forecast above rather than a second interpolation path, and it
+        # is a companion, not a standalone forecast source, so it does not get its
+        # own forecast_methods entry. No companion supplied, or bias=0 (the
+        # default), leaves the existing pv_power_forecast-only behaviour
+        # unchanged. Any invalid/misaligned/insufficient/non-finite companion is
+        # rejected explicitly (logged, set to None) rather than silently shifted,
+        # truncated, fabricated or substituted.
+        if "pv_power_forecast_p10" in runtimeparams.keys():
+            p10_input = runtimeparams["pv_power_forecast_p10"]
+            if isinstance(p10_input, dict):
+                p10_input = _align_timestamped_forecast_to_grid(
+                    p10_input, forecast_dates, optimization_time_step, time_zone
+                )
+            if isinstance(p10_input, str):
+                try:
+                    parsed = ast.literal_eval(p10_input)
+                except (ValueError, SyntaxError):
+                    parsed = None
+                if isinstance(parsed, list):
+                    p10_input = parsed
+            if params["passed_data"].get("pv_power_forecast") is None:
+                logger.error(
+                    "ERROR: pv_power_forecast_p10 was passed without a valid pv_power_forecast. "
+                    "pv_power_forecast_p10 is a companion to pv_power_forecast and is invalid on "
+                    "its own; ignoring pv_power_forecast_p10."
+                )
+                params["passed_data"]["pv_power_forecast_p10"] = None
+            elif not isinstance(p10_input, list) or len(p10_input) < len(forecast_dates):
+                logger.error(
+                    "ERROR: pv_power_forecast_p10 is either the wrong type or the length is not "
+                    f"correct, length should be {str(len(forecast_dates))}"
+                )
+                params["passed_data"]["pv_power_forecast_p10"] = None
+            else:
+                p10_input = p10_input[: len(forecast_dates)]
+                non_finite = [
+                    x
+                    for x in p10_input
+                    if not isinstance(x, (int, float))
+                    or isinstance(x, bool)
+                    or not math.isfinite(x)
+                ]
+                if non_finite:
+                    logger.error(
+                        "ERROR: pv_power_forecast_p10 contains non-numeric or non-finite values; "
+                        "rejecting the P10 companion rather than substituting a fabricated value."
+                    )
+                    params["passed_data"]["pv_power_forecast_p10"] = None
+                else:
+                    params["passed_data"]["pv_power_forecast_p10"] = p10_input
+        else:
+            params["passed_data"]["pv_power_forecast_p10"] = None
 
         # Explicitly handle historic_days_to_retrieve from runtimeparams BEFORE validation
         if "historic_days_to_retrieve" in runtimeparams:
@@ -2287,6 +2365,25 @@ async def treat_runtimeparams(
                         f"Ignoring non-integer runtime value for {calibration_key}: "
                         f"{runtimeparams[calibration_key]}"
                     )
+        # Caller-fed history for the pv-bias-calibration action (issue #1128).
+        # Passed straight through to compute_pv_bias_calibration; this is a
+        # reporting/recommendation action, so none of these touch optim_conf,
+        # retrieve_hass_conf or weather_forecast_pv_quantile_bias.
+        for calibration_history_key in ("p10", "p50", "actual", "curtailed"):
+            if calibration_history_key in runtimeparams.keys():
+                params["passed_data"][calibration_history_key] = runtimeparams[
+                    calibration_history_key
+                ]
+        for calibration_param_key in (
+            "curtailment_margin",
+            "target_shortfall_rate",
+            "gamma",
+            "bias0",
+        ):
+            if calibration_param_key in runtimeparams.keys():
+                params["passed_data"][calibration_param_key] = runtimeparams[
+                    calibration_param_key
+                ]
         if "custom_pv_forecast_id" in runtimeparams.keys():
             params["passed_data"]["custom_pv_forecast_id"] = runtimeparams["custom_pv_forecast_id"]
         if "custom_load_forecast_id" in runtimeparams.keys():
@@ -3555,6 +3652,7 @@ async def build_params(
     # To be latter populated with runtime parameters (treat_runtimeparams)
     params["passed_data"] = {
         "pv_power_forecast": None,
+        "pv_power_forecast_p10": None,
         "load_power_forecast": None,
         "load_cost_forecast": None,
         "prod_price_forecast": None,

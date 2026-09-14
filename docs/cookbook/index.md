@@ -38,8 +38,9 @@ Additional battery recipes welcome (charging-from-grid strategies, calendar-awar
 ### Forecast
 
 - [Long training history with VictoriaMetrics](forecast_victoriametrics_long_history.md): replace the archived InfluxDB 1.x add-on by VictoriaMetrics, migrate the existing history with `vmctl`, and train the ML load forecaster on months of data through `use_victoriametrics`.
+- [External PV P10 quantile bias + calibration](pv_quantile_bias_external.md): supply a caller-fed PV P10 companion alongside `pv_power_forecast`, blend it with `weather_forecast_pv_quantile_bias`, and get a report-only bias recommendation from your own history via the `pv-bias-calibration` action.
 
-Other topics that would fit: ML vs naive load forecaster selection, custom forecast injection via runtime params, dealing with forecast outages. Contributions welcome.
+Other topics that would fit: ML vs naive load forecaster selection, dealing with forecast outages. Contributions welcome.
 
 ### Tariff
 

@@ -3284,6 +3284,172 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         finally:
             self.fcst.optim_conf.pop("weather_forecast_pv_quantile_bias", None)
 
+    # ── External PV P10 companion (issue #1128) ─────────────────────────────
+    def _set_external_pv(self, p50, p10=None):
+        self.fcst.params["passed_data"]["pv_power_forecast"] = p50
+        self.fcst.params["passed_data"]["pv_power_forecast_p10"] = p10
+
+    async def test_external_p10_bias_zero_is_exact_p50_noop(self):
+        n = len(self.fcst.forecast_dates_tz)
+        p50 = [float(i + 1) for i in range(n)]
+        p10 = [float(i) * 0.5 for i in range(n)]
+        self._set_external_pv(p50, p10)
+        self.fcst.optim_conf["weather_forecast_pv_quantile_bias"] = 0.0
+        try:
+            df = self.fcst._get_weather_list()
+        finally:
+            self.fcst.optim_conf.pop("weather_forecast_pv_quantile_bias", None)
+        np.testing.assert_array_equal(df["yhat"].to_numpy(), np.array(p50))
+
+    async def test_external_p10_bias_one_is_exact_p10(self):
+        n = len(self.fcst.forecast_dates_tz)
+        p50 = [float(i + 1) for i in range(n)]
+        p10 = [float(i) * 0.5 for i in range(n)]
+        self._set_external_pv(p50, p10)
+        self.fcst.optim_conf["weather_forecast_pv_quantile_bias"] = 1.0
+        try:
+            df = self.fcst._get_weather_list()
+        finally:
+            self.fcst.optim_conf.pop("weather_forecast_pv_quantile_bias", None)
+        np.testing.assert_allclose(df["yhat"].to_numpy(), np.array(p10))
+
+    async def test_external_p10_bias_midpoint_blend(self):
+        n = len(self.fcst.forecast_dates_tz)
+        p50 = [10.0] * n
+        p10 = [2.0] * n
+        self._set_external_pv(p50, p10)
+        self.fcst.optim_conf["weather_forecast_pv_quantile_bias"] = 0.5
+        try:
+            df = self.fcst._get_weather_list()
+        finally:
+            self.fcst.optim_conf.pop("weather_forecast_pv_quantile_bias", None)
+        np.testing.assert_allclose(df["yhat"].to_numpy(), np.array([6.0] * n))
+
+    async def test_external_p50_only_unchanged_without_p10(self):
+        """No P10 companion supplied leaves pv_power_forecast-only behaviour unchanged,
+        even with a non-zero bias requested (there is nothing to blend against)."""
+        n = len(self.fcst.forecast_dates_tz)
+        p50 = [float(i + 1) for i in range(n)]
+        self._set_external_pv(p50, p10=None)
+        self.fcst.optim_conf["weather_forecast_pv_quantile_bias"] = 0.5
+        try:
+            df = self.fcst._get_weather_list()
+        finally:
+            self.fcst.optim_conf.pop("weather_forecast_pv_quantile_bias", None)
+        np.testing.assert_array_equal(df["yhat"].to_numpy(), np.array(p50))
+
+    async def test_external_p10_without_p50_is_rejected(self):
+        """pv_power_forecast_p10 is invalid on its own: treat_runtimeparams must
+        discard it (log an error) when pv_power_forecast is absent/invalid."""
+        forecast_dates = [str(d) for d in self.fcst.forecast_dates_tz]
+        n = len(forecast_dates)
+        runtimeparams = orjson.dumps({"pv_power_forecast_p10": [1.0] * n}).decode("utf-8")
+        params_json = orjson.dumps(await TestForecast.get_test_params()).decode("utf-8")
+        with self.assertLogs(logger, level="ERROR") as cm:
+            params, _, _, _ = await utils.treat_runtimeparams(
+                runtimeparams,
+                params_json,
+                self.retrieve_hass_conf,
+                self.optim_conf,
+                self.plant_conf,
+                "dayahead-optim",
+                logger,
+                emhass_conf,
+            )
+        self.assertTrue(
+            any("pv_power_forecast_p10" in msg and "without a valid pv_power_forecast" in msg
+                for msg in cm.output),
+            msg=f"expected an explicit rejection error, got: {cm.output}",
+        )
+        params_dict = orjson.loads(params) if isinstance(params, str) else params
+        self.assertIsNone(params_dict["passed_data"]["pv_power_forecast_p10"])
+
+    async def test_external_p10_insufficient_length_is_rejected(self):
+        n = len(self.fcst.forecast_dates_tz)
+        runtimeparams = orjson.dumps(
+            {
+                "pv_power_forecast": [float(i) for i in range(n)],
+                "pv_power_forecast_p10": [1.0, 2.0],  # too short
+            }
+        ).decode("utf-8")
+        params_json = orjson.dumps(await TestForecast.get_test_params()).decode("utf-8")
+        with self.assertLogs(logger, level="ERROR"):
+            params, _, _, _ = await utils.treat_runtimeparams(
+                runtimeparams,
+                params_json,
+                self.retrieve_hass_conf,
+                self.optim_conf,
+                self.plant_conf,
+                "dayahead-optim",
+                logger,
+                emhass_conf,
+            )
+        params_dict = orjson.loads(params) if isinstance(params, str) else params
+        self.assertIsNone(params_dict["passed_data"]["pv_power_forecast_p10"])
+        # The valid pv_power_forecast (P50) is unaffected by the rejected companion.
+        self.assertIsNotNone(params_dict["passed_data"]["pv_power_forecast"])
+
+    async def test_external_p10_non_finite_is_rejected(self):
+        n = len(self.fcst.forecast_dates_tz)
+        p10_with_nan = [float(i) for i in range(n)]
+        p10_with_nan[1] = float("nan")
+        runtimeparams = orjson.dumps(
+            {
+                "pv_power_forecast": [float(i) for i in range(n)],
+                "pv_power_forecast_p10": p10_with_nan,
+            }
+        ).decode("utf-8")
+        params_json = orjson.dumps(await TestForecast.get_test_params()).decode("utf-8")
+        with self.assertLogs(logger, level="ERROR") as cm:
+            params, _, _, _ = await utils.treat_runtimeparams(
+                runtimeparams,
+                params_json,
+                self.retrieve_hass_conf,
+                self.optim_conf,
+                self.plant_conf,
+                "dayahead-optim",
+                logger,
+                emhass_conf,
+            )
+        self.assertTrue(
+            any("non-finite" in msg for msg in cm.output),
+            msg=f"expected a non-finite rejection error, got: {cm.output}",
+        )
+        params_dict = orjson.loads(params) if isinstance(params, str) else params
+        self.assertIsNone(params_dict["passed_data"]["pv_power_forecast_p10"])
+
+    async def test_external_p10_timestamped_alignment(self):
+        """A timestamped P10 companion is aligned with the same machinery as
+        the timestamped P50 forecast (issue #1128): no second interpolation
+        path, so both series land on the same grid."""
+        forecast_dates = self.fcst.forecast_dates_tz
+        n = len(forecast_dates)
+        p50_map = {str(forecast_dates[0]): 100.0}
+        p10_map = {str(forecast_dates[0]): 40.0}
+        runtimeparams = orjson.dumps(
+            {"pv_power_forecast": p50_map, "pv_power_forecast_p10": p10_map}
+        ).decode("utf-8")
+        params_json = orjson.dumps(await TestForecast.get_test_params()).decode("utf-8")
+        params, _, _, _ = await utils.treat_runtimeparams(
+            runtimeparams,
+            params_json,
+            self.retrieve_hass_conf,
+            self.optim_conf,
+            self.plant_conf,
+            "dayahead-optim",
+            logger,
+            emhass_conf,
+        )
+        params_dict = orjson.loads(params) if isinstance(params, str) else params
+        p50_aligned = params_dict["passed_data"]["pv_power_forecast"]
+        p10_aligned = params_dict["passed_data"]["pv_power_forecast_p10"]
+        self.assertIsNotNone(p10_aligned)
+        self.assertEqual(len(p50_aligned), n)
+        self.assertEqual(len(p10_aligned), n)
+        # Hold-last semantics: the single provided point anchors every step.
+        self.assertTrue(all(v == 100.0 for v in p50_aligned))
+        self.assertTrue(all(v == 40.0 for v in p10_aligned))
+
 
 class TestDstForecastDates(unittest.IsolatedAsyncioTestCase):
     """Standalone tests for the DST forecast-date-range fix.

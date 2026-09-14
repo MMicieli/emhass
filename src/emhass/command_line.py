@@ -33,6 +33,7 @@ from emhass.forecast_calibration import (
 from emhass.machine_learning_forecaster import MLForecaster
 from emhass.machine_learning_regressor import MLRegressor
 from emhass.optimization import Optimization
+from emhass.pv_bias_calibration import compute_pv_bias_calibration
 from emhass.retrieve_hass import RetrieveHass
 from emhass.utils import log_runtime_banner, stage_timer
 
@@ -2291,7 +2292,11 @@ async def set_input_data_dict(
     #     Keeping these out of the OptimizationCache path stops them poisoning
     #     the cache key with config-default values that a subsequent
     #     naive-mpc-optim call would then miss against.
-    actions_without_fcst_or_opt = ["publish-data", "export-influxdb-to-csv"]
+    actions_without_fcst_or_opt = [
+        "publish-data",
+        "export-influxdb-to-csv",
+        "pv-bias-calibration",
+    ]
     actions_skip_optim_cache = [
         "forecast-model-fit",
         "forecast-model-predict",
@@ -2405,6 +2410,10 @@ async def set_input_data_dict(
     elif set_type == "forecast-calibration":
         # The calibration action retrieves its own (longer) history window inside
         # forecast_calibration(); no ML-prep here.
+        result = {}
+    elif set_type == "pv-bias-calibration":
+        # Reporting-only action: the caller-supplied p10/p50/actual history
+        # already lives in passed_data; no Forecast/Optimization needed.
         result = {}
     elif set_type == "regressor-model-fit":
         result = _prepare_regressor_fit(ctx)
@@ -3065,6 +3074,57 @@ async def forecast_calibration(input_data_dict: dict, logger: logging.Logger) ->
         var_model=var_model,
     )
     if result.get("error"):
+        return None
+    return result
+
+
+async def pv_bias_calibration(input_data_dict: dict, logger: logging.Logger) -> dict | None:
+    """Compute a caller-fed PV bias calibration recommendation (issue #1128).
+
+    Thin action wrapper around :func:`emhass.pv_bias_calibration.
+    compute_pv_bias_calibration`: it only reads the caller-supplied history
+    arrays from ``passed_data`` and returns the engine's result as-is. This is a
+    reporting/recommendation action with **no side effects** -- it never
+    modifies ``weather_forecast_pv_quantile_bias``, configuration, the live PV
+    forecast, or runs an optimization; applying a recommendation remains a
+    separate, explicit, human-authorised action.
+
+    Required ``passed_data`` keys: ``p10``, ``p50``, ``actual`` (ordered,
+    equal-length history arrays). Optional: ``curtailed``,
+    ``curtailment_margin``, ``target_shortfall_rate``, ``gamma``, ``bias0``.
+
+    :param input_data_dict: A dictionnary with multiple data used by the action functions
+    :type input_data_dict: dict
+    :param logger: The passed logger object
+    :type logger: logging.Logger
+    :return: The calibration result dict (see ``compute_pv_bias_calibration``), or
+        None when the required inputs are missing/invalid.
+    :rtype: dict | None
+    """
+    passed_data = input_data_dict["params"]["passed_data"]
+    p10 = passed_data.get("p10")
+    p50 = passed_data.get("p50")
+    actual = passed_data.get("actual")
+    if p10 is None or p50 is None or actual is None:
+        logger.error(
+            "PV bias calibration: 'p10', 'p50' and 'actual' are all required in the "
+            "passed runtime parameters."
+        )
+        return None
+    kwargs = {}
+    for key, param_name in (
+        ("curtailed", "curtailed"),
+        ("curtailment_margin", "curtailment_margin"),
+        ("target_shortfall_rate", "target_shortfall_rate"),
+        ("gamma", "gamma"),
+        ("bias0", "bias0"),
+    ):
+        if passed_data.get(key) is not None:
+            kwargs[param_name] = passed_data[key]
+    try:
+        result = compute_pv_bias_calibration(p10, p50, actual, logger=logger, **kwargs)
+    except (ValueError, TypeError) as e:
+        logger.error(f"PV bias calibration: invalid input: {e}")
         return None
     return result
 
@@ -4241,7 +4301,7 @@ async def main():
 
     - action: Set the desired action, options are: perfect-optim, dayahead-optim,
       naive-mpc-optim, publish-data, forecast-model-fit, forecast-model-predict, forecast-model-tune,
-      forecast-calibration
+      forecast-calibration, pv-bias-calibration
 
     - config: Define path to the config.yaml file
 
@@ -4263,7 +4323,7 @@ async def main():
         type=str,
         help="Set the desired action, options are: perfect-optim, dayahead-optim,\
         naive-mpc-optim, publish-data, forecast-model-fit, forecast-model-predict, forecast-model-tune,\
-        forecast-calibration",
+        forecast-calibration, pv-bias-calibration",
     )
     parser.add_argument(
         "--config", type=str, help="Define path to the config.json/defaults.json file"
@@ -4464,6 +4524,9 @@ async def main():
     elif args.action == "forecast-calibration":
         await forecast_calibration(input_data_dict, logger)
         opt_res = None
+    elif args.action == "pv-bias-calibration":
+        pv_bias_result = await pv_bias_calibration(input_data_dict, logger)
+        opt_res = None
     elif args.action == "regressor-model-fit":
         mlr = await regressor_model_fit(input_data_dict, logger, debug=args.debug)
         opt_res = None
@@ -4484,7 +4547,7 @@ async def main():
     else:
         logger.error("The passed action argument is not valid")
         logger.error(
-            "Try setting --action: perfect-optim, dayahead-optim, naive-mpc-optim, forecast-model-fit, forecast-model-predict, forecast-model-tune, forecast-calibration, export-influxdb-to-csv or publish-data"
+            "Try setting --action: perfect-optim, dayahead-optim, naive-mpc-optim, forecast-model-fit, forecast-model-predict, forecast-model-tune, forecast-calibration, pv-bias-calibration, export-influxdb-to-csv or publish-data"
         )
         opt_res = None
     logger.info(opt_res)
@@ -4510,6 +4573,8 @@ async def main():
         return success
     elif args.action == "forecast-model-tune":
         return df_pred_optim, mlf
+    elif args.action == "pv-bias-calibration":
+        return pv_bias_result
     else:
         return opt_res
 

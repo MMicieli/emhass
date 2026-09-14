@@ -282,5 +282,34 @@ class TestPvBiasCalibration(unittest.TestCase):
                 pbc.compute_pv_bias_calibration(p10, p50, actual, **kwargs)
 
 
+@unittest.skipIf(pbc is None, "pv_bias_calibration module not present (base branch)")
+class TestBlendPvQuantiles(unittest.TestCase):
+    """Endpoints of the shared blend_pv_quantiles formula (issue #1128).
+
+    This is the single implementation of `planned = bias * P10 + (1 - bias) *
+    P50`, reused by the native Solcast path, the external P10 companion path,
+    and this module's own calibration recursion (see forecast.py and
+    utils.py).
+    """
+
+    def test_bias_zero_is_exact_p50(self):
+        p10, p50 = 2.0, 5.0
+        self.assertEqual(pbc.blend_pv_quantiles(p10, p50, 0.0), p50)
+
+    def test_bias_one_is_exact_p10(self):
+        p10, p50 = 2.0, 5.0
+        self.assertEqual(pbc.blend_pv_quantiles(p10, p50, 1.0), p10)
+
+    def test_bias_midpoint(self):
+        p10, p50 = 2.0, 5.0
+        self.assertAlmostEqual(pbc.blend_pv_quantiles(p10, p50, 0.5), 3.5)
+
+    def test_array_input(self):
+        p10 = np.array([1.0, 2.0, 3.0])
+        p50 = np.array([4.0, 5.0, 6.0])
+        result = pbc.blend_pv_quantiles(p10, p50, 0.5)
+        np.testing.assert_allclose(result, [2.5, 3.5, 4.5])
+
+
 if __name__ == "__main__":
     unittest.main()

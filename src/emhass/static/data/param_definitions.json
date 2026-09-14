@@ -303,7 +303,7 @@
     },
     "weather_forecast_pv_quantile_bias": {
       "friendly_name": "PV forecast conservative bias",
-      "Description": "Blend factor that biases the Solcast PV forecast toward its conservative P10 (low) estimate. 0 (default) uses the central P50 estimate, i.e. unchanged behaviour. 1 uses the P10 estimate. Intermediate values blend linearly: estimate = bias*P10 + (1-bias)*P50. Higher values produce more defensive plans (more battery reserve held when solar is uncertain). Only effective with weather_forecast_method set to solcast. Defaults to 0.",
+      "Description": "Blend factor that biases the PV forecast toward its conservative P10 (low) estimate. 0 (default) uses the central P50 estimate, i.e. unchanged behaviour. 1 uses the P10 estimate. Intermediate values blend linearly: estimate = bias*P10 + (1-bias)*P50. Higher values produce more defensive plans (more battery reserve held when solar is uncertain). Effective with weather_forecast_method set to solcast (native P10 from the Solcast API), or with weather_forecast_method set to list when the caller also supplies a pv_power_forecast_p10 companion alongside pv_power_forecast (see docs/forecasts.md and docs/passing_data.md). Defaults to 0. See also the pv-bias-calibration action for a data-driven bias recommendation (report-only, not applied automatically).",
       "input": "float",
       "default_value": 0.0,
       "unit": "none"

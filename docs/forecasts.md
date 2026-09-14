@@ -73,6 +73,15 @@ When the horizon auto-extends, any forecast passed as a runtime list (`weather_f
 
 Solcast returns three probabilistic estimates for each forecast period: P50 (central / median), P10 (low / conservative, 10th percentile), and P90 (high / optimistic, 90th percentile). By default EMHASS uses only the P50 estimate. The `weather_forecast_pv_quantile_bias` parameter lets you blend P50 and P10 so the optimizer plans against a more cautious solar outlook.
 
+P50/P10 is available from two sources:
+
+* **native Solcast** (`weather_forecast_method: solcast`) — P10 comes from Solcast's own `pv_estimate10` field, described in this section; or
+* **an externally supplied forecast** (`weather_forecast_method: list`, e.g. from a Home Assistant integration that already owns forecast acquisition) — you supply both `pv_power_forecast` (P50) and an optional `pv_power_forecast_p10` companion yourself, described in [Caller-supplied external P10 (issue #1128)](#caller-supplied-external-p10-issue-1128) below.
+
+`weather_forecast_pv_quantile_bias` uses exactly the same formula and semantics for both sources -- there is only one blend algorithm in EMHASS.
+
+EMHASS deliberately does **not**: fit or calibrate a probabilistic PV model itself, extrapolate below P10, blend a P90 estimate, run a scenario/stochastic optimisation over the quantiles, or apply any bias/calibration recommendation automatically. This feature is a deterministic linear blend of two caller/provider-supplied point forecasts, plus an optional offline diagnostic that recommends (but never applies) a blend value. Read the shortfall-rate diagnostics below as descriptive of the logged history you fed in, not as a probabilistic guarantee about future weather.
+
 This is useful when the cost of a solar shortfall outweighs the cost of over-reserving the battery. Forecast error is asymmetric: if the sun underperforms the central estimate you may have to buy back the shortfall at the peak retail rate, which usually costs more than the value you give up by holding a little extra reserve. Biasing toward P10 makes the plan robust to that downside.
 
 The blend formula applied per period is:
@@ -101,11 +110,54 @@ curl -i -H "Content-Type:application/json" -X POST -d '{
 }' http://localhost:5000/action/dayahead-optim
 ```
 
-This parameter is Solcast-only; it has no effect when `weather_forecast_method` is set to any other method. If a forecast period does not include a `pv_estimate10` value, EMHASS falls back to the central `pv_estimate` for that period.
+This parameter only has an effect with `weather_forecast_method: solcast`, or with `weather_forecast_method: list` when you also supply a `pv_power_forecast_p10` companion (see below); for every other method it is ignored with a logged warning. For native Solcast, if a forecast period does not include a `pv_estimate10` value, EMHASS falls back to the central `pv_estimate` for that period.
 
 ```{note}
 When the Solcast cache is enabled (`weather_forecast_cache: true`), the blended forecast is what gets cached. Changing `weather_forecast_pv_quantile_bias` therefore only takes effect on the next cache refresh; to apply a new value immediately, refresh the weather-forecast cache or run with the cache disabled.
 ```
+
+#### Caller-supplied external P10 (issue #1128)
+
+If you already obtain your PV forecast outside EMHASS -- for example a Home Assistant integration that fetches Solcast (or any other provider) itself and hands EMHASS the result via `pv_power_forecast` -- you can supply the matching P10 series as `pv_power_forecast_p10` alongside it. EMHASS then applies exactly the same `weather_forecast_pv_quantile_bias` blend as the native Solcast path.
+
+Rules:
+
+* `pv_power_forecast_p10` is a **companion** to `pv_power_forecast`, not a standalone forecast source. It is invalid, and rejected with a logged error, if `pv_power_forecast` was not also supplied (as a valid `list`-method forecast) in the same call.
+* It supports the same two representations as `pv_power_forecast`: a plain list, or a timestamp -> value mapping. Both are aligned onto the optimization grid by the exact same runtime alignment/resampling machinery `pv_power_forecast` already uses -- there is only one interpolation/resampling implementation.
+* Both `pv_power_forecast` and `pv_power_forecast_p10` are in **Watts**.
+* An invalid, misaligned, insufficient-length, or non-finite `pv_power_forecast_p10` is rejected explicitly (logged error, companion discarded) -- it is never silently shifted, truncated to fit, fabricated, zero-filled, or substituted with `pv_power_forecast`.
+* No P10 companion supplied -> behaviour is identical to before this feature existed (`pv_power_forecast` alone). `bias=0` (the default) is an exact P50 no-op whether or not a companion is supplied. Native Solcast default behaviour is unaffected either way.
+* Supplying `pv_power_forecast_p10` requires no additional Solcast request, credentials, cache, or poller inside EMHASS, and no Home Assistant-specific code lives in EMHASS core -- EMHASS only consumes two plain numeric series.
+
+**List example** (Home Assistant already has both P50 and P10, e.g. from its own Solcast integration):
+
+```bash
+curl -i -H "Content-Type:application/json" -X POST -d '{
+    "pv_power_forecast": [0, 0, 120, 800, 1500, 2100, 1800, 900, 100, 0],
+    "pv_power_forecast_p10": [0, 0, 40, 300, 700, 1100, 900, 350, 20, 0],
+    "weather_forecast_pv_quantile_bias": 0.5
+}' http://localhost:5000/action/dayahead-optim
+```
+
+**Timestamped example** (each series keyed by ISO-8601 timestamp; values in Watts):
+
+```bash
+curl -i -H "Content-Type:application/json" -X POST -d '{
+    "pv_power_forecast": {
+        "2024-08-01 06:00:00+00:00": 0,
+        "2024-08-01 07:00:00+00:00": 120,
+        "2024-08-01 08:00:00+00:00": 800
+    },
+    "pv_power_forecast_p10": {
+        "2024-08-01 06:00:00+00:00": 0,
+        "2024-08-01 07:00:00+00:00": 40,
+        "2024-08-01 08:00:00+00:00": 300
+    },
+    "weather_forecast_pv_quantile_bias": 0.5
+}' http://localhost:5000/action/dayahead-optim
+```
+
+See [Passing your own forecast data](passing_data.md) for the full external-forecast contract these two keys extend.
 
 #### Self-tuning the bias (adaptive conformal inference)
 
@@ -135,6 +187,66 @@ The flag must come from the curtailment entity, never from the forecast error it
 
 * I. Gibbs and E. Candès (2021), *Adaptive Conformal Inference Under Distribution Shift*, NeurIPS 2021, [arXiv:2106.00170](https://arxiv.org/abs/2106.00170) — the fixed-`gamma` recursion used here.
 * I. Gibbs and E. Candès (2024), *Conformal Inference for Online Prediction with Arbitrary Distribution Shifts*, JMLR, [arXiv:2208.08401](https://arxiv.org/abs/2208.08401) — the parameter-free (DtACI) refinement that removes the `gamma` choice, noted as a future extension.
+
+#### Running calibration as an action: `pv-bias-calibration` (issue #1128)
+
+`compute_pv_bias_calibration(...)` is exposed as the `pv-bias-calibration` action so you can call it the same way you call `dayahead-optim` or `forecast-calibration`, without writing any Python. It takes your logged `(P10, P50, actual)` history as JSON and returns the engine's result as-is.
+
+```{warning}
+**This action is report-only and side-effect-free.** Calling it never modifies `weather_forecast_pv_quantile_bias`, never touches your configuration, never changes the live PV forecast, never runs an optimization, and never applies its own recommendation. It only returns numbers for you (or your own automation) to read and, if you agree with them, apply yourself by setting `weather_forecast_pv_quantile_bias` -- a separate, explicit, human-authorised step.
+```
+
+**Inputs** (JSON body of the POST to `/action/pv-bias-calibration`):
+
+| Key | Required | Description |
+|---|---|---|
+| `p10` | yes | ordered list of P10 (conservative) values, one per historical update step (e.g. one per day) |
+| `p50` | yes | ordered list of P50 (central) values, same length/order as `p10` |
+| `actual` | yes | ordered list of realised PV, same length/order (uncensored -- see curtailment below) |
+| `curtailed` | no | boolean mask, or the raw curtailment-power series (thresholded at `> 0`), flagging steps to exclude |
+| `curtailment_margin` | no | also drop this many neighbouring steps around each curtailed one (default `0`) |
+| `target_shortfall_rate` | no | target one-sided shortfall rate `alpha` in `(0, 1)` (default `0.10`) |
+| `gamma` | no | ACI learning rate, `> 0` (default `0.05`) |
+| `bias0` | no | initial bias in `[0, 1]` to start the recursion from (default `0.0`) |
+
+`p10`, `p50` and `actual` are all required; the action fails explicitly (HTTP 400, logged error) if any is missing, of mismatched length, empty, or entirely non-finite.
+
+**Example:**
+
+```bash
+curl -i -H "Content-Type:application/json" -X POST -d '{
+    "p10": [1.8, 2.1, 0.9, 3.0, 2.5],
+    "p50": [4.2, 4.8, 2.1, 6.1, 5.0],
+    "actual": [3.9, 5.0, 0.5, 6.5, 4.8],
+    "target_shortfall_rate": 0.10
+}' http://localhost:5000/action/pv-bias-calibration
+```
+
+**Output interpretation.** The response is the engine's own result dict, including:
+
+* `recommended_bias` -- the settled bias to consider setting as `weather_forecast_pv_quantile_bias`.
+* `achieved_shortfall_rate` / `achieved_shortfall_rate_tail` -- the shortfall rate the recursion actually produced overall / over its settled tail.
+* `feasible_shortfall_range` -- `(rate at bias=1, rate at bias=0)`, the range of shortfall rates the P10-P50 blend can express *at all* for this history.
+* `target_feasible` -- whether `target_shortfall_rate` falls inside `feasible_shortfall_range`.
+* `converged` -- whether the settled rate actually reached the target (only possible when `target_feasible` is true).
+* `n_observations` / `n_curtailed_excluded` / `curtailed_fraction` -- how much history was used vs. dropped as curtailed.
+* `bias_trajectory` and `static_shortfall_curve` -- the full recursion path and the fixed-bias reference curve, useful for plotting.
+
+**Infeasible target.** A target outside `feasible_shortfall_range` cannot be met by any convex P10-P50 blend -- EMHASS never extrapolates below P10 to chase it. The action reports this honestly: `target_feasible` is `false`, `converged` is `false`, and `achieved_shortfall_rate`/`achieved_shortfall_rate_tail` show the recursion saturating at a clip bound (pure P10 or pure P50) instead of the requested rate. Treat this as "your history says this target isn't reachable with this blend", not as an error to retry.
+
+**Curtailment.** `curtailed`/`curtailment_margin` behave exactly as documented above for the module -- an independent curtailment signal is required, and curtailment is never inferred from how far `actual` fell below the forecast.
+
+```bash
+curl -i -H "Content-Type:application/json" -X POST -d '{
+    "p10": [1.8, 2.1, 0.9, 3.0, 2.5],
+    "p50": [4.2, 4.8, 2.1, 6.1, 5.0],
+    "actual": [3.9, 5.0, 0.5, 6.5, 4.8],
+    "curtailed": [false, false, false, true, false],
+    "curtailment_margin": 1
+}' http://localhost:5000/action/pv-bias-calibration
+```
+
+See the [PV quantile-bias calibration cookbook recipe](cookbook/pv_quantile_bias_external.md) for a full worked example combining the external P10 companion with this action.
 
 ### solar.forecast 
 

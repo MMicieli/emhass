@@ -122,9 +122,26 @@ _CONVERGENCE_TOL = 0.05
 _CURTAILED_WARN_FRACTION = 0.20
 
 
+def blend_pv_quantiles(p10, p50, bias: float):
+    """Blend P10 and P50: ``planned = bias * P10 + (1 - bias) * P50``.
+
+    This is the single implementation of the ``weather_forecast_pv_quantile_bias``
+    formula (issue #961), shared by the native Solcast fetch path, the caller-supplied
+    external P10 companion path (issue #1128) and this module's own calibration
+    recursion, so the semantics never drift between them. ``bias=0`` is an exact
+    P50 no-op; ``bias=1`` is pure P10.
+
+    :param p10: P10 (conservative) value(s) -- scalar or array-like.
+    :param p50: P50 (central) value(s), same shape as ``p10``.
+    :param bias: blend factor in [0, 1].
+    :return: the blended value(s), same type/shape as the inputs.
+    """
+    return bias * p10 + (1.0 - bias) * p50
+
+
 def _planned_forecast(p10: np.ndarray, p50: np.ndarray, bias: float) -> np.ndarray:
     """Blend P10 and P50 exactly as the #961 Solcast path does."""
-    return bias * p10 + (1.0 - bias) * p50
+    return blend_pv_quantiles(p10, p50, bias)
 
 
 def _default_shortfall_score(planned: np.ndarray, actual: np.ndarray) -> np.ndarray:

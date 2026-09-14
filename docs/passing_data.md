@@ -49,6 +49,8 @@ The possible dictionary keys to pass data are:
 
 - `pv_power_forecast` for the PV power production forecast.
 
+- `pv_power_forecast_p10` for an *optional* conservative (P10) companion to `pv_power_forecast` -- see [Passing an optional PV P10 companion](#passing-an-optional-pv-p10-companion) below.
+
 - `load_power_forecast` for the Load power forecast.
 
 - `load_cost_forecast` for the Load cost forecast.
@@ -66,6 +68,46 @@ Instead of a plain list, any of these forecast keys can be passed as an object t
     "2024-01-01T06:00:00+01:00": 0.15,
     "2024-01-01T18:00:00+01:00": 0.30
   }
+}
+```
+
+### Passing an optional PV P10 companion
+
+`pv_power_forecast_p10` (issue #1128) lets you supply a conservative (P10, 10th-percentile) companion alongside `pv_power_forecast` (P50), so EMHASS can blend them with the `weather_forecast_pv_quantile_bias` parameter exactly as it already does for the native Solcast forecast source -- see [Conservative PV bias (P10 blend)](forecasts.md#conservative-pv-bias-p10-blend) for the full concept, formula and worked example.
+
+Key points:
+
+* **It is a companion, not a standalone forecast.** `pv_power_forecast_p10` is only meaningful together with `pv_power_forecast` in the *same* call; supplying it without a valid `pv_power_forecast` is rejected with a logged error and the companion is discarded.
+* **Same representations, same alignment.** `pv_power_forecast_p10` accepts a plain list or a timestamp -> value mapping, exactly like `pv_power_forecast`, and is aligned onto the optimization grid by the identical machinery described in [Passing a forecast as timestamped values](#passing-a-forecast-as-timestamped-values) above -- there is no separate interpolation/resampling path for P10.
+* **Units.** Both `pv_power_forecast` and `pv_power_forecast_p10` are in Watts.
+* **Backward compatible.** Omitting `pv_power_forecast_p10` leaves `pv_power_forecast`-only behaviour completely unchanged, and `weather_forecast_pv_quantile_bias=0` (the default) is an exact P50 no-op whether or not a P10 companion is supplied.
+* **Fails loudly, not silently.** A `pv_power_forecast_p10` that is too short, of the wrong type, or contains non-finite values is rejected explicitly (logged error, companion discarded) rather than being shifted, truncated, fabricated, or replaced by `pv_power_forecast`.
+
+**List example:**
+
+```bash
+curl -i -H 'Content-Type:application/json' -X POST -d '{
+    "pv_power_forecast": [0, 0, 120, 800, 1500, 2100, 1800, 900, 100, 0],
+    "pv_power_forecast_p10": [0, 0, 40, 300, 700, 1100, 900, 350, 20, 0],
+    "weather_forecast_pv_quantile_bias": 0.5
+}' http://localhost:5000/action/dayahead-optim
+```
+
+**Timestamped example:**
+
+```json
+{
+  "pv_power_forecast": {
+    "2024-08-01T06:00:00+00:00": 0,
+    "2024-08-01T07:00:00+00:00": 120,
+    "2024-08-01T08:00:00+00:00": 800
+  },
+  "pv_power_forecast_p10": {
+    "2024-08-01T06:00:00+00:00": 0,
+    "2024-08-01T07:00:00+00:00": 40,
+    "2024-08-01T08:00:00+00:00": 300
+  },
+  "weather_forecast_pv_quantile_bias": 0.5
 }
 ```
 

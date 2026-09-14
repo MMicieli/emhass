@@ -33,6 +33,7 @@ from emhass.command_line import (
     naive_mpc_optim,
     perfect_forecast_optim,
     publish_data,
+    pv_bias_calibration,
     regressor_model_fit,
     regressor_model_predict,
     set_input_data_dict,
@@ -630,6 +631,19 @@ async def _handle_ml_actions(action_name, input_data_dict, emhass_conf, logger):
         injection_dict = get_injection_dict_forecast_calibration(result)
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return "EMHASS >> Action forecast-calibration executed... \n", 200
+
+    # pv-bias-calibration
+    if action_name == "pv-bias-calibration":
+        action_str = " >> Performing a PV bias calibration (reporting only, no side effects)..."
+        logger.info(action_str)
+        result = await pv_bias_calibration(input_data_dict, logger)
+        if result is None:
+            return await grab_log(action_str), 400
+
+        # Reporting-only action: the response body is the calibration engine's
+        # own result dict, exposed as-is (issue #1128) rather than an HTML
+        # webui table, so a caller can consume the diagnostics programmatically.
+        return orjson.dumps(result).decode("utf-8"), 200
 
     # regressor-model-fit
     if action_name == "regressor-model-fit":
