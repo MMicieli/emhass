@@ -171,7 +171,7 @@ class TestIssue355ResearchSpike(unittest.TestCase):
             rtol=0,
         )
 
-    def test_night_discharge_uses_full_pwl_loss(self):
+    def test_night_discharge_uses_incremental_pwl_loss(self):
         df, pv, load = scenario(pv=[0] * 10, load=[2500] * 10, buy=0.45, sell=0.0)
         opt = build_opt(research=True, tolerance=30)
         result = solve(opt, df, pv, load, 0.7, 0.6)
@@ -179,7 +179,10 @@ class TestIssue355ResearchSpike(unittest.TestCase):
         dis = result["P_batt"].to_numpy() > 1.0
         self.assertTrue(np.any(dis))
         x, y = opt._issue355_research_pwl_points()
-        expected_loss = np.interp(result.loc[dis, "P_batt"].to_numpy(), x, y)
+        expected_loss = (
+            np.interp(result.loc[dis, "P_batt"].to_numpy(), x, y)
+            - np.interp(np.zeros(np.count_nonzero(dis)), x, y)
+        )
         np.testing.assert_allclose(
             result.loc[dis, "issue355_candidate_loss_W"],
             expected_loss,
@@ -193,6 +196,29 @@ class TestIssue355ResearchSpike(unittest.TestCase):
         np.testing.assert_allclose(
             result.loc[dis, "P_hybrid_inverter"],
             expected_hybrid,
+            atol=1e-5,
+            rtol=0,
+        )
+
+    def test_daylight_discharge_matches_incremental_pwl_definition(self):
+        df, pv, load = scenario(
+            pv=[500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000],
+            load=[3500] * 10,
+            buy=0.45,
+            sell=0.0,
+        )
+        opt = build_opt(research=True, tolerance=30)
+        result = solve(opt, df, pv, load, 0.7, 0.6)
+
+        dis = result["P_batt"].to_numpy() > 1.0
+        self.assertTrue(np.any(dis))
+        x, y = opt._issue355_research_pwl_points()
+        p = pv.to_numpy()[dis]
+        b = result.loc[dis, "P_batt"].to_numpy()
+        expected = np.interp(p + b, x, y) - np.interp(p, x, y)
+        np.testing.assert_allclose(
+            result.loc[dis, "issue355_candidate_loss_W"],
+            expected,
             atol=1e-5,
             rtol=0,
         )
