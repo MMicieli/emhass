@@ -29,6 +29,11 @@ jobs:
             tests/test_issue355_incremental_inverter_loss_research.py \
             src/emhass/optimization.py
 
+      - name: Run feature-off commissioned regression pins
+        run: |
+          uv run pytest -q \
+            tests/test_multi_battery_optimization.py::TestMultiBatteryN1RegressionPin
+
       - name: Run focused issue355 tests
         run: uv run pytest -q tests/test_issue355_incremental_inverter_loss_research.py
 
