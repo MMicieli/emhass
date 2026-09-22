@@ -476,7 +476,14 @@ class Optimization:
         last_slope = (y[-1] - y[-2]) / (x[-1] - x[-2])
         x_ext = ISSUE355_RESEARCH_PWL_EXTENSION_MAX_W
         y_ext = y[-1] + last_slope * (x_ext - x[-1])
-        return np.append(x, x_ext), np.append(y, y_ext)
+        # Extend the EXISTING final chord rather than appending another
+        # segment. This preserves the exact 0..15 kW approximation while
+        # avoiding one additional binary per horizon timestep.
+        x = x.copy()
+        y = y.copy()
+        x[-1] = x_ext
+        y[-1] = y_ext
+        return x, y
 
     def _init_issue355_research_params(self) -> None:
         """Create horizon-shaped Parameters for the isolated #355 spike."""
