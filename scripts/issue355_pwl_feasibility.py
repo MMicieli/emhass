@@ -13,9 +13,11 @@ Purpose:
 
 The production candidate, if E3 advances, is one decision-dependent PWL:
     x = P_PV + P_discharge
-    loss = L_pwl(x) - L(P_PV) + night_mask * L(0) * E
-where P_PV and night_mask are known parameters and E is the existing EMHASS
-battery direction binary. This makes PV-only and charging exact no-ops.
+    loss = L_pwl(x) - L_pwl(P_PV)
+where P_PV is a known parameter. This makes PV-only and charging exact
+no-ops. At night the correction is the incremental dispatch loss
+L(B)-L(0); the independently observed idle L(0) is deliberately not made
+conditional on a battery dispatch decision.
 Simultaneous PV curtailment + battery discharge remains outside validated #355
 physics and is intentionally NOT solved here by adding a second PWL.
 """
