@@ -1,0 +1,36 @@
+name: Issue 355 E3 research validation
+
+on:
+  push:
+    branches:
+      - research/issue355-incremental-inverter-loss-e3-20260923
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install EMHASS test environment
+        run: uv sync --reinstall --extra test
+
+      - name: Syntax check research files
+        run: |
+          uv run python -m py_compile \
+            scripts/issue355_pwl_feasibility.py \
+            tests/test_issue355_incremental_inverter_loss_research.py \
+            src/emhass/optimization.py
+
+      - name: Run focused issue355 tests
+        run: uv run pytest -q tests/test_issue355_incremental_inverter_loss_research.py
+
+      - name: Run H288 PWL feasibility and HiGHS microbenchmark
+        run: uv run python scripts/issue355_pwl_feasibility.py --horizon 288 --solve
