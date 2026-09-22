@@ -93,6 +93,68 @@ BATTERY_FIRST_IMPORT_PENALTY_FACTOR = 100.0
 # reachable SoC instead of returning infeasible.
 SOC_FINAL_DEVIATION_PENALTY_FACTOR = 100.0
 
+# Issue #355 research-only Sigenergy inverter-loss model. These constants are
+# deliberately NOT exposed through config defaults/UI/docs: this branch is a
+# Gate-E feasibility spike, not a production feature. Every PWL below is a
+# chordal approximation of the SAME frozen Gate A/B M4 curve; no coefficients
+# are refit. The key is the maximum dense-grid chord error (W) on 0..15 kW.
+ISSUE355_RESEARCH_PWL_POINTS_W = {
+    5: (
+        (0.0, 159.19898866861666),
+        (150.0, 179.72575710555407),
+        (700.0, 221.36211932330897),
+        (4400.0, 310.7141377644972),
+        (7050.0, 407.7182254833578),
+        (9700.0, 543.4569380472827),
+        (12350.0, 717.9415689582182),
+        (15000.0, 931.1721745887402),
+    ),
+    10: (
+        (0.0, 159.19898866861666),
+        (550.0, 213.5310219741232),
+        (3600.0, 289.00202826651457),
+        (7400.0, 423.42524584042087),
+        (11200.0, 637.4630619643651),
+        (15000.0, 931.1721745887402),
+    ),
+    15: (
+        (0.0, 159.19898866861666),
+        (350.0, 199.58005115696133),
+        (5700.0, 353.46454292620484),
+        (10350.0, 582.6687421002877),
+        (15000.0, 931.1721745887402),
+    ),
+    20: (
+        (0.0, 159.19898866861666),
+        (300.0, 195.26751593678534),
+        (4300.0, 307.8101415323799),
+        (9650.0, 540.5371999972512),
+        (15000.0, 931.1721745887402),
+    ),
+    25: (
+        (0.0, 159.19898866861666),
+        (150.0, 179.72575710555407),
+        (3000.0, 274.93750170564823),
+        (9000.0, 503.83581448006044),
+        (15000.0, 931.1721745887402),
+    ),
+    30: (
+        (0.0, 159.19898866861666),
+        (100.0, 173.51477777249264),
+        (8450.0, 474.60153793135146),
+        (15000.0, 931.1721745887402),
+    ),
+    40: (
+        (0.0, 159.19898866861666),
+        (7400.0, 423.42524584042087),
+        (15000.0, 931.1721745887402),
+    ),
+}
+ISSUE355_RESEARCH_PWL_EXTENSION_MAX_W = 50000.0
+ISSUE355_RESEARCH_DISCHARGE_ACTIVE_EPS_W = 1.0
+ISSUE355_RESEARCH_NIGHT_PV_EPS_W = 1.0
+ISSUE355_RESEARCH_VALIDATED_MAX_W = 15000.0
+
 
 class Optimization:
     r"""
@@ -264,6 +326,14 @@ class Optimization:
         self.param_soc_final_penalty = cp.Parameter(nonneg=True, name="soc_final_penalty")
         self.param_prod_price = cp.Parameter(self.num_timesteps, name="prod_price")
 
+        # Issue #355 research parameters are created only when the hidden
+        # research flag is explicitly enabled. With the flag absent/False the
+        # released v0.18.3 object graph is unchanged.
+        self.param_issue355_pv_loss_baseline = None
+        self.param_issue355_night_mask = None
+        if self._issue355_research_enabled():
+            self._init_issue355_research_params()
+
         # Per-deferrable-load cost override parameters. When the user supplies a
         # `cost_forecast_per_deferrable_load[k]` array, that load is priced at its
         # own per-timestep rate (e.g., gas price for a gas-boiler load) instead of
@@ -375,6 +445,72 @@ class Optimization:
         # unconditionally whenever the build block runs.
         self._batt_stress_conf = None
         self._inv_stress_conf = None
+
+    def _issue355_research_enabled(self) -> bool:
+        """Return whether the isolated #355 Gate-E model is explicitly on."""
+        return bool(self.optim_conf.get("research_issue355_incremental_inverter_loss", False))
+
+    def _issue355_research_pwl_points(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return the selected frozen-M4 PWL plus a linear >15 kW research tail.
+
+        The final tail exists only so an offline solve remains continuous if it
+        wanders outside the validated 0..15 kW evidence domain. Gate-E result
+        extraction flags every discharge interval using that tail as unsupported.
+        """
+        raw = self.optim_conf.get("research_issue355_pwl_max_error_w", 30)
+        try:
+            tolerance = int(raw)
+        except (TypeError, ValueError) as err:
+            raise ValueError(
+                "research_issue355_pwl_max_error_w must be one of "
+                f"{sorted(ISSUE355_RESEARCH_PWL_POINTS_W)}, got {raw!r}"
+            ) from err
+        if tolerance not in ISSUE355_RESEARCH_PWL_POINTS_W:
+            raise ValueError(
+                "research_issue355_pwl_max_error_w must be one of "
+                f"{sorted(ISSUE355_RESEARCH_PWL_POINTS_W)}, got {raw!r}"
+            )
+        pts = np.asarray(ISSUE355_RESEARCH_PWL_POINTS_W[tolerance], dtype=float)
+        x = pts[:, 0]
+        y = pts[:, 1]
+        last_slope = (y[-1] - y[-2]) / (x[-1] - x[-2])
+        x_ext = ISSUE355_RESEARCH_PWL_EXTENSION_MAX_W
+        y_ext = y[-1] + last_slope * (x_ext - x[-1])
+        return np.append(x, x_ext), np.append(y, y_ext)
+
+    def _init_issue355_research_params(self) -> None:
+        """Create horizon-shaped Parameters for the isolated #355 spike."""
+        if not self.plant_conf.get("inverter_is_hybrid", False):
+            raise ValueError("issue355 research loss model requires inverter_is_hybrid=true")
+        if not self.optim_conf.get("set_use_battery", False):
+            raise ValueError("issue355 research loss model requires set_use_battery=true")
+        if self.n_batt != 1:
+            raise ValueError("issue355 research loss model currently supports exactly one battery")
+        n = self.num_timesteps
+        self.param_issue355_pv_loss_baseline = cp.Parameter(
+            n, nonneg=True, name="issue355_pv_loss_baseline"
+        )
+        self.param_issue355_pv_loss_baseline.value = np.zeros(n)
+        self.param_issue355_night_mask = cp.Parameter(
+            n, nonneg=True, name="issue355_night_mask"
+        )
+        self.param_issue355_night_mask.value = np.zeros(n)
+
+    def _update_issue355_research_params(self, p_pv) -> None:
+        """Update numeric PWL baseline/night mask without rebuilding the MILP."""
+        if not self._issue355_research_enabled():
+            return
+        pv = np.maximum(np.asarray(p_pv, dtype=float), 0.0)
+        x, y = self._issue355_research_pwl_points()
+        if np.any(pv > x[-1]):
+            raise ValueError(
+                "issue355 research PV forecast exceeds the 50 kW continuity tail; "
+                f"max={float(np.max(pv)):.3f} W"
+            )
+        self.param_issue355_pv_loss_baseline.value = np.interp(pv, x, y)
+        self.param_issue355_night_mask.value = (
+            pv <= ISSUE355_RESEARCH_NIGHT_PV_EPS_W
+        ).astype(float)
 
     def _init_soc_recovery_params(self) -> None:
         """Initialize CVXPY parameters used for out-of-band SOC recovery.
@@ -2928,9 +3064,65 @@ class Optimization:
 
         # AC Bus Balance
         # p_hybrid == converted_DC_to_AC - converted_AC_to_DC
-        constraints.append(
-            p_hybrid_inverter == (p_dc_ac * eff_dc_ac) - (p_ac_dc * (1.0 / eff_ac_dc))
-        )
+        native_hybrid_output = (p_dc_ac * eff_dc_ac) - (p_ac_dc * (1.0 / eff_ac_dc))
+        if self._issue355_research_enabled():
+            # Gate-E research surrogate: one decision-dependent PWL L(P_PV+B).
+            # L(P_PV) is a numeric Parameter updated per solve, so PV-only and
+            # charging are exact no-ops. At forecast-night, add L(0)*E to restore
+            # the full validated nighttime loss rather than only L(B)-L(0).
+            p_discharge = self.vars["p_sto_pos"][0]
+            discharge_mode = self.vars["E"][0]
+            x_points, y_points = self._issue355_research_pwl_points()
+            widths = np.diff(x_points)
+            slopes = np.diff(y_points) / widths
+            segment_count = len(widths)
+
+            delta = cp.Variable(
+                (segment_count, n), nonneg=True, name="issue355_pwl_delta"
+            )
+            segment_active = cp.Variable(
+                (segment_count - 1, n), boolean=True, name="issue355_pwl_segment_active"
+            )
+            self.vars["issue355_pwl_delta"] = delta
+            self.vars["issue355_pwl_segment_active"] = segment_active
+
+            # Incremental exact graph: later segments can fill only after every
+            # earlier segment is full. The final segment is the research-only
+            # linear continuity tail above 15 kW; replay diagnostics flag it.
+            constraints.append(cp.sum(delta, axis=0) == p_pv + p_discharge)
+            for i in range(segment_count):
+                constraints.append(delta[i] <= widths[i])
+            for i in range(segment_count - 1):
+                constraints.append(delta[i] >= widths[i] * segment_active[i])
+                constraints.append(delta[i + 1] <= widths[i + 1] * segment_active[i])
+
+            total_loss = y_points[0] + cp.sum(
+                cp.multiply(slopes[:, None], delta), axis=0
+            )
+            candidate_loss = (
+                total_loss
+                - self.param_issue355_pv_loss_baseline
+                + cp.multiply(
+                    self.param_issue355_night_mask,
+                    y_points[0] * discharge_mode,
+                )
+            )
+            native_battery_inverter_loss = (1.0 - eff_dc_ac) * p_discharge
+            extra_loss = candidate_loss - native_battery_inverter_loss
+
+            # Make E a true discharge-active indicator for the nighttime base
+            # term. This 1 W research-only lower bound is far below the evidence
+            # domain and avoids an idle binary floating to E=1.
+            constraints.append(
+                p_discharge >= ISSUE355_RESEARCH_DISCHARGE_ACTIVE_EPS_W * discharge_mode
+            )
+
+            self.vars["issue355_candidate_loss"] = candidate_loss
+            self.vars["issue355_extra_loss"] = extra_loss
+            constraints.append(p_hybrid_inverter == native_hybrid_output - extra_loss)
+        else:
+            # Exact released v0.18.3 path.
+            constraints.append(p_hybrid_inverter == native_hybrid_output)
 
         # Enforce Binary Logic (Cannot source and sink DC simultaneously)
         constraints.append(p_ac_dc <= (1 - is_dc_sourcing) * p_ac_dc_max)
@@ -4962,6 +5154,24 @@ class Optimization:
             opt_tp["P_hybrid_inverter"] = get_val(self.vars["p_hybrid_inverter"])
             if "inv_stress_cost" in self.vars:
                 opt_tp["inv_stress_cost"] = get_val(self.vars["inv_stress_cost"])
+            if self._issue355_research_enabled():
+                opt_tp["issue355_candidate_loss_W"] = get_val(
+                    self.vars["issue355_candidate_loss"]
+                )
+                opt_tp["issue355_extra_loss_W"] = get_val(self.vars["issue355_extra_loss"])
+                discharge = opt_tp["P_batt"].to_numpy() > ISSUE355_RESEARCH_DISCHARGE_ACTIVE_EPS_W
+                coordinate = np.asarray(p_pv, dtype=float) + np.maximum(
+                    opt_tp["P_batt"].to_numpy(), 0.0
+                )
+                opt_tp["issue355_outside_15kw_domain"] = (
+                    discharge & (coordinate > ISSUE355_RESEARCH_VALIDATED_MAX_W)
+                ).astype(int)
+                if self.plant_conf["compute_curtailment"]:
+                    opt_tp["issue355_curtailment_discharge_overlap"] = (
+                        discharge & (opt_tp["P_PV_curtailment"].to_numpy() > 1.0)
+                    ).astype(int)
+                else:
+                    opt_tp["issue355_curtailment_discharge_overlap"] = 0
 
         # Costs & Prices
         opt_tp["unit_load_cost"] = unit_load_cost
@@ -5115,6 +5325,8 @@ class Optimization:
             self.param_load_cost_pos = cp.Parameter(current_n, nonneg=True, name="load_cost_pos")
             self.param_export_ceiling = cp.Parameter(current_n, nonneg=True, name="export_ceiling")
             self.param_prod_price = cp.Parameter(current_n, name="prod_price")
+            if self._issue355_research_enabled():
+                self._init_issue355_research_params()
             self.param_cost_per_load = [
                 cp.Parameter(current_n, name=f"cost_per_load_{k}")
                 for k in range(self.optim_conf.get("number_of_deferrable_loads", 0))
@@ -5354,6 +5566,7 @@ class Optimization:
 
         # Parameter Updates
         self.param_pv_forecast.value = p_pv
+        self._update_issue355_research_params(p_pv)
         self.param_load_forecast.value = p_load
         self.param_load_cost.value = unit_load_cost
         self.param_load_cost_pos.value = np.maximum(np.asarray(unit_load_cost, dtype=float), 0.0)
