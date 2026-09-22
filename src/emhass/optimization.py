@@ -152,7 +152,6 @@ ISSUE355_RESEARCH_PWL_POINTS_W = {
 }
 ISSUE355_RESEARCH_PWL_EXTENSION_MAX_W = 50000.0
 ISSUE355_RESEARCH_DISCHARGE_ACTIVE_EPS_W = 1.0
-ISSUE355_RESEARCH_NIGHT_PV_EPS_W = 1.0
 ISSUE355_RESEARCH_VALIDATED_MAX_W = 15000.0
 
 
@@ -330,7 +329,6 @@ class Optimization:
         # research flag is explicitly enabled. With the flag absent/False the
         # released v0.18.3 object graph is unchanged.
         self.param_issue355_pv_loss_baseline = None
-        self.param_issue355_night_mask = None
         if self._issue355_research_enabled():
             self._init_issue355_research_params()
 
@@ -498,13 +496,9 @@ class Optimization:
             n, nonneg=True, name="issue355_pv_loss_baseline"
         )
         self.param_issue355_pv_loss_baseline.value = np.zeros(n)
-        self.param_issue355_night_mask = cp.Parameter(
-            n, nonneg=True, name="issue355_night_mask"
-        )
-        self.param_issue355_night_mask.value = np.zeros(n)
 
     def _update_issue355_research_params(self, p_pv) -> None:
-        """Update numeric PWL baseline/night mask without rebuilding the MILP."""
+        """Update the numeric PWL PV baseline without rebuilding the MILP."""
         if not self._issue355_research_enabled():
             return
         pv = np.maximum(np.asarray(p_pv, dtype=float), 0.0)
@@ -515,9 +509,6 @@ class Optimization:
                 f"max={float(np.max(pv)):.3f} W"
             )
         self.param_issue355_pv_loss_baseline.value = np.interp(pv, x, y)
-        self.param_issue355_night_mask.value = (
-            pv <= ISSUE355_RESEARCH_NIGHT_PV_EPS_W
-        ).astype(float)
 
     def _init_soc_recovery_params(self) -> None:
         """Initialize CVXPY parameters used for out-of-band SOC recovery.
@@ -3075,10 +3066,14 @@ class Optimization:
         if self._issue355_research_enabled():
             # Gate-E research surrogate: one decision-dependent PWL L(P_PV+B).
             # L(P_PV) is a numeric Parameter updated per solve, so PV-only and
-            # charging are exact no-ops. At forecast-night, add L(0)*E to restore
-            # the full validated nighttime loss rather than only L(B)-L(0).
+            # charging are exact no-ops. At night this intentionally evaluates
+            # the INCREMENTAL dispatch loss L(B)-L(0), not the absolute L(B):
+            # Gate A/B independently proved L(0) is already a real idle/auxiliary
+            # draw. Making L(0) conditional on discharge would misprice a fixed
+            # loss as a dispatch cost and could distort the optimizer. A future
+            # absolute physical model needs a separate auxiliary AC-balance term
+            # whose actuator/charging semantics are not yet proven by #355.
             p_discharge = self.vars["p_sto_pos"][0]
-            discharge_mode = self.vars["E"][0]
             x_points, y_points = self._issue355_research_pwl_points()
             widths = np.diff(x_points)
             slopes = np.diff(y_points) / widths
@@ -3106,23 +3101,9 @@ class Optimization:
             total_loss = y_points[0] + cp.sum(
                 cp.multiply(slopes[:, None], delta), axis=0
             )
-            candidate_loss = (
-                total_loss
-                - self.param_issue355_pv_loss_baseline
-                + cp.multiply(
-                    self.param_issue355_night_mask,
-                    y_points[0] * discharge_mode,
-                )
-            )
+            candidate_loss = total_loss - self.param_issue355_pv_loss_baseline
             native_battery_inverter_loss = (1.0 - eff_dc_ac) * p_discharge
             extra_loss = candidate_loss - native_battery_inverter_loss
-
-            # Make E a true discharge-active indicator for the nighttime base
-            # term. This 1 W research-only lower bound is far below the evidence
-            # domain and avoids an idle binary floating to E=1.
-            constraints.append(
-                p_discharge >= ISSUE355_RESEARCH_DISCHARGE_ACTIVE_EPS_W * discharge_mode
-            )
 
             self.vars["issue355_candidate_loss"] = candidate_loss
             self.vars["issue355_extra_loss"] = extra_loss
