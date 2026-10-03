@@ -130,12 +130,32 @@ def add_local_calendar_days(
     explicit transition policy is applied consistently.
     """
     ts = pd.Timestamp(timestamp)
-    if ts.tzinfo is None:
-        raise ValueError("timestamp must be timezone-aware")
+    days = int(days)
+
+    # Preserve EMHASS's existing timezone-optional behavior. When no timezone
+    # is configured, there is no DST contract to resolve: calendar-day
+    # arithmetic remains naive exactly as it was before this helper existed.
+    if time_zone is None and ts.tzinfo is None:
+        if days == 0:
+            return ts
+        return ts + pd.DateOffset(days=days)
 
     tz = time_zone if time_zone is not None else ts.tz
+    if ts.tzinfo is None:
+        # A timezone was supplied for a naive wall time. Localize it so the
+        # same explicit transition policy below applies consistently.
+        localize = getattr(tz, "localize", None)
+        if localize is None:
+            zone_name = getattr(tz, "key", None) or getattr(tz, "zone", None)
+            if zone_name is None:
+                ts = ts.tz_localize(tz)
+            else:
+                tz = pytz.timezone(zone_name)
+                ts = pd.Timestamp(tz.localize(ts.to_pydatetime(), is_dst=None))
+        else:
+            ts = pd.Timestamp(tz.localize(ts.to_pydatetime(), is_dst=None))
+
     local = ts.tz_convert(tz)
-    days = int(days)
     if days == 0:
         return local
     nominal = local.tz_localize(None) + pd.DateOffset(days=days)
