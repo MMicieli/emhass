@@ -4,11 +4,11 @@ EMHASS will need 4 forecasts to work properly:
 
 - PV power production forecast (internally based on the weather forecast and the characteristics of your PV plant). This is given in Watts.
 
-- Load power forecast: how much power your house will demand in the next 24 hours. This is given in Watts.
+- Load power forecast: how much power your house will demand over the configured forecast horizon. This is given in Watts.
 
-- Load cost forecast: the price of the energy from the grid in the next 24 hours. This is given in currency/kWh.
+- Load cost forecast: the price of the energy from the grid over the configured forecast horizon. This is given in currency/kWh.
 
-- PV production selling price forecast: the price at which you will sell your excess PV production in the next 24 hours. This is given in currency/kWh.
+- PV production selling price forecast: the price at which you will sell your excess PV production over the configured forecast horizon. This is given in currency/kWh.
 
 Some methods are generalized to the 4 forecasts needed. For all the forecasts it is possible to pass the data either as a passed list of values or by reading from a CSV file. With these methods, it is then possible to use data from external forecast providers.
     
