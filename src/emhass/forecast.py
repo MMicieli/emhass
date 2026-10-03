@@ -1760,9 +1760,7 @@ class Forecast:
             self.optim_conf["delta_forecast_daily"].days,
             self.time_zone,
         ).replace(microsecond=0)
-        end_forecast_csv = add_local_calendar_days(
-            end_forecast_csv, timedelta_days, self.time_zone
-        )
+        end_forecast_csv = add_local_calendar_days(end_forecast_csv, timedelta_days, self.time_zone)
         forecast_dates_csv = pd.date_range(
             start=start_forecast_csv,
             end=end_forecast_csv - self.freq,
