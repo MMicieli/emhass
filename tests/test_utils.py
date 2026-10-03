@@ -283,9 +283,7 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dates[-1], "2026-10-04T03:00:00+11:00")
 
     @patch("emhass.utils._get_now")
-    def test_get_forecast_dates_sydney_extension_resolves_from_original_start(
-        self, mock_ts_now
-    ):
+    def test_get_forecast_dates_sydney_extension_resolves_from_original_start(self, mock_ts_now):
         """Extra forecast days must not carry a spring-gap shift into later days."""
         tz = pytz.timezone("Australia/Sydney")
         start = tz.localize(datetime(2026, 10, 3, 2, 5))
