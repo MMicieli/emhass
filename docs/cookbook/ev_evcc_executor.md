@@ -194,11 +194,11 @@ and the optimizer schedules around it instead of stopping it.
   inside a slot, use the `pv`/`minpv` variant in Step 4 and accept it may under-deliver versus the
   plan.
 - **The Step 2 deadline maths is separate from EMHASS forecast-window DST handling.** EMHASS
-  `delta_forecast_daily` uses local calendar-day semantics, but the example template's
-  `timedelta(days=1)` is still exactly 24 hours. On a timezone that observes daylight saving, that
-  template can therefore place the intended 05:00 wall-clock deadline an hour off on a switch day.
-  Construct the next local 05:00 as a calendar date/time in your Home Assistant timezone rather than
-  assuming 24 elapsed hours if your installation observes DST.
+  `delta_forecast_daily` uses local calendar-day semantics, while the example deadline is evaluated
+  by Home Assistant/Jinja and then converted into EMHASS timestep indices. If 05:00 must remain the
+  same local wall-clock deadline across a daylight-saving transition, validate or construct that
+  next local 05:00 using Home Assistant's configured timezone; do not assume EMHASS forecast-window
+  handling changes the template's datetime arithmetic.
 - **A missed deadline rolls into the next day.** Once 05:00 passes, the Step 2 template sets the
   deadline to the next 05:00, so if the car did not reach target overnight (it under-delivered on a
   low-sun `pv`/`minpv` night, or it was unplugged) the leftover energy carries a next-day deadline.
