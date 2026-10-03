@@ -216,6 +216,15 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
                     pd.Timedelta(hours=24),
                 )
 
+    def test_add_local_calendar_days_accepts_configured_iana_name(self):
+        """Runtime-param paths may still carry the configured timezone as a string."""
+        start = pd.Timestamp("2026-10-03 02:05:00")
+        result = utils.add_local_calendar_days(start, 1, "Australia/Sydney")
+        expected = pytz.timezone("Australia/Sydney").localize(
+            datetime(2026, 10, 4, 3, 5)
+        )
+        self.assertEqual(result, expected)
+
     def test_add_local_calendar_days_preserves_naive_timezone_optional_behavior(self):
         """No configured timezone keeps the pre-existing naive calendar-day path."""
         start = pd.Timestamp("2026-10-03 02:05:00")
