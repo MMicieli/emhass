@@ -1744,6 +1744,9 @@ class Forecast:
         r"""
         Get the date range vector of forecast dates that will be used when loading a CSV file.
 
+        The configured forecast horizon and any CSV extension are local calendar-day
+        counts resolved once from the frozen forecast start.
+
         :return: The forecast dates vector
         :rtype: pd.date_range
 
