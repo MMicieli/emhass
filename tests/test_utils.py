@@ -216,6 +216,16 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
                     pd.Timedelta(hours=24),
                 )
 
+    def test_add_local_calendar_days_zero_is_identity_in_fall_back_fold(self):
+        """Zero calendar days must not switch between ambiguous fall-back occurrences."""
+        tz = pytz.timezone("Australia/Sydney")
+        first_occurrence = tz.localize(
+            datetime(2027, 4, 4, 2, 30),
+            is_dst=True,
+        )
+        result = utils.add_local_calendar_days(first_occurrence, 0, tz)
+        self.assertEqual(result, pd.Timestamp(first_occurrence))
+
     def test_add_local_calendar_days_sydney_ambiguous_endpoint(self):
         """Ambiguous fall-back endpoints select the post-transition occurrence."""
         tz = pytz.timezone("Australia/Sydney")
