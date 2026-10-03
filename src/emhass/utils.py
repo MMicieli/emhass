@@ -135,7 +135,10 @@ def add_local_calendar_days(
 
     tz = time_zone if time_zone is not None else ts.tz
     local = ts.tz_convert(tz)
-    nominal = local.tz_localize(None) + pd.DateOffset(days=int(days))
+    days = int(days)
+    if days == 0:
+        return local
+    nominal = local.tz_localize(None) + pd.DateOffset(days=days)
 
     localize = getattr(tz, "localize", None)
     normalize = getattr(tz, "normalize", None)
