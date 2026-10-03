@@ -1868,10 +1868,19 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
             pd.Timestamp("2026-10-04 03:00:00", tz=tz),
         )
 
-        csv_dates = fcst.get_forecast_days_csv()
+        csv_dates = fcst.get_forecast_days_csv(timedelta_days=0)
         self.assertEqual(len(csv_dates), 288)
         self.assertEqual(csv_dates[0], fcst.forecast_dates[0])
         self.assertEqual(csv_dates[-1], fcst.forecast_dates[-1])
+
+        # Extending by one additional calendar day is resolved from the
+        # original start, not from the already gap-shifted one-day endpoint.
+        extended = fcst.get_forecast_days_csv(timedelta_days=1)
+        self.assertEqual(len(extended), 564)
+        self.assertEqual(
+            extended[-1],
+            pd.Timestamp("2026-10-05 02:00:00", tz=tz),
+        )
 
     # Guard regression: _get_weather_list / _get_load_forecast_list must not crash on None input
     async def test_get_weather_list_none_does_not_crash(self):
