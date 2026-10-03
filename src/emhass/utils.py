@@ -117,71 +117,48 @@ def add_local_calendar_days(
     days: int,
     time_zone: datetime.tzinfo | None = None,
 ) -> pd.Timestamp:
-    """Add local calendar days without failing on DST transition wall times.
+    """Add local calendar days with deterministic pytz DST endpoint handling.
 
-    EMHASS forecast horizons are expressed in local civil/calendar days, not
-    fixed 24-hour durations. For valid target wall times this preserves the
-    existing 23/24/25-hour behavior across DST. If the nominal target is
-    nonexistent, it is moved forward by the timezone's actual gap. If it is
-    ambiguous, the post-transition (non-DST) occurrence is selected.
+    EMHASS forecast horizons use local civil/calendar days, not fixed 24-hour
+    durations. Valid wall times therefore retain the existing 23/24/25-hour
+    behavior across DST. If the nominal target wall time does not exist, move
+    it forward by the timezone's actual transition gap. If it is ambiguous,
+    select the post-transition (non-DST) occurrence.
 
-    The configured EMHASS timezone is pytz-backed. A zoneinfo-style timezone
-    with an IANA key is converted to the equivalent pytz timezone so the same
-    explicit transition policy is applied consistently.
+    EMHASS constructs configured timezones with pytz.timezone. When no timezone
+    is configured and timestamp is naive, preserve the pre-existing naive
+    calendar-day behavior.
     """
     ts = pd.Timestamp(timestamp)
     days = int(days)
 
-    # Preserve EMHASS's existing timezone-optional behavior. When no timezone
-    # is configured, there is no DST contract to resolve: calendar-day
-    # arithmetic remains naive exactly as it was before this helper existed.
     if time_zone is None and ts.tzinfo is None:
-        if days == 0:
-            return ts
-        return ts + pd.DateOffset(days=days)
+        return ts if days == 0 else ts + pd.DateOffset(days=days)
 
     tz = time_zone if time_zone is not None else ts.tz
+    if not hasattr(tz, "localize") or not hasattr(tz, "normalize"):
+        raise TypeError("time_zone must be a pytz timezone")
+
     if ts.tzinfo is None:
-        # A timezone was supplied for a naive wall time. Localize it so the
-        # same explicit transition policy below applies consistently.
-        localize = getattr(tz, "localize", None)
-        if localize is None:
-            zone_name = getattr(tz, "key", None) or getattr(tz, "zone", None)
-            if zone_name is None:
-                ts = ts.tz_localize(tz)
-            else:
-                tz = pytz.timezone(zone_name)
-                ts = pd.Timestamp(tz.localize(ts.to_pydatetime(), is_dst=None))
-        else:
-            ts = pd.Timestamp(tz.localize(ts.to_pydatetime(), is_dst=None))
+        ts = pd.Timestamp(tz.localize(ts.to_pydatetime(), is_dst=None))
 
     local = ts.tz_convert(tz)
     if days == 0:
         return local
+
     nominal = local.tz_localize(None) + pd.DateOffset(days=days)
-
-    localize = getattr(tz, "localize", None)
-    normalize = getattr(tz, "normalize", None)
-    if localize is None or normalize is None:
-        zone_name = getattr(tz, "key", None) or getattr(tz, "zone", None)
-        if zone_name is None:
-            # Fixed-offset timezones have no DST ambiguity to resolve.
-            return pd.Timestamp(nominal).tz_localize(tz)
-        tz = pytz.timezone(zone_name)
-
     nominal_dt = pd.Timestamp(nominal).to_pydatetime()
     try:
         resolved = tz.localize(nominal_dt, is_dst=None)
     except pytz.NonExistentTimeError:
-        # Interpret the nominal wall time using the pre-transition offset, then
-        # normalize to the first equivalent real post-transition wall time.
-        # This moves by the actual gap (e.g. 60 min Sydney, 30 min Lord Howe).
+        # Attach the pre-transition offset, then normalize. This advances the
+        # nominal wall time by the timezone's real gap (e.g. 60 min in Sydney,
+        # 30 min on Lord Howe) rather than hard-coding an hour.
         resolved = tz.normalize(tz.localize(nominal_dt, is_dst=False))
     except pytz.AmbiguousTimeError:
         # is_dst=False selects the post-transition/non-DST occurrence.
         resolved = tz.localize(nominal_dt, is_dst=False)
     return pd.Timestamp(resolved)
-
 
 def get_forecast_dates(
     freq: int,
@@ -211,8 +188,8 @@ def get_forecast_dates(
     start_forecast = (
         pd.Timestamp(start_time).tz_convert(time_zone).replace(microsecond=0).floor(freq=freq)
     )
-    end_forecast = add_local_calendar_days(start_forecast, delta_forecast, time_zone)
-    final_end_date = add_local_calendar_days(end_forecast, timedelta_days, time_zone) - freq
+    total_days = int(delta_forecast) + int(timedelta_days or 0)
+    final_end_date = add_local_calendar_days(start_forecast, total_days, time_zone) - freq
 
     forecast_dates = pd.date_range(
         start=start_forecast,
