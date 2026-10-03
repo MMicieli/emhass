@@ -1755,12 +1755,12 @@ class Forecast:
         # _extract_daily_forecast then raises KeyError (issue #1076). The
         # rounding itself still happens exactly once, in __init__.
         start_forecast_csv = self.start_forecast
+        total_days = self.optim_conf["delta_forecast_daily"].days + int(timedelta_days or 0)
         end_forecast_csv = add_local_calendar_days(
             start_forecast_csv,
-            self.optim_conf["delta_forecast_daily"].days,
+            total_days,
             self.time_zone,
         ).replace(microsecond=0)
-        end_forecast_csv = add_local_calendar_days(end_forecast_csv, timedelta_days, self.time_zone)
         forecast_dates_csv = pd.date_range(
             start=start_forecast_csv,
             end=end_forecast_csv - self.freq,
