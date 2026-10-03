@@ -115,7 +115,7 @@ def _get_now() -> datetime:
 def add_local_calendar_days(
     timestamp: pd.Timestamp | datetime,
     days: int,
-    time_zone: datetime.tzinfo | None = None,
+    time_zone: datetime.tzinfo | str | None = None,
 ) -> pd.Timestamp:
     """Add local calendar days with deterministic pytz DST endpoint handling.
 
@@ -125,9 +125,10 @@ def add_local_calendar_days(
     it forward by the timezone's actual transition gap. If it is ambiguous,
     select the post-transition (non-DST) occurrence.
 
-    EMHASS constructs configured timezones with pytz.timezone. When no timezone
-    is configured and timestamp is naive, preserve the pre-existing naive
-    calendar-day behavior.
+    EMHASS uses either the configured IANA timezone name or a pytz timezone,
+    depending on the calling path. IANA names are normalized with
+    pytz.timezone(). When no timezone is configured and timestamp is naive,
+    preserve the pre-existing naive calendar-day behavior.
     """
     ts = pd.Timestamp(timestamp)
     days = int(days)
@@ -136,8 +137,13 @@ def add_local_calendar_days(
         return ts if days == 0 else ts + pd.DateOffset(days=days)
 
     tz = time_zone if time_zone is not None else ts.tz
+    if isinstance(tz, str):
+        # Some existing runtime-parameter paths carry the configured IANA
+        # timezone name until get_yaml_parse() converts it. Preserve that
+        # established contract and resolve it through EMHASS's pytz dependency.
+        tz = pytz.timezone(tz)
     if not hasattr(tz, "localize") or not hasattr(tz, "normalize"):
-        raise TypeError("time_zone must be a pytz timezone")
+        raise TypeError("time_zone must be an IANA timezone name or pytz timezone")
 
     if ts.tzinfo is None:
         ts = pd.Timestamp(tz.localize(ts.to_pydatetime(), is_dst=None))
