@@ -178,9 +178,9 @@ def get_forecast_dates(
 
     :param freq: Optimization time step.
     :type freq: int
-    :param delta_forecast: Number of days to forecast in the future to be used for the optimization.
+    :param delta_forecast: Number of local calendar days to forecast in the future for the optimization.
     :type delta_forecast: int
-    :param timedelta_days: Number of truncated days needed for each optimization iteration, defaults to 0
+    :param timedelta_days: Additional local calendar days needed for the forecast range, defaults to 0
     :type timedelta_days: Optional[int], optional
     :return: A list of future forecast dates.
     :rtype: pd.core.indexes.datetimes.DatetimeIndex
