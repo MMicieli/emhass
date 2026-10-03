@@ -216,6 +216,13 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
                     pd.Timedelta(hours=24),
                 )
 
+    def test_add_local_calendar_days_preserves_naive_timezone_optional_behavior(self):
+        """No configured timezone keeps the pre-existing naive calendar-day path."""
+        start = pd.Timestamp("2026-10-03 02:05:00")
+        result = utils.add_local_calendar_days(start, 1, None)
+        self.assertEqual(result, pd.Timestamp("2026-10-04 02:05:00"))
+        self.assertIsNone(result.tzinfo)
+
     def test_add_local_calendar_days_zero_is_identity_in_fall_back_fold(self):
         """Zero calendar days must not switch between ambiguous fall-back occurrences."""
         tz = pytz.timezone("Australia/Sydney")
