@@ -160,6 +160,7 @@ def add_local_calendar_days(
         resolved = tz.localize(nominal_dt, is_dst=False)
     return pd.Timestamp(resolved)
 
+
 def get_forecast_dates(
     freq: int,
     delta_forecast: int,
