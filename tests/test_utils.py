@@ -283,6 +283,21 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dates[-1], "2026-10-04T03:00:00+11:00")
 
     @patch("emhass.utils._get_now")
+    def test_get_forecast_dates_sydney_extension_resolves_from_original_start(
+        self, mock_ts_now
+    ):
+        """Extra forecast days must not carry a spring-gap shift into later days."""
+        tz = pytz.timezone("Australia/Sydney")
+        start = tz.localize(datetime(2026, 10, 3, 2, 5))
+        mock_ts_now.return_value = start.astimezone(UTC)
+
+        dates = utils.get_forecast_dates(5, 1, tz, timedelta_days=1)
+
+        self.assertEqual(len(dates), 564)
+        self.assertEqual(dates[0], "2026-10-03T02:05:00+10:00")
+        self.assertEqual(dates[-1], "2026-10-05T02:00:00+11:00")
+
+    @patch("emhass.utils._get_now")
     def test_get_forecast_dates_sydney_ambiguous_endpoint(self, mock_ts_now):
         """Fall-back target inside 02:xx uses the post-transition occurrence."""
         tz = pytz.timezone("Australia/Sydney")
