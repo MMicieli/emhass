@@ -1848,7 +1848,7 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         optim_conf["delta_forecast_daily"] = pd.Timedelta(days=1)
         start = tz.localize(pd.Timestamp("2026-10-03 02:05:00").to_pydatetime())
 
-        with unittest.mock.patch.object(pd.Timestamp, "now", return_value=start):
+        with unittest.mock.patch.object(pd.Timestamp, "now", return_value=pd.Timestamp(start)):
             fcst = Forecast(
                 retrieve_hass_conf,
                 optim_conf,
