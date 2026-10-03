@@ -1727,9 +1727,9 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
             .tz_localize(fcst.time_zone, nonexistent="shift_forward")
             .floor(fcst.freq)
         )
-        end_ts = utils.add_local_calendar_days(
-            start_ts, delta_days, fcst.time_zone
-        ).replace(microsecond=0)
+        end_ts = utils.add_local_calendar_days(start_ts, delta_days, fcst.time_zone).replace(
+            microsecond=0
+        )
         dates = (
             pd.date_range(
                 start=start_ts,
@@ -1840,9 +1840,7 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
 
         params = await TestForecast.get_test_params()
         params_json = orjson.dumps(params).decode("utf-8")
-        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(
-            params_json, logger
-        )
+        retrieve_hass_conf, optim_conf, plant_conf = utils.get_yaml_parse(params_json, logger)
         tz = pytz.timezone("Australia/Sydney")
         retrieve_hass_conf["time_zone"] = tz
         retrieve_hass_conf["optimization_time_step"] = pd.Timedelta(minutes=5)
@@ -1861,9 +1859,7 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
                 get_data_from_file=True,
             )
 
-        expected_end = tz.localize(
-            pd.Timestamp("2026-10-04 03:05:00").to_pydatetime()
-        )
+        expected_end = tz.localize(pd.Timestamp("2026-10-04 03:05:00").to_pydatetime())
         self.assertEqual(fcst.start_forecast, pd.Timestamp(start))
         self.assertEqual(fcst.end_forecast, pd.Timestamp(expected_end))
         self.assertEqual(len(fcst.forecast_dates), 288)
