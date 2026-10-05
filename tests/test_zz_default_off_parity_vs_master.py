@@ -5,8 +5,10 @@ against this checkout's src/ (curves absent/default) and once against master's s
 from the fork at the base SHA - and requires byte-identical output.
 """
 
+import hashlib
 import json
 import os
+import warnings
 import pathlib
 import subprocess
 import sys
@@ -49,5 +51,12 @@ def test_default_off_parity_exact():
     assert sorted(master) == sorted(branch)
     for name in master:
         print(name, master[name]["status"], master[name]["n_variables"], master[name]["n_constraints"])
-    assert master_out == branch_out, "DEFAULT_OFF_PARITY differs"
-    print("DEFAULT_OFF_PARITY=EXACT")
+    digest = lambda text: hashlib.sha256(text.encode()).hexdigest()  # noqa: E731
+    equal = master_out == branch_out
+    # warnings are shown in the pytest summary of a passing run, so the evidence reaches the CI log
+    warnings.warn(
+        f"PARITY master_sha256={digest(master_out)} branch_sha256={digest(branch_out)} "
+        f"configs={sorted(master)} DEFAULT_OFF_PARITY={'EXACT' if equal else 'DIFFERS'}",
+        stacklevel=1,
+    )
+    assert equal, "DEFAULT_OFF_PARITY differs"
