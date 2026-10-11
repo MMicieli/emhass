@@ -81,4 +81,43 @@ Other inspected core modules: `connection_manager`, `battery_identification`, `l
 | E9 | Independent upstream maintainer/reporter validation; docs/changelog/cookbook as genuinely affected | **OPEN** |
 | E10 | Separate site-specific HA/Package18 fail-closed boundary confirmed offline before production use | **OPEN — not a substitute for upstream release acceptance** |
 
-**Required next step:** turn E2-E8 into deterministic tests against the real EMHASS package on the exact proposed commit, implement smallest coherent fix supported by those tests, review, then raise one focused upstream PR referencing #1189. Do not close #1189 on source-only or isolated-primitive evidence. Do not change live HA/EMS, Sigenergy registers (especially protected 41501), or operator mode during this audit.
+**Required next step:** turn E2-E8 into deterministic tests against the real EMHASS package on the exact proposed commit, implement smallest coherent fix supported by those tests, review, then raise the smallest coordinated, individually reviewable PR set justified by the completed audit and maintainer feedback, all referencing #1189; validate the combined head before requesting a coordinated release. Do not close #1189 on source-only or isolated-primitive evidence. Do not change live HA/EMS, Sigenergy registers (especially protected 41501), or operator mode during this audit.
+
+
+## 2026-10-12 follow-up: history-ingestion and publication-path qualification
+
+The current source audit was extended beyond initial forecast, optimisation and publication files. Upstream reviewed at tree `224e1e715a2054bb9a1792d49847babc0f18a70f`. Tooling in the isolated analysis environment: Python with pandas 2.2.3 and pytz 2026.2. **Not** an installed EMHASS package, full HA REST/WS runtime, bundled CI, or pandas 3.0.6 validation.
+
+### D13 — Home Assistant REST history mixed-offset resampling: new deterministic reproducer
+
+- Upstream: `src/emhass/retrieve_hass.py::_process_history_dataframe` around lines 498–527.
+- The production source first runs `pd.to_datetime(df_raw["last_changed"], format="ISO8601")` (no `utc=True`), assigns that to a DataFrame index and calls `.resample(self.freq).mean()`.
+- Isolated 30-minute Berlin 2026-10-25 and Sydney 2027-04-04 fall-back samples, each containing both offsets in one REST-style `last_changed` sequence, produce an **object Index**, followed by `TypeError: Only valid with DatetimeIndex, TimedeltaIndex or PeriodIndex` on resampling. In the same fixtures, parsing with `utc=True` yields four correct 30-minute UTC-indexed rows.
+- **Classification:** CONFIRMED failure of the exact parsing/resampling operations **conditional on a single source response containing mixed offsets**. Whether the active REST retrieval call returns this shape on the fall-back date, and whether this belongs in #1189's coordinated PR set or a separately linked upstream issue, remain integration / maintainer-scope questions. Existing #769/#778/#780 fixed *result CSV* reading, not this identified *HA history input* operation. Do not claim this production path is live-broken without the REST fixture integration test.
+- Required regression: an actual `RetrieveHass._process_history_dataframe` test for one response with two distinct offsets, verifying original chronological UTC instants and corresponding values plus a non-transition control.
+
+### D14 — Saved entity JSON publication: isolated negative check (avoid false positive)
+
+- `RetrieveHass.post_data` entity-save serialises time-indexed frames using `.to_json(orient="index", date_unit="s", date_format="iso")` around `src/emhass/retrieve_hass.py` entity-save path.
+- An isolated Sydney fall-back round-trip using that exact serialization converted keys to distinct UTC `Z` timestamps; `pd.read_json(..., orient="index")` restored a proper UTC datetime index, and `pd.to_datetime(...).tz_convert("Australia/Sydney")` preserved both folds.
+- **Classification:** Evidence of a mitigating producer contract, **not** a confirmed new issue in `publish_json`. Preserve this positive-path test and only open a defect if an actual alternate producer creates mixed-offset keys or an end-to-end fixture fails.
+
+### API/forecast contract details to preserve
+
+- Per upstream `AGENTS.md` and `docs/passing_data.md`: plain runtime lists are positional optimisation timesteps, whereas timestamped mappings carry absolute instants. Do not silently reinterpret list inputs as timestamped mappings; test both contracts separately.
+- `get_forecast_days_csv` now reuses `Forecast.start_forecast` and fixes the earlier #1076 double-now boundary race. Keep that freeze-once invariant, including across DST folds.
+- `src/emhass/utils.py::_align_runtime_forecast_mapping` already normalises timestamped mappings to UTC before alignment; retain its original value-to-instant contract.
+- `src/emhass/command_line.py::_load_opt_res_latest` uses `pd.to_datetime(..., utc=True)` for mixed-offset CSV. Preserve and cover it with true persisted-result -> publication tests.
+- Perfect-forecast DST day-skipping, weather/GHI localisation and forecast.solar parsing remain *candidate* reviews, not new confirmed bugs.
+
+### Scope and PR coordination decision
+
+- **Authoritative tracker:** upstream issue #1189; prior investigation comment posted by MMicieli. No redundant implementation issues created.
+- **Preferred implementation:** a small coordinated set, typically (1) forecast-start UTC-safe rounding with local-calendar boundaries, (2) forecast extraction and exact alignment, and (3) genuinely necessary combined end-to-end regressions. Each corrective PR includes targeted tests; integration regressions may be in PR 2 if a stand-alone PR 3 would be test-only churn.
+- If D13 is independently reproducible against the real EMHASS package and confirmed to need a source change, classify its owning subsystem/issue before adding it to a PR. Avoid bundling unrelated fixes solely because they concern timezones.
+- Submit coordinated PRs for upstream review only after reproducible tests and code review. Individual PRs must pass their relevant tests; final integration of the complete set must pass on the combined head. GitHub cannot atomically merge independent PRs. Have the maintainer coordinate rapid sequential merges where feasible; rebase/retarget as necessary. **Do not claim zero rebases or automatic same-release inclusion.**
+- The final independent Claude CLI code/test sweep is reserved for **Thursday 2026-10-15 AEDT** when the operator chooses to execute it. See `docs/issue_1189_dst_claude_cli_final_sweep_2026-10-15.md`. The handoff is not a scheduled unattended action.
+
+### Upstream contribution quality contract
+
+Before claiming release-ready: follow `AGENTS.md`, `CONTRIBUTING.md`, `docs/develop.md`, `docs/develop_ai_coders.md`; run canonical `uv sync --extra test`, `uv run pytest tests/`, `uvx ruff check .` and `uvx ruff format --check .` in an actual EMHASS checkout. Test the relevant paths on both supported pandas 2.2.x and 3.0.x where feasible, but respect genuine environment/dependency compatibility failures and report exactly what ran. Explicitly verify unaffected spring fixes #1164/#1166 and the already-fixed CSV publish family #769/#778/#780. Do not mark gates E1–E10 satisfied on source inspection or isolated primitives alone.
