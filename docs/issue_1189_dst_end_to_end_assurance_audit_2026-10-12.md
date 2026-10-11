@@ -102,6 +102,16 @@ The current source audit was extended beyond initial forecast, optimisation and 
 - An isolated Sydney fall-back round-trip using that exact serialization converted keys to distinct UTC `Z` timestamps; `pd.read_json(..., orient="index")` restored a proper UTC datetime index, and `pd.to_datetime(...).tz_convert("Australia/Sydney")` preserved both folds.
 - **Classification:** Evidence of a mitigating producer contract, **not** a confirmed new issue in `publish_json`. Preserve this positive-path test and only open a defect if an actual alternate producer creates mixed-offset keys or an end-to-end fixture fails.
 
+### D15 — Site-level dispatch boundary is not a substitute for upstream UTC correctness
+
+Read-only source verification against `MMicieli/home-assistant-config` master tree `3767dd8250f10d06321619135782866c657d7b8e`:
+
+- `scripts/ems_production_runner.py` calls `naive-mpc-optim` then `publish-data`; the `emhass_production_evidence.evaluate_binding` verdict is captured/logged observationally and does **not** change runner exit status.
+- `packages/18_ems_production_control_v1.yaml` performs the commissioned physical handback on an unsuccessful runner return code; on a successful return the Package18 dispatch path uses actual published sensor values, operator authority and freshness/validity checks, but **does not independently prove same-cycle plan-to-t0 UTC identity**.
+- The existing PV-adjusted validity/freshness gate based on `last_reported` does not itself prove the intended timestamp of every published value; a fresh publication containing a wrong-fold value is logically different from an aged sensor.
+- **Classification:** system boundary consequence / *potential* successful-but-shifted-plan exposure; no live incident established, no new Package18 defect or control rewrite asserted. Prior #1189 off-box reproducer showed a plan beginning an hour earlier after an isolated workaround. E10 requires a synthetic, read-only negative test of that scenario, preferably against the current runner and Package18 contract. Do not treat a valid evidence binding as a pre-dispatch gate, and do not add a new bespoke gate without a demonstrated need, site design review and operator approval.
+- No changes to existing protected Sigenergy Modbus 41501 policy or site operator intent.
+
 ### API/forecast contract details to preserve
 
 - Per upstream `AGENTS.md` and `docs/passing_data.md`: plain runtime lists are positional optimisation timesteps, whereas timestamped mappings carry absolute instants. Do not silently reinterpret list inputs as timestamped mappings; test both contracts separately.
