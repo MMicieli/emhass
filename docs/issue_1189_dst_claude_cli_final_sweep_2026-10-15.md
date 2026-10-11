@@ -62,6 +62,10 @@ Treat D13 REST-history issue separately unless the maintainer and tests establis
 
 Every corrective PR should include a reproducer, its relevant regression(s), public-facing behaviour contract, links to #1189, compatibility effects, and concise documentation updates. Avoid duplicate tests, unused abstractions, renaming public columns/params or unnecessary dependencies. Prefer 2 focused PRs to 3 if the third is artificial. Prepare branches/diffs for review; **do not autonomously publish upstream PRs or merge**. Stacked/dependent PRs should be clearly labelled and tested on the combined head. GitHub merges sequentially, so eliminate unnecessary rebase work but never promise atomic merges.
 
+### 3a. Independent operator-boundary check (offline only)
+
+Read `MMicieli/home-assistant-config` at an explicitly recorded SHA **without changing that repository or touching Home Assistant**. Inspect `scripts/ems_production_runner.py`, `scripts/emhass_production_evidence.py::evaluate_binding`, `packages/18_ems_production_control_v1.yaml`, and their existing tests. The runner's plan/last-run binding is observational; Package18 handles failure return codes but does not independently verify every published value's t0 UTC identity. Use synthetic wrong-fold / publish-stale / false-HTTP-success negative cases to determine whether upstream E7 and site E10 actually protect physical dispatch. Do not introduce unrequested Package18 gates, operator state changes, node-red changes or Modbus writes. Distinguish published sensor freshness from forecast value-to-instant correctness. Record any risk and a bounded recommendation separately from the upstream corrective PR scope.
+
 ### 4. Canonical tests, environments and verification
 
 Follow current upstream instructions rather than relying on these commands if they change:
