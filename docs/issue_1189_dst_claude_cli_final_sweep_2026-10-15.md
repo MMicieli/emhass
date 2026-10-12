@@ -31,6 +31,26 @@ Include time operators (`floor/ceil/round`, `tz_localize/tz_convert`, `normalize
 
 Preserve the current list-vs-timestamp-mapping contract: a plain list is positional with respect to the optimisation grid; a mapping is keyed by UTC instants. Freeze one request clock instant and preserve local-calendar-day semantics of #1164 and correct horizon sizing of #1166.
 
+
+### 1a. New independent reporter evidence — obtain, verify, reuse (2026-10-12)
+
+Read the **latest** comments on upstream [issue #1189](https://github.com/davidusb-geek/emhass/issues/1189), particularly [@thorstenhornung1's extensive independent confirmation and offered pytest suite](https://github.com/davidusb-geek/emhass/issues/1189#issuecomment-6117603789). The reporter independently corroborated our D1–D4 findings and reports **additional real-package failures D16–D23** now catalogued in the sister audit markdown (read that addendum in full).
+
+**First priority: request/access the reporter's offered black-box tests if a GitHub branch or attachment is available.** Do not assume the suite was actually attached; as of our latest reading, only an offer exists. Ask for the branch/link through the operator if posting upstream is not authorised. Once available, review provenance and test safety; run unchanged against recorded upstream v0.18.5 and new master, establish xfails, then adopt/adapt focused tests with due credit and minimal duplication. The offered suite reportedly uses `time-machine` for deterministic clocks and covers full EMHASS functions without network or patched EMHASS. Do not add `time-machine` as a production runtime dependency.
+
+**Must independently reproduce, not merely cite, the following additional modes:**
+
+- **D16 first:** *two inconsistent grids even on normal days*. For Berlin 10:20 at 30-min `nearest`, show timestamped input's 10:00 price must **not** be used as 10:30, and test `last` mode. Prove `get_forecast_dates`, mapping alignment, `Forecast.__init__`, MPC start and #1166 window extension all use the same intended instant grid.
+- **D17:** `Timestamp.replace(microsecond=0)` must not swap the actual fold/UTC instant; distinguish positive/negative DST and subsecond timestamp cases.
+- **D18:** both `between_time` failure variants: omitted fold rows on MPC branch and overselected fold rows on perfect branch.
+- **D19:** unbounded nearest cost CSV extrapolation for two hours; specify intended missing-data policy (explicit hold/interpolate/fail with required warnings) before fixing. No arbitrary change to other input contracts.
+- **D20:** negative-DST zone `KeyError` from pytz/zoneinfo dtype conversions and `.loc` lookups under pandas 3; validate both supported pandas lines.
+- **D21:** local ISO CSV with mixed offsets rejected by `pd.to_datetime(first_col,...)` preflight despite subsequent utc=True parse.
+- **D22:** repeated UTC rounding on Open-Meteo path collapses a 30/60-min index in non-hour-offset `Asia/Kathmandu`.
+- **D23:** `publish-data` must use persisted plan timestamps, not create a second incompatible grid; verify both-fold, failure and stale-plan paths.
+
+**PR design change:** The earlier split into “rounding” and “forecast alignment” remains tentative; inspect whether a per-run canonical time grid is the minimal correct solution to D16 without unnecessary architectural refactoring. No isolated first PR should silently break normal-day prices while waiting for a subsequent PR. Preserve separate testable PRs **only where coherence and combined-head evidence justify them**, and ask maintainer for architecture agreement where appropriate.
+
 ### 2. Regression matrix — on actual EMHASS, not just pandas snippets
 
 Use deterministically frozen clocks and complete real-package APIs/unit integration harness, not a calendar date on the real wall clock. Cover at least:
@@ -39,9 +59,9 @@ Use deterministically frozen clocks and complete real-package APIs/unit integrat
 | --- | --- |
 | Fall-back both folds | Europe/Berlin 2026-10-25: both 02:00 and 02:30 CEST/CET; Australia/Sydney 2027-04-04: both 02:00 and 02:30 AEDT/AEST, plus 5-minute 02:05/02:55 boundaries |
 | Spring-forward nonexistent hour | Berlin 2026-03-29; Sydney 2026-10-04; before/during/after and windows that cross it |
-| Unusual transitions | Australia/Lord_Howe 30-minute gap/fold; Europe/Dublin negative DST; Africa/Casablanca negative DST |
+| Unusual transitions | Australia/Lord_Howe 30-minute gap/fold; Europe/Dublin negative DST; Africa/Casablanca negative DST (Ramadan); Asia/Kathmandu non-hour offset |
 | Clock edge cases | Just before, exactly at and just after optimisation boundaries; tie-to-nearest at half-step; host UTC vs configured site time; first/last/nearest modes |
-| Native timestep | 5, 15 and 30 minutes; no implicit rounding to 1 hour |
+| Native timestep | 5, 15, 30 and 60 minutes; no implicit rounding to 1 hour |
 | Horizon | Requested exact counts, e.g. 1, 142, 287, 288 and calendar 23/24/25h or 23.5/24.5h as applicable |
 | Forecast inputs | Positional list, timestamped mapping, CSV, load/PV/price, typical/naive, weather and any applicable predictor; value identity by absolute UTC instant |
 | Outputs | Solver objective/input values and rows, unique monotonically increasing UTC timestamps, persistence CSV round-trip, full publish, `/api/v1/plan`, `/api/v1/last-run`, failed-run freshness and unchanged previous-run visibility |
