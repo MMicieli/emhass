@@ -51,6 +51,13 @@ Read the **latest** comments on upstream [issue #1189](https://github.com/davidu
 
 **PR design change:** The earlier split into “rounding” and “forecast alignment” remains tentative; inspect whether a per-run canonical time grid is the minimal correct solution to D16 without unnecessary architectural refactoring. No isolated first PR should silently break normal-day prices while waiting for a subsequent PR. Preserve separate testable PRs **only where coherence and combined-head evidence justify them**, and ask maintainer for architecture agreement where appropriate.
 
+
+### 1b. Newly rerun isolated evidence and external-suite availability (2026-10-12)
+
+A follow-on independent primitive replay on pandas **2.2.3** / pytz **2026.2** has now corroborated D16's *normal-day two-grid divergence*, D17's **±60-minute** fold switch via local `.replace(microsecond=0)` (four affected occurrences across Berlin, Sydney, Dublin and Casablanca), and D22's Kathmandu 30-minute re-rounding changing **12/12** samples and introducing **5 duplicate index values**. See the latest addendum of the authoritative audit for precise cases. None was run against installed full EMHASS; full package/integration gates remain open. Specifically D21 CSV preflight emitted a `FutureWarning` rather than an exception in pandas 2.2.3; test actual pandas 3 behaviour before classification.
+
+As of that check, upstream issue #1189 had **no link or attachment for the reporter's offered pytest suite**. A GitHub issue-comment attempt via this integration failed with **403 Resource not accessible by integration**, so no request was posted. **If a suite is not available when the CLI begins, proceed with original deterministic tests from the matrix; do not claim it was shared or wait for an external action.** Request operator to paste the short inquiry in the upstream issue if useful. If the suite arrives during development, verify and integrate it judiciously.
+
 ### 2. Regression matrix — on actual EMHASS, not just pandas snippets
 
 Use deterministically frozen clocks and complete real-package APIs/unit integration harness, not a calendar date on the real wall clock. Cover at least:
