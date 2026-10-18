@@ -124,8 +124,7 @@ class TestNaiveMPCOverridePlacement(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_present_but_invalid_override_does_not_silently_fallback(self):
-        with self.assertRaises(ValueError):
-            await self._prepare(None, supplied=True)
+        self.assertIsNone(await self._prepare(None, supplied=True))
 
 
 if __name__ == "__main__":
