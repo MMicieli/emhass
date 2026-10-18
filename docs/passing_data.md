@@ -55,6 +55,8 @@ The possible dictionary keys to pass data are:
 
 - `pv_power_forecast` for the central (P50) PV power production forecast.
 
+- `pv_power_first_step_override` is an **optional, MPC-only post-forecast override**, applied *after* native adjusted-PV prediction and *before* the optimiser, to the first PV step only. It accepts `{"timestamp":"2026-10-18T17:00:00+11:00","power_w":2050}`, where `timestamp` must equal EMHASS's actual first forecast grid instant (derived from the request clock by `method_ts_round`, see [config](config.md); with `nearest` it can be up to half a step after the request time) and `power_w` is finite, non-negative instantaneous/estimated PV power in watts. This does **not** resample a sparse P50 mapping or bypass the native adjustment for subsequent steps. If omitted, behaviour is unchanged; an invalid or off-grid supplied override fails before optimisation. Callers are responsible for proving the measurement was actually available before input freeze, sufficiently fresh and not physically curtailed. The field is not a guarantee that instantaneous power will equal the following 5-minute interval mean, and is not a substitute for curtailment screening. This affects only `naive-mpc-optim`, not day-ahead or `publish-data` source preparation.
+
 - `pv_power_forecast_p10` as an optional conservative P10 companion to `pv_power_forecast`. It must use the same representation (list or timestamped mapping) and the same source timeline as P50. When present, the pair is validated/aligned together and `weather_forecast_pv_quantile_bias` applies `bias * P10 + (1 - bias) * P50`. Omitting the companion leaves the existing P50-only behavior unchanged.
 
 - `load_power_forecast` for the Load power forecast.

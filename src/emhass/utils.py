@@ -2654,6 +2654,12 @@ async def treat_runtimeparams(
             else:
                 prediction_horizon = runtimeparams["prediction_horizon"]
             params["passed_data"]["prediction_horizon"] = prediction_horizon
+            # Optional per-request source input: interpreted ONLY after native
+            # adjusted-PV prediction and ONLY for MPC's first forecast instant.
+            if "pv_power_first_step_override" in runtimeparams:
+                params["passed_data"]["pv_power_first_step_override"] = runtimeparams[
+                    "pv_power_first_step_override"
+                ]
             # Auto-extend the forecast window to cover the requested MPC horizon.
             # Forecast days are local calendar days, so their timestep count is not
             # always 24h / optimization_time_step: a DST spring-forward day is shorter

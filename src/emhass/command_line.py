@@ -2125,6 +2125,46 @@ async def _get_naive_mpc_pv_forecast(ctx: SetupContext, set_mix_forecast, df_inp
     return p_pv_forecast, df_weather
 
 
+def _apply_first_step_pv_override(p_pv_forecast: pd.Series, override: dict) -> pd.Series:
+    """Override only the first post-adjustment MPC PV step, in W.
+
+    The caller owns measurement freshness and curtailment eligibility.
+    The timestamp must identify EMHASS's actual UTC-instant first grid step.
+    """
+    if not isinstance(override, dict) or set(override) != {"timestamp", "power_w"}:
+        raise ValueError("pv_power_first_step_override must contain timestamp and power_w")
+    raw_timestamp = override["timestamp"]
+    if not isinstance(raw_timestamp, str):
+        raise ValueError("pv_power_first_step_override timestamp must be an ISO string")
+    try:
+        timestamp = pd.Timestamp(raw_timestamp)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pv_power_first_step_override timestamp is invalid") from exc
+    if timestamp.tzinfo is None:
+        raise ValueError("pv_power_first_step_override timestamp requires UTC offset")
+
+    power = override["power_w"]
+    if (
+        isinstance(power, (bool, np.bool_))
+        or not isinstance(power, (int, float, np.integer, np.floating))
+        or not np.isfinite(power)
+        or power < 0
+    ):
+        raise ValueError("pv_power_first_step_override power_w must be finite and >= 0 W")
+    if (
+        p_pv_forecast.empty
+        or not isinstance(p_pv_forecast.index, pd.DatetimeIndex)
+        or p_pv_forecast.index.tz is None
+    ):
+        raise ValueError("pv_power_first_step_override requires a timezone-aware PV grid")
+    if timestamp.tz_convert("UTC") != p_pv_forecast.index[0].tz_convert("UTC"):
+        raise ValueError("pv_power_first_step_override timestamp differs from MPC first step")
+
+    result = p_pv_forecast.copy()
+    result.iloc[0] = float(power)
+    return result
+
+
 async def _prepare_naive_mpc_optim(ctx: SetupContext, stage_times: dict | None = None):
     """Helper to prepare data for Naive MPC optimization.
 
@@ -2144,6 +2184,15 @@ async def _prepare_naive_mpc_optim(ctx: SetupContext, stage_times: dict | None =
         )
     if p_pv_forecast is None:
         return None
+    # Native RAW14 has already run. Do not change its raw input or later slots.
+    if "pv_power_first_step_override" in ctx.params["passed_data"]:
+        try:
+            p_pv_forecast = _apply_first_step_pv_override(
+                p_pv_forecast, ctx.params["passed_data"]["pv_power_first_step_override"]
+            )
+        except ValueError as exc:
+            ctx.logger.error("Invalid PV first-step override: %s", exc)
+            return None
     # Get Load Forecast
     with stage_timer(stage_times, "load_forecast", ctx.logger):
         p_load_forecast = await ctx.fcst.get_load_forecast(
