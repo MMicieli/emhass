@@ -7,6 +7,13 @@
       "default_value": 10,
       "unit": "timesteps"
     },
+    "pv_power_first_step_override": {
+      "friendly_name": "PV first-step power override",
+      "Description": "Optional MPC-only override of the first optimiser PV timestep AFTER any native adjusted-PV model. Object: {timestamp: timezone-aware ISO 8601 instant of the actual EMHASS first grid step, power_w: finite non-negative PV watts}. Only the first step changes; later native forecast values are untouched. The caller must validate measurement availability, freshness and absence of curtailment. Invalid supplied input fails before optimisation.",
+      "input": "object",
+      "default_value": null,
+      "unit": "W"
+    },
     "soc_init": {
       "friendly_name": "Initial battery state of charge",
       "Description": "Battery state of charge at the start of the horizon, as a fraction in [0,1] (NOT percent). Defaults to battery_target_state_of_charge when omitted. If passed outside [battery_minimum_state_of_charge, battery_maximum_state_of_charge] a warning is logged and the real SOC is kept for optimization recovery. Only used by naive-mpc-optim. See passing_data.md.",
