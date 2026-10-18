@@ -2155,7 +2155,7 @@ def _apply_first_step_pv_override(
         or power < 0
     ):
         raise ValueError("pv_power_first_step_override power_w must be finite and >= 0 W")
-    if p_pv_forecast.empty or p_pv_forecast.index.tz is None:
+    if p_pv_forecast.empty or not isinstance(p_pv_forecast.index, pd.DatetimeIndex) or p_pv_forecast.index.tz is None:
         raise ValueError("pv_power_first_step_override requires a timezone-aware PV grid")
     if timestamp.tz_convert("UTC") != p_pv_forecast.index[0].tz_convert("UTC"):
         raise ValueError("pv_power_first_step_override timestamp differs from MPC first step")
@@ -2186,9 +2186,13 @@ async def _prepare_naive_mpc_optim(ctx: SetupContext, stage_times: dict | None =
         return None
     # Native RAW14 has already run. Do not change its raw input or later slots.
     if "pv_power_first_step_override" in ctx.params["passed_data"]:
-        p_pv_forecast = _apply_first_step_pv_override(
-            p_pv_forecast, ctx.params["passed_data"]["pv_power_first_step_override"]
-        )
+        try:
+            p_pv_forecast = _apply_first_step_pv_override(
+                p_pv_forecast, ctx.params["passed_data"]["pv_power_first_step_override"]
+            )
+        except ValueError as exc:
+            ctx.logger.error("Invalid PV first-step override: %s", exc)
+            return None
     # Get Load Forecast
     with stage_timer(stage_times, "load_forecast", ctx.logger):
         p_load_forecast = await ctx.fcst.get_load_forecast(
