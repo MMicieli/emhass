@@ -6171,6 +6171,10 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                 "overshoot_temperature": 20.0,
             },
         ]
+        # The last step is worth ~0.15 of a ~2400 objective, inside the default 1%
+        # lp_solver_mip_rel_gap, so the solver may legitimately stop without it
+        # (depending on the forecast grid); ask for the exact optimum.
+        self.optim_conf["lp_solver_mip_rel_gap"] = 0
         opt = self.create_optimization()
         prices = self.df_input_data_dayahead[opt.var_load_cost].to_numpy(dtype=float).copy()
         prices[:] = 0.30
