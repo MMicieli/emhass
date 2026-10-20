@@ -1,6 +1,6 @@
 # EMHASS Python 3.11–3.15 compatibility research — upstream #1220
 
-**Updated:** 2026-10-20 (Linux results and zone-test root cause added). **Status:** research and qualification in progress, **not** a Python 3.14/3.15 support declaration.
+**Updated:** 2026-10-21 (Stage 1 documentation alignment). **Status:** Stage 1 source qualified locally; hosted CI outstanding; **not** a Python 3.14/3.15 support declaration.
 
 **Owner:** this fork, for detailed compatibility research and reproducible evidence. [Upstream issue #1220](https://github.com/davidusb-geek/emhass/issues/1220) owns maintainer decisions and any approved upstream contribution. [Home Assistant compatibility watch #75](https://github.com/MMicieli/home-assistant-config/issues/75) tracks the upstream item at a high level; do **not** copy this investigation into #75.
 
@@ -10,7 +10,7 @@ This document is **fork-only research**, not upstream user documentation, a prod
 
 Investigate **one EMHASS codebase that continues to work on Python 3.11–3.15**, with 3.14/3.15 prioritised as the newest stable pair. Retain 3.11–3.13 when practical; do not let unsupported assertions or arbitrary caps block newer interpreters. The maintainer [agreed to retain older compatible Python versions where feasible](https://github.com/davidusb-geek/emhass/issues/1220#issuecomment-6191735326) and [endorsed the incremental approach](https://github.com/davidusb-geek/emhass/issues/1220#issuecomment-6193660741).
 
-1. **Stage 1 — 3.11–3.13:** remove Python 3.10 claims, resolve test isolation, and establish CI. [Fork implementation branch](https://github.com/MMicieli/emhass/tree/feat/python-311-313-issue-1220), initial commit `806da4ecb34266581014b7b867457b2dffb9e3c5`.
+1. **Stage 1 — 3.11–3.13:** remove Python 3.10 claims, resolve test isolation, and establish CI. [Fork implementation branch](https://github.com/MMicieli/emhass/tree/feat/python-311-313-issue-1220), initial commit `806da4ecb34266581014b7b867457b2dffb9e3c5`. The current branch tip [`281c358`](https://github.com/MMicieli/emhass/commit/281c35890824df547ed8a34543a64c24dd2bbefb) adds only a source-linked Python/CI clarification to `docs/develop.md` (six changed files total). Existing CLI regression reports were obtained before this documentation-only commit; validate its diff and wording, not another full interpreter matrix.
 2. **Stage 2 — 3.14:** assess package compatibility and make only justified dependency/code changes.
 3. **Stage 3 — 3.15:** assess wheel availability, native builds and all runtime/regression requirements; qualify when feasible.
 
