@@ -1,0 +1,54 @@
+name: EMHASS issue 1112 offline comparison
+on:
+  push:
+    branches:
+      - investigate/issue1112-offline-diagnostic-20261102
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: "Issue 1112 / ${{ matrix.version }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [v0.17.2, v0.18.1, v0.18.8]
+    steps:
+      - name: Checkout diagnostic from fork
+        uses: actions/checkout@v4
+        with:
+          path: diagnostic
+
+      - name: Checkout upstream version
+        uses: actions/checkout@v4
+        with:
+          repository: davidusb-geek/emhass
+          ref: ${{ matrix.version }}
+          path: upstream
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install upstream dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./upstream
+
+      - name: Run strictly offline optimizer diagnostics
+        run: |
+          python diagnostic/tests/issue1112_ci_diagnostic.py \
+            --repo upstream --out "evidence/${{ matrix.version }}"
+
+      - name: Preserve diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue1112-${{ matrix.version }}
+          path: evidence/${{ matrix.version }}/
+          if-no-files-found: warn
