@@ -20,6 +20,7 @@ import pandas as pd
 from aioresponses import aioresponses
 
 from emhass import utils
+from emhass.command_line import adjust_pv_forecast
 from emhass.retrieve_hass import RetrieveHass
 from emhass.utils import get_days_list, get_logger, get_yaml_parse
 
@@ -207,6 +208,86 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         # Only the HTTP 401 branch logs this; a connection error logs "Network error" instead
         self.assertTrue(any("TOKEN/KEY is invalid or missing" in line for line in logs.output))
         self.assertIn(("GET", test_url), [(m, str(u)) for m, u in mocked.requests])
+
+    async def test_issue_865_missing_historical_pv_forecast_closes_rest_session(self):
+        """REST history with a missing PV forecast must return False and close its
+        own HTTP session. The separate persistent HA-config session is tested
+        through set_input_data_dict's failed-setup tests.
+        """
+        day = pd.Timestamp("2026-05-19T00:00:00Z")
+        days = pd.date_range(day, periods=1, freq="D")
+        load = self.retrieve_hass_conf["sensor_power_load_no_var_loads"]
+        actual = self.retrieve_hass_conf["sensor_power_photovoltaics"]
+        forecast = self.retrieve_hass_conf["sensor_power_photovoltaics_forecast"]
+        requested = [load, actual, forecast]
+        history = [
+            {
+                "last_changed": (day + pd.Timedelta(minutes=30 * i)).isoformat(),
+                "state": str(1000 + i),
+            }
+            for i in range(4)
+        ]
+        entered_sessions = []
+        original_enter = aiohttp.ClientSession.__aenter__
+
+        async def track_enter(session):
+            entered_sessions.append(session)
+            return await original_enter(session)
+
+        with (
+            aioresponses() as mocked,
+            patch.object(aiohttp.ClientSession, "__aenter__", track_enter),
+        ):
+            for entity_id in requested:
+                url = self.rh._build_history_url(day, entity_id, "empty", False, False)
+                mocked.get(url, payload=[[] if entity_id == forecast else history])
+
+            with self.assertLogs(logger, level="ERROR") as logs:
+                success = await self.rh.get_data(days, requested)
+
+        self.assertFalse(success)
+        self.assertEqual(len(entered_sessions), 1)
+        self.assertTrue(entered_sessions[0].closed)
+        self.assertTrue(any("No data was retrieved" in msg for msg in logs.output))
+
+    async def test_issue_865_missing_pv_history_falls_back_without_model_file(self):
+        """A failed PV history retrieval does not replace the forecast with False,
+        attempt to fit a model, or create a bogus model artifact.
+        """
+        raw_pv = pd.Series(
+            [0.0, 1200.0, 2400.0],
+            index=pd.date_range("2026-05-19", periods=3, freq="30min", tz="UTC"),
+        )
+        rh = MagicMock(spec=RetrieveHass)
+        rh.get_data = AsyncMock(return_value=False)
+        optim_conf = {
+            "set_use_pv": True,
+            "set_use_adjusted_pv": True,
+            "adjusted_pv_model_max_age": 24,
+            "adjusted_pv_regression_model": "LassoRegression",
+        }
+
+        with tempfile.TemporaryDirectory() as dirname:
+            model_path = pathlib.Path(dirname) / "adjust_pv_regressor.pkl"
+            with self.assertLogs(logger, level="WARNING") as logs:
+                adjusted = await adjust_pv_forecast(
+                    logger,
+                    MagicMock(),
+                    raw_pv,
+                    False,
+                    self.retrieve_hass_conf,
+                    optim_conf,
+                    rh,
+                    {"data_path": pathlib.Path(dirname)},
+                    pd.DataFrame(),
+                )
+            self.assertFalse(model_path.exists())
+
+        pd.testing.assert_series_equal(adjusted, raw_pv)
+        rh.get_data.assert_awaited_once()
+        self.assertTrue(
+            any("Could not train adjusted PV model" in msg for msg in logs.output)
+        )
 
     # Test with html mock response
     async def test_get_data_mock(self):
