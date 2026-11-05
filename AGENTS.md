@@ -128,6 +128,18 @@ Four rules. Reduce wrong-assumption drift, scope creep, dead-code regression.
 3. **Surgical.** Touch only requested code. No "while I'm here" refactors. Match existing style. Remove only imports/vars YOUR change orphaned, never pre-existing dead code unless asked.
 4. **Goal-driven.** Task → verifiable criteria. "Add validation" → "tests for invalid inputs pass". "Fix bug" → "reproduce-test passes". State plan as numbered steps, each with verify check.
 
+## Section 6A — Resource-efficient agent execution (all tasks)
+
+This contract applies to **every** issue, project, research pass, triage, investigation, implementation, review, documentation task and handoff—not just Claude coding prompts. Optimise token/context, tool calls and compute **without sacrificing correctness, safety, independent evidence or necessary tests**.
+
+1. **Use all relevant resources, selectively.** Discover available local CLI (`rg`, `git`, `gh`, Python), GitHub/connected tools, repository instructions, authoritative docs, source/tests and prior verified results. Choose the smallest sufficient toolchain; check permissions and actual capabilities before declaring a resource unavailable. "All relevant" does not mean exhaustively calling every tool.
+2. **Load evidence just in time.** Start with the owning live issue, task acceptance and the smallest relevant code paths. Prefer targeted searches, diffs and line ranges to full-file or repo dumps; fetch only needed current comments. Reuse provenance-bound results and existing fixtures instead of repeating research or reproducing large prompts/chat histories.
+3. **Delegate only for leverage.** Use specialised subagents or parallel work only for clearly independent tasks that benefit from their capabilities. Avoid agents that re-explore the same code, repeated generic review/proceed loops, or overhead greater than doing a small task directly.
+4. **Validate economically, but completely.** Run a minimal reproducer and focused tests before the necessary broader suite/CI. Inspect test collection size and available CPU/RAM before expensive or parallel jobs; do not rerun unchanged successful matrices without cause. Keep complete logs when valuable but return only concise evidence, counts, failures and links.
+5. **Prompt by outcome, then stop.** Specify the issue/file, exact goal, source/baseline, authority limits, acceptance and stop condition once. Return a short diff/test/decision report; distinguish PASS, FAIL, NOT_RUN and BLOCKED. Do not create extra documents, issues, PRs or follow-up work solely to demonstrate effort. A verified NO_CHANGE/NO_BUILD is a valid result.
+
+These instructions never authorise deployment, upstream communication, production control, or bypassing repository workflow; follow higher-priority instructions and explicit operator approvals.
+
 ## Section 7 — Conventions
 
 - **Docs:** soft Diátaxis (tutorials, how-tos, reference, explanation). Not strict four-quadrant. Worked examples in `docs/study_cases/`.
