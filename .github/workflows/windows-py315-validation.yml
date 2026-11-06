@@ -1,0 +1,298 @@
+name: Windows Python 3.15.2 baseline (EMHASS #1220)
+
+# One-off experiment. Runs ONLY for a push to this exact branch of MMicieli/emhass.
+# It builds the UNMODIFIED EMHASS dependency set on stable CPython 3.15.2 / Windows x64 / MSVC and runs the
+# UNMODIFIED upstream test suite. It contains no EMHASS source: the source under test is fetched read-only at a
+# pinned upstream commit. It cannot publish anything: read-only token, no secrets, no release/registry/push steps.
+
+on:
+  push:
+    branches: ["ci/windows-py315-validation"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: win-py315-baseline
+  cancel-in-progress: false
+
+env:
+  EMHASS_REPO: "davidusb-geek/emhass"
+  EMHASS_SHA: "4efdaa25bb22a8d4161a8022be614df88bdb8ddf"   # upstream master when the pilot was validated
+  PY_VERSION: "3.15.2"
+  UV_VERSION: "0.13.7"
+  UV_SHA256: "0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021"
+  VCPKG_COMMIT: "054bd01bec7f31492ec9ac063740cc984a0fe59e"
+  VCPKG_TRIPLET: "x64-windows-release"
+  PIP_VERSION: "26.3"
+  PYTHONUTF8: "1"
+  UV_NO_PROGRESS: "1"
+  UV_LINK_MODE: "copy"
+  VCPKG_DISABLE_METRICS: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  baseline:
+    name: CPython 3.15.2 / Windows x64 / MSVC (unmodified)
+    # fail closed on anything but the one intended repository and ref
+    if: github.repository == 'MMicieli/emhass' && github.ref == 'refs/heads/ci/windows-py315-validation' && github.event_name == 'push'
+    runs-on: windows-2025
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - name: Keep LF line endings (Windows images set core.autocrlf=true system-wide)
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Check out the harness (this branch)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Check out the EMHASS source under test (upstream, pinned commit, read-only)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ env.EMHASS_REPO }}
+          ref: ${{ env.EMHASS_SHA }}
+          path: emhass-src
+          persist-credentials: false
+
+      - name: Confirm the source is exactly the pinned commit and the tree is clean
+        working-directory: emhass-src
+        run: |
+          $head = git rev-parse HEAD
+          "HEAD=$head"
+          if ($head -ne $env:EMHASS_SHA) { throw "source is $head, expected $env:EMHASS_SHA" }
+          if (git status --porcelain) { throw "source tree is not clean" }
+          "HARNESS=$env:GITHUB_WORKSPACE\harness\ci-1220\scripts" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force logs | Out-Null
+          $head | Out-File logs/source-sha.txt
+
+      # ------------------------------------------------------------------ prerequisites are asserted, not assumed
+      - name: Record and assert the build prerequisites
+        working-directory: emhass-src
+        run: |
+          $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs  = & $vsw -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json | ConvertFrom-Json
+          if (-not $vs) { throw "no Visual Studio with the x64 C++ toolset on this image" }
+          $report = [ordered]@{
+            image         = "$env:ImageOS $env:ImageVersion"
+            visual_studio = "$($vs[0].displayName) $($vs[0].installationVersion)"
+            cmake         = (cmake --version | Select-Object -First 1)
+            ninja         = (ninja --version)
+            git           = (git --version)
+            gfortran      = [bool](Get-Command gfortran -ErrorAction SilentlyContinue)
+            runner_vcpkg  = $env:VCPKG_INSTALLATION_ROOT
+          }
+          $report | ConvertTo-Json | Tee-Object logs/prerequisites.json
+          if (-not (Get-Command cmake) -or -not (Get-Command ninja)) { throw "cmake/ninja missing from PATH" }
+
+      - name: Import the MSVC x64 environment (vcvars64) into the job
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * `
+                  -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $out = cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set"
+          foreach ($l in $out) { if ($l -match '^([^=]+)=(.*)$') { "$($Matches[1])=$($Matches[2])" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV } }
+          "CMAKE_GENERATOR=Ninja" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CC=cl" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CXX=cl" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Confirm the compiler is the one imported
+        working-directory: emhass-src
+        run: |
+          (cl 2>&1 | Select-Object -First 1) | Tee-Object logs/cl-version.txt
+          $global:LASTEXITCODE = 0
+
+      # ------------------------------------------------------------------ pinned tools
+      - name: Install pinned uv (checksum verified)
+        run: |
+          $zip = "$env:RUNNER_TEMP\uv.zip"
+          Invoke-WebRequest "https://github.com/astral-sh/uv/releases/download/$env:UV_VERSION/uv-x86_64-pc-windows-msvc.zip" -OutFile $zip
+          $got = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $env:UV_SHA256) { throw "uv checksum mismatch: $got" }
+          Expand-Archive $zip "$env:RUNNER_TEMP\uvbin" -Force
+          "$env:RUNNER_TEMP\uvbin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          "UV_PYTHON_INSTALL_DIR=$env:RUNNER_TEMP\pyinst" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UV_PYTHON_PREFERENCE=only-managed" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Install CPython (stable) and create the environment
+        working-directory: emhass-src
+        run: |
+          uv --version
+          uv python install $env:PY_VERSION
+          uv venv "$env:RUNNER_TEMP\venv" --python $env:PY_VERSION
+          $py = "$env:RUNNER_TEMP\venv\Scripts\python.exe"
+          "PY=$py" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $v = & $py -c "import sys; print(sys.version.split()[0], sys.version_info.releaselevel)"
+          $v | Tee-Object logs/python-version.txt
+          if ($v -ne "$env:PY_VERSION final") { throw "expected CPython $env:PY_VERSION final, got: $v" }
+
+      - name: Build HDF5 and OpenBLAS with vcpkg (pinned commit, release-only dynamic triplet)
+        working-directory: emhass-src
+        run: |
+          $root = "$env:RUNNER_TEMP\vcpkg"
+          git init $root | Out-Null
+          git -C $root fetch --depth 1 https://github.com/microsoft/vcpkg.git $env:VCPKG_COMMIT
+          if ($LASTEXITCODE) { throw "vcpkg fetch failed" }
+          git -C $root checkout FETCH_HEAD
+          & "$root\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE) { throw "vcpkg bootstrap failed" }
+          & "$root\vcpkg.exe" install "hdf5[zlib]:$env:VCPKG_TRIPLET" "openblas:$env:VCPKG_TRIPLET" --clean-after-build 2>&1 | Tee-Object logs/vcpkg-install.log
+          if ($LASTEXITCODE) { throw "vcpkg install failed" }
+          & "$root\vcpkg.exe" list | Tee-Object logs/vcpkg-list.txt
+          $inst = "$root\installed\$env:VCPKG_TRIPLET"
+          "HDF5_DIR=$inst" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CMAKE_PREFIX_PATH=$inst" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "$inst\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          "HDF5_INCLUDEDIRS=$inst\include" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "HDF5_LIBDIRS=$inst\lib" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      # ------------------------------------------------------------------ resolve the unmodified pins, build every sdist separately
+      - name: Resolve the unmodified dependency set for 3.15.2 (fresh, as upstream CI does)
+        working-directory: emhass-src
+        run: |
+          uv pip compile pyproject.toml --extra test --python $env:PY -o resolved.txt
+          if ($LASTEXITCODE) { throw "dependency resolution failed" }
+          Copy-Item resolved.txt logs/resolved.txt
+          (Get-Content resolved.txt | Where-Object { $_ -match '^[A-Za-z0-9_.\-]+==' }).Count
+
+      - name: Record which pins have no usable 3.15 wheel (informational)
+        working-directory: emhass-src
+        run: |
+          uv pip install --python $env:PY --dry-run --only-binary :all: -r resolved.txt *> logs/wheel-gap.txt
+          Get-Content logs/wheel-gap.txt | Select-Object -Last 8
+          'pyyaml,ndindex,numexpr,h5py,highspy,qdldl,osqp,sparsediffpy,cvxpy' | Out-File logs/source-build-list.txt
+          $global:LASTEXITCODE = 0   # the dry run is expected to fail; it is evidence, not a gate
+
+      - name: Build wheels from source, one package at a time (each result recorded)
+        id: build
+        continue-on-error: true
+        working-directory: emhass-src
+        run: |
+          uv pip install --python $env:PY "pip==$env:PIP_VERSION" | Out-Null
+          New-Item -ItemType Directory -Force wheelhouse, logs/build | Out-Null
+          $pins = @{}
+          Get-Content resolved.txt | Where-Object { $_ -match '^([A-Za-z0-9_.\-]+)==([^\s;]+)' } | ForEach-Object { $pins[$Matches[1].ToLower().Replace('_','-')] = $Matches[2] }
+          $rows = @(); $failed = 0
+          foreach ($n in (Get-Content logs/source-build-list.txt).Trim().Split(',')) {
+            $ver = $pins[$n]; if (-not $ver) { $rows += "| $n | not in resolution | - | - |"; continue }
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            & $env:PY -m pip wheel --no-deps -v --no-binary=$n -w wheelhouse "$n==$ver" *> "logs/build/$n.log"
+            $ok = ($LASTEXITCODE -eq 0); $sw.Stop()
+            if (-not $ok) { $failed++ }
+            $rows += "| $n $ver | $(if ($ok) {'built'} else {'FAILED'}) | $([int]$sw.Elapsed.TotalSeconds) s | $(if ($ok) { (Get-ChildItem wheelhouse -Filter "$($n.Replace('-','_'))*" | Select-Object -First 1).Name } else { '-' }) |"
+          }
+          $md = @("### Source builds (CPython $env:PY_VERSION)", "| package | result | time | wheel |", "|---|---|---|---|") + $rows
+          $md | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          $md | Out-File logs/build-summary.md -Encoding utf8
+          Select-String -Path logs/build/*.log -Pattern 'BLAS|LAPACK|OpenBLAS' -List | ForEach-Object { "mentions BLAS/LAPACK: $($_.Path)" } | Tee-Object logs/blas-mentions.txt
+          if ($failed) { exit 1 }
+          exit 0
+
+      - name: Classify any build failure (missing prerequisite vs genuine compile error)
+        if: always() && steps.build.outcome == 'failure'
+        working-directory: emhass-src
+        run: |
+          $logs = Get-ChildItem logs/build/*.log | Where-Object { Select-String -Path $_.FullName -Pattern 'error|Error' -Quiet }
+          & $env:PY "$env:HARNESS\classify_build_failure.py" $logs.FullName --json logs/build-classification.json |
+            Tee-Object logs/build-classification.txt | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          $global:LASTEXITCODE = 0
+
+      # ------------------------------------------------------------------ install strictly from the resolution
+      - name: Install the full set (prebuilt wheels + the wheelhouse) and the project
+        id: install
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        working-directory: emhass-src
+        run: |
+          uv pip install --python $env:PY --find-links wheelhouse -r resolved.txt 2>&1 | Tee-Object logs/install.log
+          if ($LASTEXITCODE) { throw "dependency install failed" }
+          $extra = Select-String -Path logs/install.log -Pattern '^\s*Building (\S+)' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+          "unexpected source builds: $($extra -join ', ')" | Tee-Object logs/unexpected-builds.txt
+          uv pip install --python $env:PY --no-deps -e . 2>&1 | Tee-Object -Append logs/install.log
+          if ($LASTEXITCODE) { throw "project install failed" }
+          uv pip freeze --python $env:PY | Tee-Object logs/freeze.txt | Out-Null
+
+      - name: Verify the stack by executing it (imports, HDF5, solvers, MILP, BLAS)
+        id: stack
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        working-directory: emhass-src
+        run: |
+          & $env:PY -I "$env:HARNESS\verify_stack.py" --expect-python $env:PY_VERSION --out logs/stack.json 2>&1 | Tee-Object logs/stack.txt
+          exit $LASTEXITCODE
+
+      # ------------------------------------------------------------------ unmodified upstream quality + tests
+      - name: Ruff (check + format) and strict byte-compile of the unmodified source
+        id: ruff_base
+        if: steps.stack.outcome == 'success'
+        continue-on-error: true
+        working-directory: emhass-src
+        run: |
+          & $env:PY -m ruff --version | Tee-Object logs/ruff.txt
+          & $env:PY -m ruff check src tests 2>&1 | Tee-Object -Append logs/ruff.txt
+          $a = $LASTEXITCODE
+          & $env:PY -m ruff format --check src tests 2>&1 | Tee-Object -Append logs/ruff.txt
+          $b = $LASTEXITCODE
+          & $env:PY -W error -c "import compileall,sys; sys.exit(0 if compileall.compile_dir('src', quiet=1, force=True) else 1)"
+          $c = $LASTEXITCODE
+          if ($a -or $b -or $c) { exit 1 }
+
+      - name: Full upstream test suite (unmodified)
+        id: tests_base
+        if: steps.stack.outcome == 'success'
+        continue-on-error: true
+        working-directory: emhass-src
+        run: |
+          & $env:PY -m pytest -p no:cacheprovider -q -rfEsxX --junitxml=logs/junit-baseline.xml tests 2>&1 | Tee-Object logs/pytest-baseline.txt
+          $rc = $LASTEXITCODE
+          & $env:PY "$env:HARNESS\summarize_junit.py" baseline logs/junit-baseline.xml | Tee-Object logs/counts-baseline.json
+          exit $rc
+
+      # ------------------------------------------------------------------ report, preserve logs, gate
+      - name: Job summary
+        if: always()
+        working-directory: emhass-src
+        run: |
+          $lines = @("## Windows CPython $env:PY_VERSION baseline (source $env:EMHASS_SHA)", "| stage | outcome |", "|---|---|")
+          $stages = [ordered]@{
+            'source builds'      = '${{ steps.build.outcome }}'
+            'install'            = '${{ steps.install.outcome }}'
+            'stack execution'    = '${{ steps.stack.outcome }}'
+            'ruff + byte-compile' = '${{ steps.ruff_base.outcome }}'
+            'full test suite'    = '${{ steps.tests_base.outcome }}'
+          }
+          foreach ($k in $stages.Keys) { $lines += "| $k | $($stages[$k]) |" }
+          foreach ($f in Get-ChildItem logs/counts-*.json -ErrorAction SilentlyContinue) { $lines += "``$(Get-Content $f -Raw)``" }
+          $lines | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          $global:LASTEXITCODE = 0
+
+      - name: Preserve diagnostic logs (stored with this run in GitHub, not published elsewhere)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: win-py315-baseline-evidence
+          path: |
+            emhass-src/logs/
+            emhass-src/wheelhouse/
+            emhass-src/resolved.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Gate - every required stage must be an explicit success
+        if: always()
+        run: |
+          $o = [ordered]@{ build='${{ steps.build.outcome }}'; install='${{ steps.install.outcome }}'; stack='${{ steps.stack.outcome }}';
+                           ruff='${{ steps.ruff_base.outcome }}'; tests='${{ steps.tests_base.outcome }}' }
+          $bad = foreach ($k in $o.Keys) { if ($o[$k] -ne 'success') { "$k=$($o[$k])" } }
+          if ($bad) { Write-Error "not green: $($bad -join ', ')"; exit 1 }
+          "all required stages succeeded"
