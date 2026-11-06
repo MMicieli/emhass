@@ -66,7 +66,7 @@ The **secrets** parameters are:
 - `alt`: The altitude in meters. For example: 100.0
 - `solcast_api_key`: The Solcast API key (weather_forecast_method=solcast)
 - `solcast_rooftop_id`: The Solcast rooftop ID (weather_forecast_method=solcast)
-- `solar_forecast_kwp`: The PV peak installed power in kW used for the 'solar.forecast' API call (weather_forecast_method=solar.forecast)
+- `solar_forecast_kwp`: The peak power in kW of one PV plane (one entry of `pv_module_model`), used for the 'solar.forecast' API call (weather_forecast_method=solar.forecast). With one plane that is the peak power of your installation. With several planes (several entries in `pv_module_model`) a single number is used for each plane, so give a list with one number per plane in the order of `pv_module_model`, or a single number if all the planes have the same size. A list can be set in the secrets file or passed at runtime. The add-on options page only takes a single number for now. See [the forecast documentation](forecasts.md#solarforecast) for the rules and checks.
 - `influxdb_username`: Username for authenticating with InfluxDB. Leave empty if no authentication is required.
 - `influxdb_password`: Password for authenticating with InfluxDB. Leave empty if no authentication is required.
 - `victoriametrics_username`: Username for HTTP Basic authentication with VictoriaMetrics. Leave empty if no authentication is required.
@@ -394,7 +394,7 @@ Existing configurations need no migration: leaving both parameters empty (their 
 
 If your system has a battery (set_use_battery=True), then you should define the following parameters:
 
-- `number_of_batteries`: The number of physical batteries in the plant. Defaults to 1, matching every EMHASS config written before this parameter existed - every existing config keeps working unchanged. Set it above 1 to model a fleet of distinct batteries (for example two different chemistries or sizes) as separate storage devices sharing the same PV/load balance, instead of a single lumped battery.
+- `number_of_batteries`: The number of physical batteries in the plant. Defaults to 1, matching every EMHASS config written before this parameter existed - every existing config keeps working unchanged. Set it above 1 to model a fleet of distinct batteries (for example two different chemistries or sizes) as separate storage devices sharing the same PV/load balance, instead of a single lumped battery. The most it accepts is 100: every per-battery setting is expanded to one entry per battery, so a larger count is refused with an error naming the limit, at save time and on a runtime override.
 - `battery_discharge_power_max`: The maximum discharge power in Watts. Defaults to 1000.
 - `battery_charge_power_max`: The maximum charge power in Watts. Defaults to 1000.
 - `battery_charge_power_derating`: Optional table describing how the BMS steps its charge limit down as the battery fills, so the optimizer stops planning charge power the battery cannot deliver (issue #807). Each row is `[soc_threshold, power_max]`, both given as percentage/100, ascending by state of charge: above `soc_threshold` the charge power is capped at that much of `battery_charge_power_max`. For example `[[0.5, 0.84], [0.7, 0.42], [0.9, 0.23]]` means 84% of `battery_charge_power_max` above 50% SOC, 42% above 70% and 23% above 90%. Below the first threshold the flat maximum applies, so the table lists only the derating steps. Empty (the default) keeps the single flat ceiling, which is the behaviour of every earlier release.
