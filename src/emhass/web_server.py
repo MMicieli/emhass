@@ -2,11 +2,14 @@
 
 import argparse
 import asyncio
+import contextvars
+import hashlib
 import logging
 import os
 import pickle
 import platform
 import re
+import tempfile
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -14,11 +17,13 @@ from pathlib import Path
 import aiofiles
 import jinja2
 import orjson
+import pandas as pd
 import uvicorn
 import yaml
 from markupsafe import Markup
 from quart import Quart, make_response, request
 from quart import logging as log
+from werkzeug.exceptions import HTTPException
 
 from emhass import last_run, plan_store
 from emhass.command_line import (
@@ -41,16 +46,28 @@ from emhass.command_line import (
 )
 from emhass.connection_manager import close_global_connection, get_websocket_client, is_connected
 from emhass.utils import (
+    DRY_RUN_ACTIONS,
+    DRY_RUN_FLAGS,
+    HEAT_TOPOLOGY_KEYS,
+    InverterConfigError,
+    SocFractionError,
     build_config,
     build_legacy_config_params,
     build_params,
     build_secrets,
+    compile_heat_topology,
+    dry_run_request_problem,
     get_injection_dict,
     get_injection_dict_forecast_calibration,
     get_injection_dict_forecast_model_fit,
     get_injection_dict_forecast_model_tune,
     get_keys_to_mask,
+    inverter_config_faults,
+    inverter_power_curve_faults,
     param_to_config,
+    read_flag,
+    try_lock_file,
+    unlock_file,
 )
 
 app = Quart(__name__)
@@ -70,6 +87,47 @@ action_log_str = "action_logs.txt"
 injection_dict_file = "injection_dict.pkl"
 params_file = "params.pkl"
 error_msg_associations_file = "Unable to obtain associations file"
+
+# The (level, message) records of the dry run being served, or None outside
+# one. Each request runs in its own task with its own copy of the context, so
+# a record lands with the request that logged it and never with another.
+_dry_run_log: contextvars.ContextVar[list[tuple[int, str]] | None] = contextvars.ContextVar(
+    "emhass_dry_run_log", default=None
+)
+
+
+class _DryRunLog(logging.Handler):
+    """Collects the warnings and errors a dry run logs, for its own response."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        records = _dry_run_log.get()
+        if records is not None:
+            records.append((record.levelno, record.getMessage()))
+
+
+def _not_from_a_dry_run(record: logging.LogRecord) -> bool:
+    """Keep a dry run's records out of the action log.
+
+    An action's HTTP status is read back from that shared file, so an error a
+    dry run logged there could fail a live request running at the same time.
+    A dry run's records go to the console and to its own response instead.
+    """
+    return _dry_run_log.get() is None
+
+
+app.logger.addHandler(_DryRunLog())
+
+
+def _dry_run_slot() -> Path:
+    """The lock file that lets one dry run at a time run on this EMHASS, across
+    all its Gunicorn workers. It is outside the data folder, where a dry run
+    writes nothing, and named after that folder, so two EMHASS on one host
+    each have their own."""
+    key = hashlib.sha256(str(Path(emhass_conf["data_path"]).resolve()).encode()).hexdigest()
+    return Path(tempfile.gettempdir()) / f"emhass-dry-run-{key[:16]}.lock"
 
 
 # Add custom filter for trusted HTML content
@@ -442,6 +500,59 @@ async def parameter_set():
     if len(request_data) == 0:
         return await make_response(["failed to retrieve config json"], 400)
 
+    # Validate heat_topology at save time instead of at the next optimization
+    # run: the compiler's ValueError names the offending field, so surface it
+    # in the UI alert now rather than failing an unattended run later.
+    heat_topology = request_data.get("heat_topology")
+    # An empty text box arrives as null, "", "null" or {} and means "no
+    # topology". Anything else that is not an object (a list, a JSON topology
+    # quoted as a string) would be saved and then silently ignored at run time.
+    if heat_topology not in (None, "", "null") and not isinstance(heat_topology, dict):
+        app.logger.warning("Rejected config save: heat_topology is not an object")
+        return await make_response(
+            [
+                "heat_topology is invalid: it must be a JSON object, got "
+                f"{type(heat_topology).__name__}"
+            ],
+            400,
+        )
+    if isinstance(heat_topology, dict) and heat_topology:
+        # The compiler ignores keys it does not know, so a misspelled section
+        # (e.g. "source") would compile to zero loads and, in replace mode,
+        # remove the configured ones. At save time that is a typo: reject it.
+        unknown = sorted(set(heat_topology) - HEAT_TOPOLOGY_KEYS)
+        if unknown:
+            app.logger.warning("Rejected config save: heat_topology unknown keys %s", unknown)
+            return await make_response(
+                [
+                    f"heat_topology is invalid: unknown key(s) {unknown}; expected "
+                    f"{sorted(HEAT_TOPOLOGY_KEYS)}"
+                ],
+                400,
+            )
+        try:
+            # Off the event loop: a large topology must not stall other requests.
+            await asyncio.to_thread(compile_heat_topology, heat_topology)
+        except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as e:
+            # The compiler raises ValueError with a field path; the others are a
+            # backstop for malformed entries it does not check explicitly (e.g. a
+            # string where an object is expected), which would otherwise surface
+            # as an unhandled 500.
+            app.logger.warning("Rejected config save: heat_topology invalid: %s", e)
+            return await make_response([f"heat_topology is invalid: {e}"], 400)
+
+    # Reject an unusable inverter curve before anything is written: build_params would
+    # otherwise clear it (recovery for an already-persisted file), and a silent clear
+    # here would leave the user believing the curve is active. The per-inverter settings
+    # (#1150) are checked in the same pass, so one answer lists every fault: the curves
+    # first, then the inverter settings, then the refusal of more than one inverter.
+    inverter_faults = inverter_power_curve_faults(request_data) + inverter_config_faults(
+        request_data
+    )
+    if inverter_faults:
+        app.logger.warning("Rejected config save: inverter settings invalid: %s", inverter_faults)
+        return await make_response(inverter_faults, 400)
+
     # Format config by converting to params (format params. check if params match legacy option.json format. If so format)
     params = await build_params(emhass_conf, params_secrets, request_data, app.logger)
     if type(params) is bool and not params:
@@ -482,28 +593,8 @@ async def _load_params_and_runtime(request, emhass_conf, logger):
     """
     action_str = " >> Obtaining params: "
     logger.info(action_str)
-
-    # Load params.pkl
-    params = None
-    costfun = "profit"
-    params_path = emhass_conf["data_path"] / params_file
-
-    if params_path.exists():
-        async with aiofiles.open(str(params_path), "rb") as fid:
-            content = await fid.read()
-            try:
-                _, params = pickle.loads(content)  # Don't overwrite emhass_conf["config_path"]
-            except (EOFError, pickle.UnpicklingError, UnicodeDecodeError):
-                logger.error(
-                    "params.pkl is corrupted or truncated (race condition); cannot proceed"
-                )
-                return None, None, None
-            # Set local costfun variable
-            if params.get("optim_conf") is not None:
-                costfun = params["optim_conf"].get("costfun", "profit")
-            params = orjson.dumps(params).decode()
-    else:
-        logger.error("Unable to find params.pkl file")
+    params, costfun = await _load_params(emhass_conf, logger)
+    if params is None:
         return None, None, None
 
     # Load runtime params
@@ -521,6 +612,35 @@ async def _load_params_and_runtime(request, emhass_conf, logger):
     runtimeparams = orjson.dumps(runtimeparams).decode()
 
     return params, costfun, runtimeparams
+
+
+async def _load_params(emhass_conf, logger):
+    """Load the configuration parameters saved in params.pkl.
+
+    Returns (params as a JSON string, costfun), or (None, None) on failure.
+    """
+    params = None
+    costfun = "profit"
+    params_path = emhass_conf["data_path"] / params_file
+
+    if params_path.exists():
+        async with aiofiles.open(str(params_path), "rb") as fid:
+            content = await fid.read()
+            try:
+                _, params = pickle.loads(content)  # Don't overwrite emhass_conf["config_path"]
+            except (EOFError, pickle.UnpicklingError, UnicodeDecodeError):
+                logger.error(
+                    "params.pkl is corrupted or truncated (race condition); cannot proceed"
+                )
+                return None, None
+            # Set local costfun variable
+            if params.get("optim_conf") is not None:
+                costfun = params["optim_conf"].get("costfun", "profit")
+            params = orjson.dumps(params).decode()
+    else:
+        logger.error("Unable to find params.pkl file")
+        return None, None
+    return params, costfun
 
 
 async def _handle_action_dispatch(
@@ -546,13 +666,24 @@ async def _handle_action_dispatch(
     if action_name == "weather-forecast-cache":
         action_str = " >> Performing weather forecast, try to caching result"
         logger.info(action_str)
-        await weather_forecast_cache(emhass_conf, params, runtimeparams, logger)
+        try:
+            success = await weather_forecast_cache(emhass_conf, params, runtimeparams, logger)
+        except (SocFractionError, InverterConfigError) as exc:
+            # The message names only this request's own value, unlike the shared log's tail.
+            return f"EMHASS >> ERROR: {exc}\n", 400
+        if not success:
+            # Not the shared action-log tail: it can hold the lines of concurrent requests, which
+            # include their runtime parameters. The reason is in the action log.
+            return "EMHASS >> Weather forecast failed, see the action log for the reason... \n", 400
         return "EMHASS >> Weather Forecast has run and results possibly cached... \n", 200
 
     if action_name == "export-influxdb-to-csv":
         action_str = " >> Exporting InfluxDB data to CSV..."
         logger.info(action_str)
-        success = await export_influxdb_to_csv(None, logger, emhass_conf, params, runtimeparams)
+        try:
+            success = await export_influxdb_to_csv(None, logger, emhass_conf, params, runtimeparams)
+        except (SocFractionError, InverterConfigError):
+            return await grab_log(action_str), 400
         if success:
             return "EMHASS >> Action export-influxdb-to-csv executed successfully... \n", 200
         return await grab_log(action_str), 400
@@ -575,6 +706,10 @@ async def _handle_action_dispatch(
         action_str = f" >> Performing {action_name}..."
         logger.info(action_str)
         opt_res = await optim_actions[action_name](input_data_dict, logger)
+        # False: the action stopped before the solver, e.g. on a rejected
+        # runtime forecast (#1135); there is no plan to render.
+        if isinstance(opt_res, bool) and not opt_res:
+            return await grab_log(action_str), 400
         injection_dict = get_injection_dict(opt_res)
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return f"EMHASS >> Action {action_name} executed... \n", 200
@@ -731,6 +866,145 @@ async def api_v1_plan():
     return response
 
 
+@app.route("/api/v1/dry-run/<action_name>", methods=["POST"])
+async def api_v1_dry_run(action_name: str):
+    """Solve an optimization as POST /action/<action_name> would, and return
+    the plan instead of keeping it.
+
+    The body is the action's body. Nothing is written: no results CSV, entity
+    file, plan store, last-run record, weather cache, model or publish, and
+    the OptimizationCache is left as the last live run left it. No forecast
+    service is called: it plans with the forecasts in the body, or those live
+    runs saved, so it spends no provider's quota. The response
+    carries the run record /api/v1/last-run would have served, the plan
+    /api/v1/plan would have served, and the warnings and errors this request
+    logged, and no other request's.
+
+    HTTP 200: the solver ran; ``status`` says how (ok, infeasible, error).
+    HTTP 400: refused, or stopped before the solver; ``status`` is "not-run".
+    HTTP 413: the body is over MAX_CONTENT_LENGTH (16 MB); ``status`` is "not-run".
+    HTTP 429: another dry run is running (one runs at a time); ``status`` is "not-run".
+    HTTP 500: the run failed; ``status`` is "not-run".
+
+    Schema: docs/api/v1/dry-run.schema.json (JSON Schema draft 2020-12).
+    """
+    records: list[tuple[int, str]] = []
+    token = _dry_run_log.set(records)
+    headers = {}
+    try:
+        # One dry run at a time: a burst of them, which cold-solve, must never
+        # queue ahead of the live MPC run. One that arrives while another runs,
+        # on this worker or another, gets 429.
+        with open(_dry_run_slot(), "a+") as slot:
+            if not try_lock_file(slot):
+                app.logger.error(
+                    "Another dry run is running, and one runs at a time. Retry shortly. "
+                    "Nothing was run"
+                )
+                body, code = {"status": "not-run", "plan": None}, 429
+                headers["Retry-After"] = "2"
+            else:
+                try:
+                    body, code = await _dry_run(action_name)
+                finally:
+                    unlock_file(slot)
+    except HTTPException as exc:  # e.g. 413: the body is over MAX_CONTENT_LENGTH
+        app.logger.error(f"{exc.description} Nothing was run")
+        body, code = {"status": "not-run", "plan": None}, exc.code or 400
+    except Exception as exc:  # noqa: BLE001 - reported in the response, never raised
+        app.logger.exception(f"Dry run of {action_name} failed: {exc}")
+        body, code = {"status": "not-run", "plan": None}, 500
+    finally:
+        _dry_run_log.reset(token)
+    response_body = {
+        "dry_run": True,
+        "action": action_name,
+        **body,
+        "warnings": [msg for level, msg in records if level == logging.WARNING],
+        "errors": [msg for level, msg in records if level >= logging.ERROR],
+    }
+    response = await make_response(orjson.dumps(response_body), code)
+    response.headers["Content-Type"] = "application/json"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers.update(headers)
+    return response
+
+
+def _explain(message: str) -> None:
+    """Log ``message`` as the dry run's error, unless it has logged one already."""
+    if not any(level >= logging.ERROR for level, _ in _dry_run_log.get() or []):
+        app.logger.error(message)
+
+
+async def _dry_run(action_name: str) -> tuple[dict, int]:
+    """Run ``action_name`` as a dry run. Returns (body, HTTP status)."""
+    not_run = {"status": "not-run", "plan": None}
+    wrappers = {
+        "perfect-optim": perfect_forecast_optim,
+        "dayahead-optim": dayahead_forecast_optim,
+        "naive-mpc-optim": naive_mpc_optim,
+    }
+    if action_name not in DRY_RUN_ACTIONS:
+        app.logger.error(
+            f"A dry run is for {', '.join(DRY_RUN_ACTIONS)}, not {action_name!r}. Nothing was run"
+        )
+        return not_run, 400
+    raw = await request.get_data()
+    if not raw.strip():
+        runtime = {}  # no body, as /action/<action> allows
+    else:
+        try:
+            runtime = orjson.loads(raw)
+        except orjson.JSONDecodeError as exc:
+            app.logger.error(f"The body is not JSON ({exc}). Nothing was run")
+            return not_run, 400
+    if not isinstance(runtime, dict):
+        app.logger.error("The body must be a JSON object. Nothing was run")
+        return not_run, 400
+    problem = dry_run_request_problem(runtime, dry_run=True)
+    if problem:
+        app.logger.error(problem)
+        return not_run, 400
+    runtime.pop("dry_run", None)
+    for key in DRY_RUN_FLAGS:
+        if key in runtime:
+            runtime[key] = read_flag(runtime[key], key)
+
+    if runtime:
+        app.logger.info(f"Passed runtime parameters: {runtime}")
+    params, costfun = await _load_params(emhass_conf, app.logger)
+    if params is None:
+        _explain("The configuration could not be read. Nothing was run")
+        return not_run, 400
+    input_data_dict = await set_input_data_dict(
+        emhass_conf,
+        costfun,
+        params,
+        orjson.dumps(runtime).decode(),
+        action_name,
+        app.logger,
+        dry_run=True,
+    )
+    if not input_data_dict:
+        _explain("The inputs could not be built; see the warnings. Nothing was solved")
+        return not_run, 400
+    try:
+        opt_res = await wrappers[action_name](input_data_dict, app.logger)
+    finally:
+        if "rh" in input_data_dict:
+            await input_data_dict["rh"].close()
+    # False: the action stopped before the solver, e.g. on a rejected runtime
+    # forecast (#1135); there is no plan.
+    if not isinstance(opt_res, pd.DataFrame):
+        _explain("The run stopped before the solver; see the warnings. Nothing was solved")
+        return not_run, 400
+    run = input_data_dict.get("run_record")
+    if run is None:
+        app.logger.error("The dry run's record could not be built")
+        return not_run, 500
+    return {**run, "plan": plan_store.serialize(opt_res)}, 200
+
+
 @app.route("/healthz", methods=["GET"])
 async def healthz():
     """Liveness/readiness probe for container watchdogs.
@@ -786,6 +1060,13 @@ async def action_call(action_name: str):
     )
     if params is None:
         return await make_response(await grab_log(" >> Obtaining params: "), 400)
+    # A dry run has a URL of its own. Asked for here, it is refused before
+    # anything runs: running live would replace the plan the caller meant to keep.
+    runtime = orjson.loads(runtimeparams)
+    problem = dry_run_request_problem(runtime, dry_run=False) if isinstance(runtime, dict) else None
+    if problem:
+        app.logger.error(problem)
+        return await make_response(f"EMHASS >> ERROR: {problem}\n", 400)
 
     # Check for actions that do not need input_data_dict
     if action_name in [
@@ -1002,6 +1283,7 @@ async def _configure_logging(logging_level: str) -> None:
     file_logger = logging.FileHandler(str(emhass_conf["data_path"] / action_log_str))
     formatter = logging.Formatter("%(levelname)s - %(name)s - %(message)s")
     file_logger.setFormatter(formatter)  # add format to Handler
+    file_logger.addFilter(_not_from_a_dry_run)
     if logging_level == "DEBUG":
         app.logger.setLevel(logging.DEBUG)
         file_logger.setLevel(logging.DEBUG)

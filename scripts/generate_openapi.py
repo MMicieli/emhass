@@ -23,6 +23,7 @@ CURATED = {
     "/action/{action_name}": {"POST"},
     "/api/v1/last-run": {"GET"},
     "/api/v1/plan": {"GET"},
+    "/api/v1/dry-run/{action_name}": {"POST"},
     "/healthz": {"GET"},
 }
 
@@ -46,21 +47,32 @@ def _base_schema(base: str, param: dict) -> dict:
     )
 
 
-def _input_to_schema(input_str: str, param: dict) -> dict:
+def _input_to_schema(input_str: str, param: dict, scalar_default: bool = False) -> dict:
     """Map a param_definitions `input` string + param dict to an OpenAPI schema.
 
     For array.* inputs, the param `default_value` is the per-element scalar template,
     so it is placed on items.default; scalars get `default` directly. title/description/
     x-unit annotate the outermost property.
+
+    `scalar_default` is True for an array.* param whose shipped default in
+    config_defaults.json is a plain scalar (so /get-config returns a scalar until a list is
+    saved, and a list or a scalar is accepted). The property is then
+    `{"anyOf": [<element schema>, <array schema>]}`, with the annotations on the outer
+    object and the element default where it is for a plain array.
     """
     parts = input_str.split(".")
     leaf = _base_schema(parts[-1], param)
     dv = param.get("default_value", None)
     if dv is not None:
         leaf["default"] = dv
+    if param.get("maximum") is not None:
+        leaf["maximum"] = param["maximum"]
     schema = leaf
     for _ in parts[:-1]:  # one wrap per leading "array"
         schema = {"type": "array", "items": schema}
+    if scalar_default and len(parts) == 2 and parts[0] == "array":
+        element = {key: value for key, value in leaf.items() if key != "default"}
+        schema = {"anyOf": [element, schema]}
     if param.get("friendly_name"):
         schema["title"] = param["friendly_name"]
     desc = (param.get("Description") or "").strip()
@@ -73,8 +85,17 @@ def _input_to_schema(input_str: str, param: dict) -> dict:
     return schema
 
 
-def build_config_component(param_defs: dict) -> dict:
+def _has_scalar_default(config_defaults: dict, key: str) -> bool:
+    """True when config_defaults.json ships a plain (non-null, non-list, non-object) value."""
+    value = config_defaults.get(key)
+    return value is not None and not isinstance(value, list | dict)
+
+
+def build_config_component(param_defs: dict, config_defaults: dict) -> dict:
     """Flatten param_definitions sections into a single OpenAPI object schema.
+
+    `config_defaults` (config_defaults.json) decides which array.* params also accept a
+    scalar: those whose shipped default is a scalar, see `_input_to_schema`.
 
     Raises if a param key appears in more than one section (don't silently overwrite).
     """
@@ -83,7 +104,9 @@ def build_config_component(param_defs: dict) -> dict:
         for key, param in params.items():
             if key in props:
                 raise SystemExit(f"generate_openapi: duplicate param key {key!r} across sections")
-            props[key] = _input_to_schema(param["input"], param)
+            props[key] = _input_to_schema(
+                param["input"], param, _has_scalar_default(config_defaults, key)
+            )
     return {"type": "object", "properties": props}
 
 
@@ -118,8 +141,10 @@ def assert_no_undocumented(routes: set, curated: dict, skip: set) -> None:
 
 _REPO = Path(__file__).resolve().parents[1]
 _PARAM_DEFS = _REPO / "src" / "emhass" / "static" / "data" / "param_definitions.json"
+_CONFIG_DEFAULTS = _REPO / "src" / "emhass" / "data" / "config_defaults.json"
 _LAST_RUN_SCHEMA = _REPO / "docs" / "api" / "v1" / "last-run.schema.json"
 _PLAN_SCHEMA = _REPO / "docs" / "api" / "v1" / "plan.schema.json"
+_DRY_RUN_SCHEMA = _REPO / "docs" / "api" / "v1" / "dry-run.schema.json"
 _HEALTHZ_SCHEMA = _REPO / "docs" / "api" / "healthz.schema.json"
 _OUT = _REPO / "src" / "emhass" / "static" / "openapi.json"
 
@@ -145,10 +170,12 @@ def build_spec(routes: set | None = None) -> dict:
     if routes is None:
         routes = discovered_routes()
     param_defs = json.loads(_PARAM_DEFS.read_text(encoding="utf-8"))
+    config_defaults = json.loads(_CONFIG_DEFAULTS.read_text(encoding="utf-8"))
     components = {
-        "Config": build_config_component(param_defs),
+        "Config": build_config_component(param_defs, config_defaults),
         "LastRun": _load_json(_LAST_RUN_SCHEMA),
         "Plan": _load_json(_PLAN_SCHEMA),
+        "DryRun": _load_json(_DRY_RUN_SCHEMA),
         "Healthz": _load_json(_HEALTHZ_SCHEMA),
     }
     config_ref = {"$ref": "#/components/schemas/Config"}
@@ -237,6 +264,56 @@ def build_spec(routes: set | None = None) -> dict:
                         "description": "Plan envelope",
                         **json_ct({"$ref": "#/components/schemas/Plan"}),
                     }
+                },
+            }
+        },
+        "/api/v1/dry-run/{action_name}": {
+            "post": {
+                "summary": "Solve an optimization and return the plan, writing nothing",
+                "description": (
+                    "Takes the body of POST /action/{action_name}. Solves as that action "
+                    "does, and writes no results file, entity, plan, last-run record, cache "
+                    "or model, publishes nothing, and calls no forecast service: it plans "
+                    "with the forecasts in the body or those live runs saved. An EMHASS "
+                    "without this route answers 404, so it never runs a live solve instead."
+                ),
+                "externalDocs": {
+                    "description": "Plan output field reference",
+                    "url": _PLAN_OUTPUT_DOC,
+                },
+                "parameters": [
+                    {
+                        "name": "action_name",
+                        "in": "path",
+                        "required": True,
+                        "schema": {
+                            "type": "string",
+                            "enum": ["perfect-optim", "dayahead-optim", "naive-mpc-optim"],
+                        },
+                    }
+                ],
+                "requestBody": json_ct({"type": "object", "additionalProperties": True}),
+                "responses": {
+                    "200": {
+                        "description": "The solver ran; status says how",
+                        **json_ct({"$ref": "#/components/schemas/DryRun"}),
+                    },
+                    "400": {
+                        "description": "Refused, or stopped before the solver",
+                        **json_ct({"$ref": "#/components/schemas/DryRun"}),
+                    },
+                    "413": {
+                        "description": "The body is over MAX_CONTENT_LENGTH (16 MB)",
+                        **json_ct({"$ref": "#/components/schemas/DryRun"}),
+                    },
+                    "429": {
+                        "description": "Another dry run is running; retry after Retry-After",
+                        **json_ct({"$ref": "#/components/schemas/DryRun"}),
+                    },
+                    "500": {
+                        "description": "The run failed",
+                        **json_ct({"$ref": "#/components/schemas/DryRun"}),
+                    },
                 },
             }
         },

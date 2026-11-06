@@ -7,8 +7,10 @@ import inspect
 import os
 import pathlib
 import pickle
+import re
 import tempfile
 import unittest
+import warnings
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiofiles
@@ -16,11 +18,11 @@ import aiohttp
 import numpy as np
 import orjson
 import pandas as pd
-from aioresponses import aioresponses
 
 from emhass import utils
 from emhass.retrieve_hass import RetrieveHass
 from emhass.utils import get_days_list, get_logger, get_yaml_parse
+from tests.aioresponses_compat import aioresponses
 
 # The root folder
 root = pathlib.Path(utils.get_root(__file__, num_parent=2))
@@ -39,6 +41,12 @@ logger, ch = get_logger(__name__, emhass_conf, save_to_file=False)
 
 class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        # build_secrets reads EMHASS_URL, SUPERVISOR_TOKEN and TIME_ZONE from the environment; a
+        # developer's own values must not reach these tests. The environment is restored after
+        # each test.
+        environ = self.enterContext(patch.dict(os.environ))
+        for name in ("EMHASS_URL", "SUPERVISOR_TOKEN", "TIME_ZONE"):
+            environ.pop(name, None)
         emhass_conf["data_path"] = root / "data/"
 
         self.get_data_from_file = True
@@ -171,6 +179,7 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         self.assertIn("hass_url", self.retrieve_hass_conf.keys())
         if self.get_data_from_file:
             self.assertEqual(self.retrieve_hass_conf["hass_url"], "https://myhass.duckdns.org/")
+            self.assertEqual(str(self.retrieve_hass_conf["time_zone"]), "Europe/Paris")
 
     # Check yaml parse worked
     async def test_yaml_parse_web_server(self):
@@ -191,11 +200,14 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
     async def test_get_data_failed(self):
         days_list = get_days_list(1)
         var_list = [self.retrieve_hass_conf["sensor_power_load_no_var_loads"]]
-        response = await self.rh.get_data(days_list, var_list)
-        if self.get_data_from_file:
-            self.assertFalse(response)
-        else:
-            self.assertTrue(response)
+        test_url = "http://mock.invalid/history"
+        with aioresponses() as mocked, self.assertLogs(logger, level="ERROR") as logs:
+            mocked.get(test_url, status=401, repeat=True)
+            response = await self.rh.get_data(days_list, var_list, test_url=test_url)
+        self.assertFalse(response)
+        # Only the HTTP 401 branch logs this; a connection error logs "Network error" instead
+        self.assertTrue(any("TOKEN/KEY is invalid or missing" in line for line in logs.output))
+        self.assertIn(("GET", test_url), [(m, str(u)) for m, u in mocked.requests])
 
     # Test with html mock response
     async def test_get_data_mock(self):
@@ -1079,10 +1091,12 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         )
 
     @staticmethod
-    def _vm_query_side_effect(entity_data, calls=None, keep_metric_name=True):
+    def _vm_query_side_effect(
+        entity_data, calls=None, keep_metric_name=True, entity_label="entity_id"
+    ):
         """Build a ``_vm_query_range`` side_effect emulating VictoriaMetrics.
 
-        :param entity_data: mapping of entity_id label -> list of series, each a tuple
+        :param entity_data: mapping of entity label value -> list of series, each a tuple
             ``(metric_name, [(bucket_start_iso, value), ...])``. Timestamps are given as
             the START of the bucket (the label EMHASS must produce); the fake server
             returns them the way VictoriaMetrics does, at the END of the
@@ -1091,12 +1105,14 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         :param calls: optional list collecting ``(query, start, end, step)`` per call.
         :param keep_metric_name: emulate MetricsQL (``__name__`` kept through
             ``avg_over_time``, the default) or a plain PromQL backend that drops it.
+        :param entity_label: label the selector locates the entity with (``entity_id``
+            for InfluxDB-integration data, ``entity`` for Prometheus-integration data).
         """
 
         async def query_side_effect(session, query, start_s, end_s, step_s):
             if calls is not None:
                 calls.append((query, start_s, end_s, step_s))
-            entity_id = query.split('entity_id="')[1].split('"')[0]
+            entity_id = query.split(f'{{{entity_label}="')[1].split('"')[0]
             result = []
             for metric_name, points in entity_data.get(entity_id, []):
                 values = []
@@ -1105,7 +1121,7 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
                     if start_s <= ts <= end_s:
                         values.append([ts, str(value)])
                 if values:
-                    metric = {"entity_id": entity_id, "domain": "sensor"}
+                    metric = {entity_label: entity_id, "domain": "sensor"}
                     if keep_metric_name:
                         metric["__name__"] = metric_name
                     result.append({"metric": metric, "values": values})
@@ -1126,11 +1142,35 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         # Quotes and backslashes in a value cannot break out of the matcher
         self.assertIn('entity_id="a\\"b\\\\c"', rh._vm_selector('sensor.a"b\\c'))
 
+    def test_vm_selector_entity_label(self):
+        """With an entity label the full entity id is matched on that label alone."""
+        rh = self._make_vm_rh(
+            victoriametrics_database="",
+            victoriametrics_metric_regex="homeassistant_sensor_.+",
+            victoriametrics_entity_label=" entity ",
+        )
+        self.assertEqual(
+            rh._vm_selector("sensor.power_a"),
+            '{entity="sensor.power_a",__name__=~"homeassistant_sensor_.+"}',
+        )
+        self.assertIn('entity="sensor.a\\"b\\\\c"', rh._vm_selector('sensor.a"b\\c'))
+        # The database filter still applies when configured
+        rh = self._make_vm_rh(victoriametrics_entity_label="entity")
+        self.assertTrue(rh._vm_selector("sensor.power_a").endswith(',db="homeassistant"}'))
+        # A label name cannot be quoted, so an invalid one is refused with an error and
+        # the entity_id/domain matching is used instead
+        with self.assertLogs(logger, level="ERROR") as logs:
+            rh = self._make_vm_rh(victoriametrics_entity_label='entity="x"} or vector(1) #')
+        self.assertIn("Invalid victoriametrics_entity_label", logs.output[0])
+        self.assertTrue(rh._vm_selector("sensor.power_a").startswith('{entity_id="power_a",'))
+
     def test_vm_connection_settings(self):
         """Host/port/ssl/auth settings map onto the HTTP client arguments."""
         rh = self._make_vm_rh()
         self.assertEqual(rh._vm_base_url(), "http://fake-vm:8428")
-        self.assertEqual(rh._vm_auth().login, "fake-user")
+        self.assertEqual(
+            rh._vm_auth_headers(), {"Authorization": "Basic ZmFrZS11c2VyOmZha2UtcGFzcw=="}
+        )
         self.assertIsNone(rh._vm_ssl())
         rh = self._make_vm_rh(
             victoriametrics_username="",
@@ -1138,8 +1178,131 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
             victoriametrics_verify_ssl=False,
         )
         self.assertEqual(rh._vm_base_url(), "https://fake-vm:8428")
-        self.assertIsNone(rh._vm_auth())
+        self.assertEqual(rh._vm_auth_headers(), {})
         self.assertIs(rh._vm_ssl(), False)
+
+    @staticmethod
+    def _vm_mock_session(
+        status=200, body=b'{"status": "success", "data": {"result": []}}', exc=None
+    ):
+        """Mock aiohttp session whose ``get`` records its call and yields a canned response."""
+        response = MagicMock()
+        response.status = status
+        response.read = AsyncMock(return_value=body)
+        context = MagicMock()
+        if exc is None:
+            context.__aenter__ = AsyncMock(return_value=response)
+        else:
+            context.__aenter__ = AsyncMock(side_effect=exc)
+        context.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.get = MagicMock(return_value=context)
+        return session
+
+    async def _vm_request(self, rh, session):
+        return await rh._vm_query_range(session, "up", 0, 60, 60)
+
+    async def test_vm_query_range_authorization_header(self):
+        """Credentials are sent as an explicit Authorization header (latin-1, as BasicAuth did)."""
+        cases = [
+            ({}, "Basic ZmFrZS11c2VyOmZha2UtcGFzcw=="),
+            (
+                {"victoriametrics_username": "usér", "victoriametrics_password": "pässwörd"},
+                "Basic dXPpcjpw5HNzd/ZyZA==",
+            ),
+            ({"victoriametrics_password": ""}, "Basic ZmFrZS11c2VyOg=="),
+            ({"victoriametrics_password": None}, "Basic ZmFrZS11c2VyOg=="),
+            (
+                {"victoriametrics_username": "u", "victoriametrics_password": "p:w"},
+                "Basic dTpwOnc=",
+            ),
+        ]
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                rh = self._make_vm_rh(**overrides)
+                session = self._vm_mock_session()
+                self.assertEqual(await self._vm_request(rh, session), [])
+                session.get.assert_called_once()
+                kwargs = session.get.call_args.kwargs
+                self.assertEqual(kwargs["headers"], {"Authorization": expected})
+                self.assertNotIn("auth", kwargs)
+                self.assertEqual(
+                    kwargs["params"], {"query": "up", "start": 0, "end": 60, "step": 60}
+                )
+                self.assertEqual(
+                    session.get.call_args.args, ("http://fake-vm:8428/api/v1/query_range",)
+                )
+                self.assertIsNone(kwargs["ssl"])
+
+    async def test_vm_query_range_no_username_sends_no_authorization(self):
+        """Without a username no Authorization header is sent, even if a password is set."""
+        for username in ("", None):
+            with self.subTest(username=username):
+                rh = self._make_vm_rh(victoriametrics_username=username)
+                session = self._vm_mock_session()
+                self.assertEqual(await self._vm_request(rh, session), [])
+                kwargs = session.get.call_args.kwargs
+                self.assertEqual(kwargs["headers"], {})
+                self.assertNotIn("auth", kwargs)
+
+    async def test_vm_query_range_no_deprecation_warning(self):
+        """Neither authenticated nor unauthenticated requests warn (warnings as errors)."""
+        for overrides in ({}, {"victoriametrics_username": ""}):
+            with self.subTest(overrides=overrides):
+                rh = self._make_vm_rh(**overrides)
+                session = self._vm_mock_session()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    self.assertEqual(await self._vm_request(rh, session), [])
+
+    async def test_vm_query_range_errors_are_non_fatal_and_logged(self):
+        """401, HTTP errors, network failures and invalid JSON return None and are logged."""
+        cases = [
+            ({"status": 401}, "401 Unauthorized"),
+            ({"status": 500, "body": b"boom"}, "query_range error 500"),
+            ({"exc": aiohttp.ClientConnectionError("down")}, "Network error connecting"),
+            ({"body": b"not json"}, "Invalid JSON from VictoriaMetrics"),
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(expected=expected):
+                rh = self._make_vm_rh()
+                session = self._vm_mock_session(**kwargs)
+                with self.assertLogs(logger, level="ERROR") as logs:
+                    self.assertIsNone(await self._vm_request(rh, session))
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn(expected, logs.output[0])
+                self.assertEqual(
+                    session.get.call_args.kwargs["headers"],
+                    {"Authorization": "Basic ZmFrZS11c2VyOmZha2UtcGFzcw=="},
+                )
+                self.assertNotIn("ZmFrZS11c2VyOmZha2UtcGFzcw", logs.output[0])
+                self.assertNotIn("fake-pass", logs.output[0])
+
+    async def test_vm_query_range_invalid_credentials_are_non_fatal_and_not_leaked(self):
+        """A colon in the username or an unencodable character fails softly, without leaks."""
+        secret_user = "sec:retuser"  # pragma: allowlist secret
+        cases = [
+            {"victoriametrics_username": secret_user, "victoriametrics_password": "hunter2"},
+            {"victoriametrics_username": "sec€user", "victoriametrics_password": "hunter2"},
+            {"victoriametrics_username": "secuser", "victoriametrics_password": "hunt€r2"},
+        ]
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                rh = self._make_vm_rh(**overrides)
+                session = self._vm_mock_session()
+                with self.assertLogs(logger, level="ERROR") as logs:
+                    self.assertIsNone(await self._vm_request(rh, session))
+                session.get.assert_not_called()
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn("Invalid VictoriaMetrics credentials", logs.output[0])
+                with self.assertRaises(ValueError) as ctx:
+                    rh._vm_auth_headers()
+                self.assertTrue(
+                    ctx.exception.__context__ is None or ctx.exception.__suppress_context__
+                )
+                for text in (logs.output[0], str(ctx.exception)):
+                    for leaked in ("sec", "hunt", "retuser", "u20ac", "€"):
+                        self.assertNotIn(leaked, text)
 
     async def test_get_data_victoriametrics_mock(self):
         """get_data routes to VictoriaMetrics and yields the InfluxDB-shaped frame."""
@@ -1167,12 +1330,17 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
 
         df = rh.df_final
         self.assertEqual(list(df.columns), var_list)
-        self.assertEqual(len(df), 2)
+        # The grid is held (FILL previous) from the first sample through the last bucket
+        # strictly before end_time (2023-04-02T00:00:00Z), i.e. 10:00 .. 23:30 at 30min.
+        self.assertEqual(len(df), 28)
         self.assertEqual(df.index.freq, pd.Timedelta("30min"))
         self.assertEqual(str(df.index.tz), "UTC")
         # Buckets are labelled by their start, like InfluxDB GROUP BY time()
         self.assertAlmostEqual(df.loc["2023-04-01 10:00:00+00:00"][var_list[0]], 1500.0)
         self.assertAlmostEqual(df.loc["2023-04-01 10:30:00+00:00"][var_list[1]], 450.0)
+        # The terminal state (last known sample) is held through the last eligible bucket
+        self.assertAlmostEqual(df.loc["2023-04-01 23:30:00+00:00"][var_list[0]], 1800.0)
+        self.assertAlmostEqual(df.loc["2023-04-01 23:30:00+00:00"][var_list[1]], 450.0)
         self.assertEqual(rh.var_list, var_list)
         # One query_range call per sensor, on a step-aligned grid at the optimization step
         self.assertEqual(len(calls), 2)
@@ -1183,6 +1351,47 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(end_s, int(pd.Timestamp("2023-04-02T00:00:00Z").timestamp()))
         self.assertTrue(query.startswith("avg_over_time({entity_id="))
         self.assertTrue(query.endswith("}[1800s])"))
+
+    async def test_get_data_victoriametrics_entity_label(self):
+        """Prometheus-integration series are read through the entity label, and series
+        split by a label change (same metric name) are joined into one history."""
+        rh = self._make_vm_rh(
+            victoriametrics_database="",
+            victoriametrics_metric_regex="homeassistant_sensor_.+",
+            victoriametrics_entity_label="entity",
+        )
+        calls = []
+        side_effect = self._vm_query_side_effect(
+            {
+                "sensor.power_photovoltaics": [
+                    (
+                        "homeassistant_sensor_power_w",
+                        [("2023-04-01T10:00:00Z", 1500.0), ("2023-04-01T10:30:00Z", 1800.0)],
+                    )
+                ],
+                "sensor.power_load_no_var_loads": [
+                    ("homeassistant_sensor_power_w", [("2023-04-01T10:00:00Z", 500.0)]),
+                    ("homeassistant_sensor_power_w", [("2023-04-01T10:30:00Z", 450.0)]),
+                ],
+            },
+            calls,
+            entity_label="entity",
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        var_list = ["sensor.power_photovoltaics", "sensor.power_load_no_var_loads"]
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            self.assertTrue(await rh.get_data(days_list, var_list))
+        df = rh.df_final
+        self.assertEqual(list(df.columns), var_list)
+        self.assertEqual(len(df), 28)
+        self.assertAlmostEqual(df.loc["2023-04-01 10:00:00+00:00"][var_list[0]], 1500.0)
+        self.assertAlmostEqual(df.loc["2023-04-01 10:00:00+00:00"][var_list[1]], 500.0)
+        self.assertAlmostEqual(df.loc["2023-04-01 10:30:00+00:00"][var_list[1]], 450.0)
+        self.assertAlmostEqual(df.loc["2023-04-01 23:30:00+00:00"][var_list[1]], 450.0)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(
+            calls[0][0].startswith('avg_over_time({entity="sensor.power_photovoltaics",')
+        )
 
     async def test_get_data_victoriametrics_fill_previous(self):
         """Empty buckets are forward-filled like InfluxDB FILL(previous)."""
@@ -1201,8 +1410,12 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         with patch.object(rh, "_vm_query_range", side_effect=side_effect):
             self.assertTrue(await rh.get_data(days_list, ["sensor.price"]))
         df = rh.df_final
-        self.assertEqual(len(df), 4)
-        self.assertEqual(df["sensor.price"].tolist(), [0.2, 0.2, 0.2, 0.3])
+        # Internal gap (10:00 -> 11:30) uses the previous value; the terminal state (0.3)
+        # is then held through the last bucket strictly before end_time (23:30).
+        self.assertEqual(len(df), 28)
+        self.assertEqual(df["sensor.price"].tolist()[:4], [0.2, 0.2, 0.2, 0.3])
+        self.assertEqual(df["sensor.price"].tolist()[4:], [0.3] * 24)
+        self.assertEqual(df.index.max(), pd.Timestamp("2023-04-01 23:30:00+00:00"))
 
     async def test_get_data_victoriametrics_multiple_metrics(self):
         """When a sensor changed unit the metric with the most samples is kept."""
@@ -1224,7 +1437,9 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
             self.assertLogs(logger, level="WARNING") as logs,
         ):
             self.assertTrue(await rh.get_data(days_list, ["sensor.power_a"]))
-        self.assertEqual(rh.df_final["sensor.power_a"].tolist(), [1000.0, 1200.0])
+        values = rh.df_final["sensor.power_a"].tolist()
+        self.assertEqual(values[:2], [1000.0, 1200.0])
+        self.assertEqual(values[2:], [1200.0] * 26)
         self.assertTrue(any("several VictoriaMetrics metrics" in line for line in logs.output))
 
     async def test_get_data_victoriametrics_metric_name_dropped(self):
@@ -1252,8 +1467,10 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
             self.assertLogs(logger, level="WARNING") as logs,
         ):
             self.assertTrue(await rh.get_data(days_list, ["sensor.power_a"]))
-        self.assertEqual(len(rh.df_final), 2)
-        self.assertEqual(rh.df_final["sensor.power_a"].tolist(), [1.0, 1200.0])
+        values = rh.df_final["sensor.power_a"].tolist()
+        self.assertEqual(len(rh.df_final), 28)
+        self.assertEqual(values[:2], [1.0, 1200.0])
+        self.assertEqual(values[2:], [1200.0] * 26)
         self.assertTrue(any("duplicate timestamps" in line for line in logs.output))
         self.assertFalse(any("several VictoriaMetrics metrics" in line for line in logs.output))
 
@@ -1352,6 +1569,207 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(s_next, e_prev + step)
         self.assertEqual(calls[0][1], int(start.tz_localize("UTC").timestamp()) + step)
         self.assertEqual(calls[-1][2], int(end.tz_localize("UTC").timestamp()))
+
+    # Regression coverage for the VictoriaMetrics terminal FILL(previous) tail defect:
+    # the reindex used to stop at the last SAMPLE timestamp instead of the last ELIGIBLE
+    # bucket before end_time, silently dropping trailing held-state buckets as NaN.
+
+    async def test_vm_fill_previous_no_backward_fill_before_first_sample(self):
+        """Leading buckets before the first known state stay NaN (no backward fill)."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {"sensor_a": [("W_value", [("2023-04-01T02:00:00Z", 10.0)])]}
+        )
+        start = pd.Timestamp("2023-04-01T00:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:00:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.sensor_a", start, end)
+        # No buckets at all before the first sample (00:00, 00:30, 01:00, 01:30 absent)
+        self.assertEqual(df.index.min(), pd.Timestamp("2023-04-01 02:00:00+00:00"))
+        self.assertNotIn(pd.Timestamp("2023-04-01 00:00:00+00:00"), df.index)
+        self.assertNotIn(pd.Timestamp("2023-04-01 01:30:00+00:00"), df.index)
+
+    async def test_vm_fill_previous_terminal_state_extends_to_query_end(self):
+        """A sparse state last written before end_time is held through every eligible
+        bucket strictly before end_time (half-open interval [start_time, end_time))."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {"sensor_a": [("W_value", [("2023-04-01T02:00:00Z", 10.0)])]}
+        )
+        start = pd.Timestamp("2023-04-01T02:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:00:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.sensor_a", start, end)
+        # Last eligible bucket is end_time - step = 03:30; no bucket at or beyond end_time
+        self.assertEqual(df.index.max(), pd.Timestamp("2023-04-01 03:30:00+00:00"))
+        self.assertNotIn(pd.Timestamp("2023-04-01 04:00:00+00:00"), df.index)
+        self.assertEqual(df["sensor.sensor_a"].tolist(), [10.0] * len(df))
+
+    async def test_vm_fill_previous_non_aligned_end_time_uses_last_complete_bucket(self):
+        """An off-grid end_time includes only complete buckets wholly inside [start, end)."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {"sensor_a": [("W_value", [("2023-04-01T02:00:00Z", 10.0)])]}
+        )
+        start = pd.Timestamp("2023-04-01T02:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:10:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.sensor_a", start, end)
+
+        # With 30-minute buckets, 03:30 labels the final complete bucket (03:30, 04:00].
+        # The next bucket would end at 04:30 and therefore lies outside [start, 04:10).
+        self.assertEqual(df.index.max(), pd.Timestamp("2023-04-01 03:30:00+00:00"))
+        self.assertNotIn(pd.Timestamp("2023-04-01 04:00:00+00:00"), df.index)
+        self.assertTrue((df.index < end).all())
+        self.assertEqual(df["sensor.sensor_a"].tolist(), [10.0] * len(df))
+
+    async def test_vm_fill_previous_terminal_constrained_positive_state_held(self):
+        """A terminal bounded/limited positive state (e.g. a ceiling register) remains at
+        its held value through end_time, not just at the sample timestamp."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {
+                "limit_register": [
+                    (
+                        "W_value",
+                        [
+                            ("2023-04-01T02:00:00Z", 0.0),
+                            ("2023-04-01T02:30:00Z", 4000.0),  # becomes constrained/binding
+                        ],
+                    )
+                ]
+            }
+        )
+        start = pd.Timestamp("2023-04-01T02:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:00:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.limit_register", start, end)
+        self.assertEqual(df.index.max(), pd.Timestamp("2023-04-01 03:30:00+00:00"))
+        # The binding positive value is held through every trailing bucket, not lost to NaN
+        self.assertEqual(df["sensor.limit_register"].tolist(), [0.0, 4000.0, 4000.0, 4000.0])
+        self.assertFalse(df["sensor.limit_register"].isna().any())
+
+    async def test_vm_fill_previous_terminal_zero_state_held(self):
+        """A terminal non-binding zero state is correctly held at zero through end_time
+        (not merely coincidentally zero because of a NaN->fillna(0.0) downstream bug)."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {
+                "limit_register": [
+                    (
+                        "W_value",
+                        [
+                            ("2023-04-01T02:00:00Z", 4000.0),
+                            ("2023-04-01T02:30:00Z", 0.0),  # constraint released
+                        ],
+                    )
+                ]
+            }
+        )
+        start = pd.Timestamp("2023-04-01T02:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:00:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.limit_register", start, end)
+        self.assertEqual(df.index.max(), pd.Timestamp("2023-04-01 03:30:00+00:00"))
+        self.assertEqual(df["sensor.limit_register"].tolist(), [4000.0, 0.0, 0.0, 0.0])
+        self.assertFalse(df["sensor.limit_register"].isna().any())
+
+    async def test_vm_fill_previous_transition_at_end_time_excluded(self):
+        """A state transition occurring exactly at end_time must not create a bucket at or
+        beyond end_time, and must not leak backward into earlier buckets."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {
+                "sensor_a": [
+                    (
+                        "W_value",
+                        [
+                            ("2023-04-01T02:00:00Z", 10.0),
+                            ("2023-04-01T04:00:00Z", 99.0),  # exactly at end_time
+                        ],
+                    )
+                ]
+            }
+        )
+        start = pd.Timestamp("2023-04-01T02:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:00:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.sensor_a", start, end)
+        self.assertNotIn(pd.Timestamp("2023-04-01 04:00:00+00:00"), df.index)
+        self.assertEqual(df.index.max(), pd.Timestamp("2023-04-01 03:30:00+00:00"))
+        # The later (end_time) value never leaks backward into earlier held buckets
+        self.assertTrue((df["sensor.sensor_a"] == 10.0).all())
+
+    async def test_vm_fill_previous_terminal_fill_across_chunk_boundary(self):
+        """The terminal fill is correct even when the window spans several VM query
+        chunks (the last sample lands in an earlier chunk than the final bucket)."""
+        rh = self._make_vm_rh()
+        rh.freq = pd.Timedelta("15min")
+        from emhass.retrieve_hass import VM_MAX_POINTS_PER_REQUEST
+
+        step = 900
+        chunk_span_steps = VM_MAX_POINTS_PER_REQUEST
+        # Last sample lands in the first chunk; the window extends ~1.5 chunks further so
+        # the terminal fill must be carried through a chunk boundary with no new data.
+        start = pd.Timestamp("2025-01-01T00:00:00Z")
+        last_sample = start + pd.Timedelta(minutes=15)
+        end = start + pd.Timedelta(seconds=int(chunk_span_steps * step * 1.5))
+        calls = []
+        side_effect = self._vm_query_side_effect(
+            {"sensor_a": [("W_value", [(last_sample.isoformat(), 7.0)])]}, calls
+        )
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.sensor_a", start, end)
+        self.assertGreaterEqual(len(calls), 2)  # confirms chunking actually occurred
+        expected_last_bucket = end - rh.freq
+        self.assertEqual(df.index.max(), expected_last_bucket)
+        self.assertTrue((df["sensor.sensor_a"] == 7.0).all())
+        self.assertFalse(df["sensor.sensor_a"].isna().any())
+
+    async def test_vm_fill_previous_dense_sensor_unchanged(self):
+        """A dense sensor (a sample at every bucket already) is value-for-value unchanged
+        by the terminal-fill fix: the reindex extension is a no-op when there is no gap."""
+        rh = self._make_vm_rh()
+        points = [
+            (f"2023-04-01T{hour:02d}:{minute:02d}:00Z", float(hour * 2 + minute / 30))
+            for hour in range(2, 4)
+            for minute in (0, 30)
+        ]
+        side_effect = self._vm_query_side_effect({"dense_sensor": [("W_value", points)]})
+        start = pd.Timestamp("2023-04-01T02:00:00Z")
+        end = pd.Timestamp("2023-04-01T04:00:00Z")
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            async with aiohttp.ClientSession() as session:
+                df = await rh._fetch_sensor_data_vm(session, "sensor.dense_sensor", start, end)
+        expected = [float(h * 2 + m / 30) for h, m in [(2, 0), (2, 30), (3, 0), (3, 30)]]
+        self.assertEqual(df["sensor.dense_sensor"].tolist(), expected)
+        self.assertFalse(df["sensor.dense_sensor"].isna().any())
+
+    async def test_get_data_victoriametrics_expression_terminal_fill(self):
+        """End-to-end: an arithmetic expression built over VM-retrieved entities receives
+        the corrected terminal-filled series, not a truncated-then-NaN tail."""
+        rh = self._make_vm_rh()
+        side_effect = self._vm_query_side_effect(
+            {
+                "power_a": [("W_value", [("2023-04-01T10:00:00Z", 1500.0)])],
+                "power_b": [("kW_value", [("2023-04-01T10:00:00Z", 0.5)])],
+            }
+        )
+        days_list = pd.date_range(start="2023-04-01", periods=1, freq="D", tz="UTC")
+        expression = "{{'sensor.power_a' - 'sensor.power_b' * 1000}}"
+        with patch.object(rh, "_vm_query_range", side_effect=side_effect):
+            self.assertTrue(await rh.get_data(days_list, [expression]))
+        df = rh.df_final
+        # Held through the last bucket of the day (23:30), not just at the 10:00 sample
+        self.assertFalse(df[expression].isna().any())
+        self.assertAlmostEqual(df.loc["2023-04-01 23:30:00+00:00"][expression], 1000.0)
 
     # Test publish data
     async def test_publish_data(self):
@@ -1853,6 +2271,11 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
     @patch("aiofiles.open")
     async def test_post_data_extended(self, mock_aio_open):
         self.rh.get_data_from_file = False
+        # Every POST goes to a controlled response: four successes, then one 503 below
+        mocked = self.enterContext(aioresponses())
+        states_url = re.compile(r".*/states/.*")
+        for _ in range(4):
+            mocked.post(states_url, status=200)
 
         # Setup mock file context for save_entities=True
         mock_f = AsyncMock()
@@ -1871,6 +2294,7 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
             data_df, idx, entity_id, "monetary", "EUR", "Cost Function", "cost_fun"
         )
         self.assertEqual(data["state"], f"{data_df.sum():.2f}")
+        self.assertTrue(response.ok)
 
         # Test "optim_status" type
         status_df = pd.Series(["Optimal"], index=[0])
@@ -1878,12 +2302,14 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
             status_df, 0, "sensor.optim_status", "none", "", "Status", "optim_status"
         )
         self.assertEqual(data["state"], "Optimal")
+        self.assertTrue(response.ok)
 
         # Test "deferrable" type (complex attributes)
         response, data = await self.rh.post_data(
             data_df, idx, entity_id, "power", "W", "Deferrable", "deferrable"
         )
         self.assertIn("deferrables_schedule", data["attributes"])
+        self.assertTrue(response.ok)
 
         # Test "unit_load_cost" (4 decimals)
         response, data = await self.rh.post_data(
@@ -1891,6 +2317,7 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(data["state"], f"{data_df.iloc[0]:.4f}")
         self.assertIn("unit_load_cost_forecasts", data["attributes"])
+        self.assertTrue(response.ok)
 
         # Test save_entities=True
         # Save old path to restore later
@@ -1937,23 +2364,21 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(mock_f.write.called)
         self.assertGreaterEqual(mock_f.write.call_count, 2)
 
-        # Test Error Handling (response_ok = False)
-        # We need to un-patch the aioresponses or create a new specific patch for client session
-        with patch("aiohttp.ClientSession.post") as mock_post:
-            mock_resp = AsyncMock()
-            mock_resp.ok = False
-            mock_resp.status = 500
-            mock_resp.__aenter__.return_value = mock_resp
-            mock_post.return_value = mock_resp
+        # Test Error Handling (response_ok = False): the next POST gets a 503. post_data reports
+        # 500 for any transport exception, so a 503 can only come from the mocked response.
+        mocked.post(states_url, status=503)
+        # Use dont_post=False to force the POST (get_data_from_file is False, set at start)
+        response, _ = await self.rh.post_data(
+            data_df, idx, entity_id, "power", "W", "Fail", "power", dont_post=False
+        )
 
-            # Use dont_post=False to force network attempt
-            # Ensure get_data_from_file is False (set at start of test)
-            response, _ = await self.rh.post_data(
-                data_df, idx, entity_id, "power", "W", "Fail", "power", dont_post=False
-            )
-
-            self.assertFalse(response.ok)
-            self.assertEqual(response.status_code, 500)
+        self.assertFalse(response.ok)
+        self.assertEqual(response.status_code, 503)
+        # The four successful posts and the failing one all reached the mocked endpoint
+        posts = sum(
+            len(calls) for (method, _), calls in mocked.requests.items() if method == "POST"
+        )
+        self.assertEqual(posts, 5)
 
     async def test_concurrent_save_entities_metadata_integrity(self):
         """Concurrent publishes that share entities/metadata.json must not

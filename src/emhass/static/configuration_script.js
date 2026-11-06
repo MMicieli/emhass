@@ -64,14 +64,24 @@ const DEFERRABLE_ARRAY_PARAMS = [
   "end_timesteps_of_each_deferrable_load",
 ];
 
+//a request still pending after this long fails with an error instead of leaving the page waiting
+//(browsers without AbortSignal.timeout keep waiting, as before)
+const REQUEST_TIMEOUT_MS = 30000;
+
 //on page reload
 window.onload = async function () {
   ///fetch configuration parameters from definitions json file
   let param_definitions = await getParamDefinitions();
   //obtain configuration from emhass (pull)
-  let config = await obtainConfig();
+  let config = param_definitions && (await obtainConfig());
   //obtain configuration_list.html html as a template to dynamically to render parameters in a list view (parameters as input items)
-  let list_html = await getListHTML();
+  let list_html = config && (await getListHTML());
+  //fail closed: a failed load is not an empty configuration. Render no form, allow no save, say how to recover
+  if (!list_html) {
+    document.getElementById("save").disabled = true;
+    document.getElementById("alert-text").textContent += "\r\n\u2022 Reload the page to try again.";
+    return;
+  }
   //load list parameter page (default)
   loadConfigurationListView(param_definitions, config, list_html);
 
@@ -101,65 +111,99 @@ window.onload = async function () {
 };
 
 //obtain file containing information about parameters (definitions)
+//returns null when the definitions could not be obtained
 async function getParamDefinitions() {
-  const response = await fetch(`static/data/param_definitions.json`);
-  if (response.status !== 200 && response.status !== 201) {
+  try {
+    const response = await fetch(`static/data/param_definitions.json`, {
+      cache: "no-cache", //revalidate: the definitions change with the release
+      signal: AbortSignal.timeout?.(REQUEST_TIMEOUT_MS),
+    });
+    if (response.status !== 200 && response.status !== 201) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return await response.json();
+  } catch (error) {
     //alert error in alert box
-    errorAlert("Unable to obtain definitions file");
-    return {};
+    errorAlert(`Unable to obtain definitions file: ${error.message}`);
+    return null;
   }
-  const param_definitions = await response.json();
-  return await param_definitions;
+}
+
+//request a configuration from emhass: the saved one or the defaults
+//returns null when it could not be obtained (never an empty config)
+async function fetchConfig(url, what) {
+  config = {};
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      signal: AbortSignal.timeout?.(REQUEST_TIMEOUT_MS),
+    });
+    let response_status = response.status; //return status
+    //if request failed
+    if (response_status !== 200 && response_status !== 201) {
+      showChangeStatus(response_status, await readErrorLog(response));
+      return null;
+    }
+    //else extract json rom data
+    let blob = await response.blob(); //get data blob
+    config = await new Response(blob).json(); //obtain json from blob
+    //an empty object would render the parameter defaults as if they were the saved settings
+    if (config === null || typeof config !== "object" || Array.isArray(config) || Object.keys(config).length === 0) {
+      throw new Error("the response is not a non-empty configuration object");
+    }
+    showChangeStatus(response_status, {});
+    return config;
+  } catch (error) {
+    showChangeStatus(0, [`Unable to obtain ${what}: ${error.message}`]);
+    return null;
+  }
 }
 
 //obtain emhass config (from saved params extracted/simplified into the config format)
 async function obtainConfig() {
-  config = {};
-  const response = await fetch(`get-config`, {
-    method: "GET",
-  });
-  let  response_status = response.status; //return status
-  //if request failed
-  if (response_status !== 200 && response_status !== 201) {
-    showChangeStatus(response_status, await response.json());
-    return {};
-  }
-  //else extract json rom data
-  let blob = await response.blob(); //get data blob
-  config = await new Response(blob).json(); //obtain json from blob
-  showChangeStatus(response_status, {});
-  return config;
+  return fetchConfig(`get-config`, "the configuration");
 }
 
 //obtain emhass default config (to present the default parameters in view)
 async function ObtainDefaultConfig() {
-  config = {};
-  const response = await fetch(`get-config/defaults`, {
-    method: "GET",
-  });
-  //if request failed
-  let response_status = response.status; //return status
-  if (response_status !== 200 && response_status !== 201) {
-    showChangeStatus(response_status, await response.json());
-    return {};
+  return fetchConfig(`get-config/defaults`, "the default configuration");
+}
+
+//error messages of a failed response: the JSON list sent by emhass, else the HTTP status
+async function readErrorLog(response) {
+  try {
+    const log = await response.json();
+    if (Array.isArray(log) && log.length) {
+      return log;
+    }
+  } catch (error) {
+    //not JSON (e.g. a proxy error page)
   }
-  //else extract json rom data
-  let blob = await response.blob(); //get data blob
-  config = await new Response(blob).json(); //obtain json from blob
-  showChangeStatus(response_status, {});
-  return config;
+  return [`HTTP ${response.status}`];
 }
 
 //get html data from configuration_list.html (list template)
+//returns null when the template could not be obtained
 async function getListHTML() {
-  const response = await fetch(`static/configuration_list.html`);
-  if (response.status !== 200 && response.status !== 201) {
-    errorAlert("Unable to obtain configuration_list.html file");
-    return {};
+  try {
+    const response = await fetch(`static/configuration_list.html`, {
+      cache: "no-cache", //revalidate: the template changes with the release
+      signal: AbortSignal.timeout?.(REQUEST_TIMEOUT_MS),
+    });
+    if (response.status !== 200 && response.status !== 201) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    let blob = await response.blob(); //get data blob
+    const html = await new Response(blob).text(); //obtain html from blob
+    //an empty template cannot render a form: report it instead of failing closed without a message
+    if (!html.trim()) {
+      throw new Error("the file is empty");
+    }
+    return html;
+  } catch (error) {
+    errorAlert(`Unable to obtain configuration_list.html file: ${error.message}`);
+    return null;
   }
-  let blob = await response.blob(); //get data blob
-  let htmlTemplateData = await new Response(blob).text(); //obtain html from blob
-  return htmlTemplateData;
 }
 
 //load list configuration view
@@ -348,7 +392,10 @@ function buildParamContainers(
     let array_buttons = "";
     if (
       parameter_definition_object["input"].search("array.") > -1 &&
-      parameter_definition_name !== "battery_charge_power_derating" &&
+      !(
+        parameter_definition_object["input"] === "array.array.float" &&
+        Array.isArray(parameter_definition_object["default_value"])
+      ) &&
       !(section == "Deferrable Loads" && DEFERRABLE_ARRAY_PARAMS.includes(parameter_definition_name)) &&
       !(section == "Battery" && BATTERY_ARRAY_PARAMS.includes(parameter_definition_name))
     ) {
@@ -469,6 +516,17 @@ function buildParamContainers(
   }
 }
 
+//HTML-encode a configuration-derived value for use inside a double-quoted
+//attribute or as element text, so it is always parsed as data (#1290).
+//String() keeps the textual form template interpolation produced before.
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
 //create html input element/s for a param container (called by buildParamContainers)
 function buildParamElement(
   parameter_definition_object,
@@ -542,14 +600,37 @@ function buildParamElement(
   //check if a param value is saved in the config file (if so overwrite definition default)
   let value = checkConfigParam(placeholder, config, parameter_definition_name);
 
-  // Battery tables use one JSON field. Other nested-array parameters can allow
-  // null entries and follow their existing per-load rendering and save paths.
-  if (parameter_definition_name === "battery_charge_power_derating" &&
-      parameter_definition_object["input"] === "array.array.float") {
+  // A static numeric table (array.array.float with a list default, e.g. the
+  // battery charge derating or the inverter power curves) uses one JSON field.
+  // Per-load nested arrays declare a null default, may hold null entries and
+  // keep their own per-load rendering and save paths.
+  if (parameter_definition_object["input"] === "array.array.float" &&
+      Array.isArray(parameter_definition_object["default_value"])) {
     const json = typeof value === "string" ? value : JSON.stringify(value ?? []);
     const escaped = json.replaceAll('&', '&amp;').replaceAll('<', '&lt;')
       .replaceAll('>', '&gt;').replaceAll('"', '&quot;');
     return `<input class="param_input" type="text" placeholder="[]" value="${escaped}">`;
+  }
+  // Object parameters (nested JSON such as heat_topology) get a multi-line
+  // textarea: a one-line <input> is unusable for large nested structures.
+  // Absent config, JSON null and the legacy string "null" all render as an
+  // empty box. Content is entity-escaped; the browser decodes it back, so the
+  // value round-trips through saveConfiguration's JSON.parse unchanged.
+  if (parameter_definition_object["input"] === "object") {
+    let json_text = "";
+    if (value !== null && value !== undefined && value !== "" && value !== "null") {
+      json_text = typeof value === "object" ? JSON.stringify(value, null, 2) : String(value);
+    }
+    json_text = json_text
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+    const placeholder_attr = String(placeholder ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+    return `<textarea class="param_input param-json" rows="10" spellcheck="false" placeholder="${placeholder_attr}">${json_text}</textarea>`;
   }
 
   //generate and return param input html,
@@ -562,7 +643,9 @@ function buildParamElement(
         let selected = ""
         //if item in select is the same as the config value, then append "selected" tag
         if (options==value) {selected = `selected="selected"`}
-        inputs += `<option ${selected}>${options}</option>`;
+        //explicit value: without it the browser derives the value from the option text,
+        //stripping and collapsing whitespace, so saveConfiguration would read it altered
+        inputs += `<option ${selected} value="${escapeHtml(options)}">${escapeHtml(options)}</option>`;
       }
       inputs += `</select>`;
       return inputs;
@@ -576,7 +659,7 @@ function buildParamElement(
       let checked_attr = type === "checkbox" && value === true ? "checked" : "";
       return `
           ${type_specific_html}
-          <input class="param_input" type="${type}" placeholder=${parameter_definition_object["default_value"]} value=${value} ${checked_attr}>
+          <input class="param_input" type="${type}" placeholder="${escapeHtml(parameter_definition_object["default_value"])}" value="${escapeHtml(value)}" ${checked_attr}>
           ${type_specific_html_end}
           `;
     }
@@ -587,22 +670,18 @@ function buildParamElement(
     if (value === null) {
       return `
           ${type_specific_html}
-          <input class="param_input" type="${type}" placeholder="${placeholder}" value="">
+          <input class="param_input" type="${type}" placeholder="${escapeHtml(placeholder)}" value="">
           ${type_specific_html_end}
           `;
-    }
-    // The nested-object path below is designed only for load_peak_hour_periods.
-    if (parameter_definition_object["input"] === "object") {
-      return `<input class="param_input" type="text" placeholder="${placeholder}" value="${JSON.stringify(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')}">`;
     }
     //for items such as load_peak_hour_periods (object of objects with arrays)
     // exclude null: typeof null === "object" is a JS gotcha — null elements must fall to the array branch
     if (typeof Object.values(value)[0] === "object" && Object.values(value)[0] !== null) {
       for (let param of Object.values(value)) {
         for (let items of Object.values(param)) {
-          inputs += `<input class="param_input" type="${type}" placeholder=${Object.values(items)[0]} value=${
+          inputs += `<input class="param_input" type="${type}" placeholder="${escapeHtml(Object.values(items)[0])}" value="${escapeHtml(
             Object.values(items)[0]
-          }>`;
+          )}">`;
         }
         inputs += `</br>`;
       }
@@ -618,7 +697,7 @@ function buildParamElement(
         let checked_attr = type === "checkbox" && param === true ? "checked" : "";
         inputs += `
           ${type_specific_html}
-          <input class="param_input" type="${type}" placeholder=${parameter_definition_object["default_value"]} value=${param} ${checked_attr}>
+          <input class="param_input" type="${type}" placeholder="${escapeHtml(parameter_definition_object["default_value"])}" value="${escapeHtml(param)}" ${checked_attr}>
           ${type_specific_html_end}
           `;
       }
@@ -940,9 +1019,11 @@ async function saveConfiguration(param_definitions) {
 
           //build parameters using values extracted from param_inputs
 
-          // Nested numeric arrays must be saved as JSON, not flattened strings.
-          if (parameter_definition_name === "battery_charge_power_derating" &&
-              parameter_definition_object["input"] === "array.array.float") {
+          // Static numeric tables must be saved as JSON, not flattened strings.
+          // Only the structure is checked here; the physics of each table is
+          // validated authoritatively in Python.
+          if (parameter_definition_object["input"] === "array.array.float" &&
+              Array.isArray(parameter_definition_object["default_value"])) {
             try {
               const value = JSON.parse((param_values[0] ?? "").trim() || "[]");
               const numericRow = (row) => Array.isArray(row) &&
@@ -960,9 +1041,11 @@ async function saveConfiguration(param_definitions) {
             continue;
           }
 
-          // object-type: JSON.parse the text-box value; treat "" and "null" as JSON null
+          // object-type: JSON.parse the textarea value; treat "" and "null" as
+          // JSON null. Trim so stray whitespace/newlines in an otherwise empty
+          // textarea do not read as invalid JSON.
           if (parameter_definition_object["input"] === "object") {
-            const raw = (param_values[0] ?? "").toString();
+            const raw = (param_values[0] ?? "").toString().trim();
             if (raw === "" || raw === "null") {
               config[parameter_definition_name] = null;
             } else {
@@ -1038,14 +1121,24 @@ async function saveConfiguration(param_definitions) {
   }
 
   //finally, send built config to emhass
-  const response = await fetch(`set-config`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(config),
-  });
-  showChangeStatus(response.status, await response.json());
+  const timeout = AbortSignal.timeout?.(REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`set-config`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(config),
+      signal: timeout,
+    });
+    const saved = response.status === 200 || response.status === 201;
+    showChangeStatus(response.status, saved ? [] : await readErrorLog(response));
+  } catch (error) {
+    //a request that timed out may still have been applied by the server (older Chrome aborts with an
+    //AbortError rather than a TimeoutError, so ask the signal)
+    const outcome = timeout?.aborted ? " The server may still have saved it." : "";
+    showChangeStatus(0, [`Unable to save the configuration: ${error.message}.${outcome} Reload the page to check the stored settings.`]);
+  }
 }
 
 //Toggle between box (json) and list view
@@ -1077,6 +1170,10 @@ async function ToggleView(param_definitions, list_html, default_reset) {
   } else {
     //obtain latest config
     config = await obtainConfig();
+  }
+  //keep the current view if the configuration could not be obtained
+  if (config === null) {
+    return;
   }
 
   //if array is empty assume json box is selected
@@ -1114,7 +1211,8 @@ async function loadConfigurationBoxPage(config) {
       <textarea id="config-box" rows="30" placeholder="{}"></textarea>
       `;
   //set created textarea box with retrieved config
-  document.getElementById("config-box").innerHTML = JSON.stringify(
+  //.value, not innerHTML: a textarea's HTML parsing would decode &amp; etc. in the data (#1290)
+  document.getElementById("config-box").value = JSON.stringify(
     config,
     null,
     2
@@ -1131,6 +1229,8 @@ async function showChangeStatus(status, logJson) {
   if (status === 200 || status === 201) {
     //if status is 200 or 201, then show a tick
     loading.innerHTML = `<p class=tick>&#x2713;</p>`;
+    //a request that succeeds ends the failure shown for the one before it
+    document.getElementById("alert").style.display = "none";
   } else {
     //then show a cross
     loading.classList.remove("loading");

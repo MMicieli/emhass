@@ -39,6 +39,8 @@ _confirm terminal is in the root `emhass` directory before starting_
 
 **Create a developer environment:**
 
+Use a Python interpreter satisfying `requires-python` in `pyproject.toml`; see `.github/workflows/python-test.yml` for the interpreter/OS combinations currently tested in CI.
+
 Using the [`uv` package manager](https://docs.astral.sh/uv/):
 ```bash
 # With the 'test' packages to run unit tests locally.
@@ -212,7 +214,7 @@ _This use case may not require any volume mounts (unless you use secrets_emhass.
  you can also pass location, key and url secret parameters via environment variables.
 
 ```bash
-docker build -t emhass/test --build-arg build_version=addon-local .
+docker build -t emhass/test --build-arg BUILD_VERSION=addon-local .
 
 docker run -it -p 5000:5000 --name emhass-test -e URL="YOURHAURLHERE" -e KEY="YOURHAKEYHERE" -e LAT="45.83" -e LON="6.86" -e ALT="4807.8" -e TIME_ZONE="Europe/Paris" emhass/test
 ```
@@ -228,7 +230,7 @@ export LAT="45.83"
 export LON="6.86"
 export ALT="4807.8"
 
-docker build -t emhass/test --build-arg build_version=addon-local .
+docker build -t emhass/test --build-arg BUILD_VERSION=addon-local .
 
 docker run -it -p 5000:5000 --name emhass-test -e EMHASS_KEY -e EMHASS_URL -e TIME_ZONE -e LAT -e LON -e ALT emhass/test
 ```
@@ -325,6 +327,8 @@ To support the configuration website to generate the parameter in the list view,
 ```
 *Note: The `default_value` in this case acts (or should act) as last resort fallback if default_config.json is not found. It also acts as the default value when you append (press plus) to an array.\* parameter*
 
+*Note: a static table-valued parameter (`input: "array.array.float"` with a list `default_value`, such as `battery_charge_power_derating` or the `inverter_power_curve_*` curves) is edited in the list view as one JSON text field and saved with `JSON.parse`; the UI only checks that it is nested numeric arrays, so validate the content in Python. A nullable per-load nested array (`default_value: null`) keeps the per-load rendering.*
+
 ![Screenshot from 2024-09-09 16-45-32](https://github.com/user-attachments/assets/01e7984f-3332-4e25-8076-160f51a2e0c4)
 
 If you are only adding another option for a existing parameter, editing `param_definitions.json` file should be all you need (allowing the user to select the option from the configuration page):
@@ -343,10 +347,12 @@ If you are only adding another option for a existing parameter, editing `param_d
 },
 ```
 
-4. Update the Optimization Cache Key (`command_line.py`)
+4. Check the Optimization Cache Key (`command_line.py`)
 If your new parameter affects the mathematical structure of the optimization problem (e.g., adding constraints, changing binary variables, or adding penalty weights), it must trigger a cache miss when changed.
 
-Add your parameter to the `OptimizationCacheKey` dataclass and the `_compute_cache_key` method inside `command_line.py`:
+Usually nothing needs to be added. `_compute_cache_key` already hashes every `plant_conf` key (`plant_conf_hash`) and every `optim_conf` key (`optim_conf_structural_hash`) except those in the `plant_runtime_keys` / `optim_conf_runtime_keys` sets, which are the values updated per call without a rebuild (CVXPY Parameters, solver options, forecast-method selectors). A new structural parameter in `plant_conf` or `optim_conf` is therefore covered automatically: do NOT add a redundant field. Instead, add a test that a change to its value changes the key (see `test_curves_invalidate_the_optimization_cache_through_plant_conf_hash` in `tests/test_inverter_power_curves.py`).
+
+Add an explicit field to the `OptimizationCacheKey` dataclass and to `_compute_cache_key` only if the parameter is *not* covered by those hashes: it lives outside `plant_conf`/`optim_conf` (e.g. `retrieve_hass_conf`), is listed in a runtime-keys set but still changes the structure, or needs a canonical form first (e.g. scalar and singleton list must share one key):
 ```python
 @dataclass(frozen=True)
 class OptimizationCacheKey:

@@ -139,6 +139,86 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(f_write.write.called)
 
+    @patch("emhass.web_server.aiofiles.open")
+    @patch("os.path.exists")
+    @patch("emhass.web_server.build_params")
+    @patch("emhass.web_server.param_to_config")
+    async def test_parameter_set_rejects_invalid_heat_topology(
+        self, mock_p2c, mock_build_params, mock_exists, mock_file
+    ):
+        """An invalid heat_topology is rejected at save time with the compiler's
+        field-precise error, instead of failing at the next optimization run."""
+        mock_exists.return_value = True
+        f_defaults = AsyncMock()
+        f_defaults.read.return_value = orjson.dumps({"default": 1})
+        mock_file.return_value.__aenter__.return_value = f_defaults
+        bad_topology = {
+            "sources": [{"id": "hp", "type": "not_a_real_type", "nominal_power": 1000}],
+            "storage": [{"id": "dhw", "volume": 0.2}],
+            "flows": [{"from": "hp", "to": "dhw"}],
+        }
+        response = await self.client.post("/set-config", json={"heat_topology": bad_topology})
+        self.assertEqual(response.status_code, 400)
+        body = await response.get_json()
+        self.assertIn("heat_topology is invalid", body[0])
+        self.assertIn("not_a_real_type", body[0])
+        # Validation failure must stop the save before any config is built
+        mock_build_params.assert_not_called()
+        mock_p2c.assert_not_called()
+
+    @patch("emhass.web_server.aiofiles.open")
+    @patch("os.path.exists")
+    @patch("emhass.web_server.build_params")
+    @patch("emhass.web_server.param_to_config")
+    async def test_parameter_set_accepts_an_empty_heat_topology(
+        self, mock_p2c, mock_build_params, mock_exists, mock_file
+    ):
+        """An empty text box means "no topology": null, "", "null" and {} all
+        save, so the stricter type check does not lock out zero-config users."""
+        mock_exists.return_value = True
+        mock_build_params.return_value = {"new": "params"}
+        mock_p2c.return_value = {"new": "config"}
+        for empty in (None, "", "null", {}):
+            with self.subTest(value=empty):
+                f_defaults = AsyncMock()
+                f_defaults.read.return_value = orjson.dumps({"default": 1})
+                f_write = AsyncMock()
+                mock_file.return_value.__aenter__.side_effect = [f_defaults, f_write, f_write]
+                response = await self.client.post("/set-config", json={"heat_topology": empty})
+                self.assertEqual(response.status_code, 200)
+
+    @patch("emhass.web_server.aiofiles.open")
+    @patch("os.path.exists")
+    @patch("emhass.web_server.build_params")
+    @patch("emhass.web_server.param_to_config")
+    async def test_parameter_set_accepts_valid_heat_topology(
+        self, mock_p2c, mock_build_params, mock_exists, mock_file
+    ):
+        """A valid heat_topology compiles cleanly and the save proceeds."""
+        mock_exists.return_value = True
+        f_defaults = AsyncMock()
+        f_defaults.read.return_value = orjson.dumps({"default": 1})
+        f_write = AsyncMock()
+        mock_file.return_value.__aenter__.side_effect = [f_defaults, f_write, f_write]
+        mock_build_params.return_value = {"new": "params"}
+        mock_p2c.return_value = {"new": "config"}
+        good_topology = {
+            "sources": [{"id": "boiler", "type": "gas", "efficiency": 0.9, "nominal_power": 10000}],
+            "storage": [
+                {
+                    "id": "tank",
+                    "volume": 0.1,
+                    "start_temperature": 35,
+                    "min_temperature": [25] * 4,
+                    "max_temperature": [60] * 4,
+                }
+            ],
+            "flows": [{"from": "boiler", "to": "tank"}],
+        }
+        response = await self.client.post("/set-config", json={"heat_topology": good_topology})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(f_write.write.called)
+
     @patch("emhass.web_server.set_input_data_dict")
     @patch("emhass.web_server.perfect_forecast_optim")
     @patch("emhass.web_server._save_injection_dict")
@@ -173,6 +253,100 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/action/export-influxdb-to-csv", json={})
         # App returns 400 for failures in this specific action
         self.assertEqual(response.status_code, 400)
+
+    @patch("emhass.web_server.weather_forecast_cache", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_weather_cache_400_never_returns_other_requests_log(
+        self, mock_load, mock_cache
+    ):
+        """Both 400 paths answer with a request-specific message, not the shared log's tail.
+
+        The action log is shared and holds every request's runtime parameters, which can include
+        API keys. The log below has another request's (fake) credentials after this request's
+        marker, as happens when two requests overlap.
+        """
+        from emhass.utils import SocFractionError
+
+        mock_load.return_value = ({}, "profit", "{}")
+        interleaved_log = (
+            "INFO - emhass.web_server -  >> Performing weather forecast, try to caching result\n"
+            "INFO - emhass.web_server - Passed runtime parameters: "
+            "{'solcast_api_key': 'FAKE-KEY-123', 'long_lived_token': 'FAKE-TOKEN-456'}\n"
+            "ERROR - emhass.web_server - another request failed\n"
+        )
+        for label, effect, expected in (
+            ("returned False", False, "Weather forecast failed"),
+            ("SOC fraction", SocFractionError("soc_init=65 is above 1"), "soc_init=65 is above 1"),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                mock_cache.side_effect = effect if isinstance(effect, Exception) else None
+                mock_cache.return_value = effect
+                self.mock_conf["data_path"] = pathlib.Path(tmp)
+                (pathlib.Path(tmp) / web_server.action_log_str).write_text(interleaved_log)
+                response = await self.client.post("/action/weather-forecast-cache", json={})
+                body = await response.get_data(as_text=True)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(expected, body)
+                for secret in ("FAKE-KEY-123", "FAKE-TOKEN-456", "another request failed"):
+                    self.assertNotIn(secret, body)
+
+    @patch("emhass.web_server.weather_forecast_cache", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_weather_cache_transport_failure_is_not_hidden(
+        self, mock_load, mock_cache
+    ):
+        """A raised provider or network failure is a server error (500), not a 200 or a 400 result."""
+        import aiohttp
+
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_cache.side_effect = aiohttp.ClientConnectionError("provider unreachable")
+        response = await self.client.post("/action/weather-forecast-cache", json={})
+        self.assertEqual(response.status_code, 500)
+
+    @patch("emhass.web_server.weather_forecast_cache", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_weather_cache_success_is_200(self, mock_load, mock_cache):
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_cache.return_value = True
+        response = await self.client.post("/action/weather-forecast-cache", json={})
+        self.assertEqual(response.status_code, 200)
+
+    @patch("emhass.web_server.grab_log", new_callable=AsyncMock)
+    @patch("emhass.web_server.export_influxdb_to_csv", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_export_csv_soc_fraction_is_400(self, mock_load, mock_export, mock_grab):
+        from emhass.utils import SocFractionError
+
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_export.side_effect = SocFractionError("soc_init=65 is above 1")
+        mock_grab.return_value = ["ERROR soc_init=65 is above 1"]
+        response = await self.client.post("/action/export-influxdb-to-csv", json={})
+        self.assertEqual(response.status_code, 400)
+
+    @patch("emhass.web_server.grab_log", new_callable=AsyncMock)
+    @patch("emhass.web_server.export_influxdb_to_csv", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_export_csv_inverter_config_error_is_400(
+        self, mock_load, mock_export, mock_grab
+    ):
+        from emhass.utils import InverterConfigError
+
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_export.side_effect = InverterConfigError("number_of_inverters=2 is not supported")
+        mock_grab.return_value = ["ERROR number_of_inverters=2 is not supported"]
+        response = await self.client.post("/action/export-influxdb-to-csv", json={})
+        self.assertEqual(response.status_code, 400)
+
+    @patch("emhass.web_server.weather_forecast_cache", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_weather_cache_inverter_config_error_is_400(self, mock_load, mock_cache):
+        from emhass.utils import InverterConfigError
+
+        mock_load.return_value = ({}, "profit", "{}")
+        mock_cache.side_effect = InverterConfigError("inverter_ac_output_max must be a list")
+        response = await self.client.post("/action/weather-forecast-cache", json={})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("inverter_ac_output_max", await response.get_data(as_text=True))
 
     @patch("emhass.web_server.set_input_data_dict")
     @patch("emhass.web_server.forecast_model_fit")
@@ -645,6 +819,109 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         web_server._cleanup_entities()
         # Should have called remove twice (once for each file)
         self.assertEqual(mock_remove.call_count, 2)
+
+    @patch("emhass.web_server.aiofiles.open")
+    @patch("os.path.exists")
+    @patch("emhass.web_server.build_params")
+    @patch("emhass.web_server.param_to_config")
+    async def test_parameter_set_rejects_heat_topology_missing_id(
+        self, mock_p2c, mock_build_params, mock_exists, mock_file
+    ):
+        """A source entry without an `id` must return the clean 400 validation
+        message like any other invalid topology - not an unhandled 500 from an
+        internal KeyError."""
+        mock_exists.return_value = True
+        f_defaults = AsyncMock()
+        f_defaults.read.return_value = orjson.dumps({"default": 1})
+        mock_file.return_value.__aenter__.return_value = f_defaults
+        bad_topology = {
+            "sources": [{"type": "gas", "efficiency": 0.9, "nominal_power": 1000}],
+            "storage": [{"id": "dhw", "volume": 0.2}],
+            "flows": [],
+        }
+        response = await self.client.post("/set-config", json={"heat_topology": bad_topology})
+        self.assertEqual(response.status_code, 400)
+        body = await response.get_json()
+        self.assertIn("heat_topology is invalid", body[0])
+        self.assertIn("id", body[0])
+        mock_build_params.assert_not_called()
+        mock_p2c.assert_not_called()
+
+    @patch("emhass.web_server.aiofiles.open")
+    @patch("os.path.exists")
+    @patch("emhass.web_server.build_params")
+    @patch("emhass.web_server.param_to_config")
+    async def test_parameter_set_rejects_heat_topology_missing_efficiency(
+        self, mock_p2c, mock_build_params, mock_exists, mock_file
+    ):
+        """A fuel source without `efficiency` must return the 400 validation message,
+        not a 500 from a KeyError escaping the ValueError-only handler."""
+        mock_exists.return_value = True
+        f_defaults = AsyncMock()
+        f_defaults.read.return_value = orjson.dumps({"default": 1})
+        mock_file.return_value.__aenter__.return_value = f_defaults
+        bad_topology = {
+            "sources": [{"id": "gas", "type": "gas", "nominal_power": 20000}],
+            "storage": [{"id": "dhw", "volume": 0.2}],
+            "flows": [{"from": "gas", "to": "dhw"}],
+        }
+        response = await self.client.post("/set-config", json={"heat_topology": bad_topology})
+        self.assertEqual(response.status_code, 400)
+        body = await response.get_json()
+        self.assertIn("heat_topology is invalid", body[0])
+        self.assertIn("efficiency", body[0])
+        mock_build_params.assert_not_called()
+
+    @patch("emhass.web_server.aiofiles.open")
+    @patch("os.path.exists")
+    @patch("emhass.web_server.build_params")
+    @patch("emhass.web_server.param_to_config")
+    async def test_parameter_set_rejects_malformed_list_entries(
+        self, mock_p2c, mock_build_params, mock_exists, mock_file
+    ):
+        """A string where a flow, consumer or group object is expected, or a
+        non-string source type, must return the 400 validation message, not a
+        500 from an AttributeError."""
+        mock_exists.return_value = True
+        f_defaults = AsyncMock()
+        f_defaults.read.return_value = orjson.dumps({"default": 1})
+        mock_file.return_value.__aenter__.return_value = f_defaults
+        storage = [{"id": "dhw", "volume": 0.2}]
+        gas = {"id": "gas", "type": "gas", "nominal_power": 20000, "efficiency": 0.9}
+        for bad in (
+            {"sources": [gas], "storage": storage, "flows": ["x"]},
+            {"sources": [gas], "storage": storage, "consumers": ["x"]},
+            {"sources": [gas], "storage": storage, "actuator_groups": ["x"]},
+            {
+                "sources": [{**gas, "type": 5}],
+                "storage": storage,
+                "flows": [{"from": "gas", "to": "dhw"}],
+            },
+            {
+                "sources": [gas],
+                "storage": storage,
+                "flows": [{"from": "gas", "to": "dhw"}],
+                "actuator_groups": [{"flows": [["gas"]], "mutual_exclusion": True}],
+            },
+            # Not an object at all: a list, or a JSON topology quoted as a string.
+            [{"id": "gas"}],
+            '{"sources": []}',
+            # A number too large for a float (OverflowError in the compiler).
+            {
+                "sources": [{**gas, "nominal_power": 10**400}],
+                "storage": storage,
+                "flows": [{"from": "gas", "to": "dhw"}],
+            },
+            # A misspelled top-level key: it would compile to zero loads and
+            # replace the configured ones.
+            {"source": [gas]},
+        ):
+            with self.subTest(topology=bad):
+                response = await self.client.post("/set-config", json={"heat_topology": bad})
+                self.assertEqual(response.status_code, 400)
+                body = await response.get_json()
+                self.assertIn("heat_topology is invalid", body[0])
+        mock_build_params.assert_not_called()
 
 
 class TestAPIV1LastRun(unittest.IsolatedAsyncioTestCase):

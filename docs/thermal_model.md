@@ -44,6 +44,7 @@ You can define the following parameters inside the `thermal_config` dictionary:
 * **heating_rate**: The rate at which the temperature changes per hour when the device is operating at nominal power.
 * **cooling_constant**: The rate at which temperature is lost to the environment (per hour per degree difference).
 * **thermal_inertia**: (Float, Default: 0.0) The thermal lag of the system in hours. This models the delay between the device turning on and the temperature effectively starting to change. For example, `1.0` means a 1-hour delay. The lag is applied in whole timesteps (the value is divided by the optimization time step and rounded down, so `0.75` at a 30-minute step is a 1-step lag) and is capped at the optimization horizon.
+* **prior_heat**: (List of floats, optional) The initial condition for `thermal_inertia` under rolling MPC: the input power in **watts** for each of the last L steps that has not reached the temperature yet, oldest first. Without it, the first L steps of every run get no heat from the device, so an MPC loop keeps re-injecting heat that is already on its way. Each time an optimization time step completes, drop the oldest value and append the device's average input power over that step (for example a differenced energy counter: kWh × 1000 / step length in hours); resend the same list on MPC runs in between. Use what the device actually drew, not the previous plan's intentions; clamp a negative counter difference (a reset) to 0 and send 0 for an unavailable reading. A shorter list is right-aligned (the most recent steps), a longer one keeps its last L values, and either is logged; without a lag the value is ignored with a log line. A non-numeric, negative or non-finite value fails the run. Absent means no heat in flight (the previous behaviour). Unlike `shared_tank_prior_heat` (thermal kWh), this value is electrical input in W. Because it is part of the problem structure, a changing `prior_heat` rebuilds the problem on every run instead of warm-starting.
 * **start_temperature**: The initial room temperature.
 * **sense**: Defines the operation mode of the thermal load.
     * `'heat'`: (Default) The device adds heat (e.g., heater).
@@ -53,7 +54,7 @@ You can define the following parameters inside the `thermal_config` dictionary:
 * **min_temperatures**: (List of floats) The minimum allowed temperature per timestep.
 * **max_temperatures**: (List of floats) The maximum allowed temperature per timestep.
 * **desired_temperatures**: (Legacy) A specific target temperature per timestep. Used with `penalty_factor`.
-* **overshoot_temperature**: (Legacy) A global maximum temperature limit.
+* **overshoot_temperature**: (Legacy) A global maximum temperature limit. Used with `desired_temperatures`: the load does not heat (or cool) in a step that would end beyond it, whether it is semi-continuous or continuous. A semi-continuous load that would cross it in one step at full power is off for that step.
 
 **Note on Constraint Modes:**
 It is recommended to use `min_temperatures` and `max_temperatures` to define a "Comfort Range". This allows the optimizer to "float" the temperature within this range to find the cheapest time to operate, resulting in clear On/Off blocks.
@@ -98,11 +99,20 @@ rest_command:
     headers:
       content-type: application/json
     payload: >
-      {% macro time_to_timestep(time) -%}
-        {{ (((today_at(time) - now()) / timedelta(minutes=30)) | round(0, 'ceiling')) % 48 }}
-      {%- endmacro %}
+      {#- The comfort window is decided per step from the local clock time of that step, so it
+          stays correct across a daylight saving change. The window must not cross midnight
+          (comfort_start earlier than comfort_end on the same day).
+          Step i is the instant first_step + i * 1800 s, the first step being the one that
+          contains now (optimization_time_step 30). This needs method_ts_round: first in the EMHASS
+          configuration (it is not a runtime key) and a request that reaches EMHASS within the same
+          step as this render; check the first timestamp of the returned plan against first_step. -#}
+      {%- set t_now = now() -%}
+      {%- set step_s = 1800 -%}
+      {%- set utc_offset_s = t_now.utcoffset().total_seconds() -%}
+      {%- set first_step = ((as_timestamp(t_now) + utc_offset_s) // step_s) * step_s - utc_offset_s -%}
       {%- set horizon = 24 -%}
-      {%- set comfort_intervals = [[time_to_timestep("06:30")|int, time_to_timestep("23:00")|int]] -%}
+      {%- set comfort_start = "06:30" -%}
+      {%- set comfort_end = "23:00" -%}
       {%- set pv_power_forecast = namespace(all=[]) -%}
       {% for i in range(horizon) %}
         {%- set pv_power_forecast.all = pv_power_forecast.all + [ 0.0 ] -%}
@@ -123,17 +133,13 @@ rest_command:
             "thermal_inertia": 1.0,
             "start_temperature": {{ states('sensor.my_room_temperature') }},
             "sense": "heat",
-            "max_temperatures": [24.0] * {{ horizon }}, 
+            "max_temperatures": {{ ([24.0] * horizon) | tojson }}, 
             "min_temperatures": [
               {%- set comma = joiner(", ") -%}
               {%- for i in range(horizon) -%}
-                {%- set timestep = i -%}
+                {%- set clock = (first_step + i * step_s) | timestamp_custom("%H:%M", true) -%}
                 {{ comma() }}
-                {% for interval in comfort_intervals if timestep >= interval[0] and timestep <= interval[1] %}
-                21.0
-                {%- else -%}
-                18.0
-                {%- endfor %}
+                {{ 21.0 if comfort_start <= clock <= comfort_end else 18.0 }}
               {%- endfor %}
             ]}
           }

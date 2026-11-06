@@ -3,6 +3,7 @@ import copy
 import logging
 import os
 import pickle
+import threading
 import time
 from math import ceil, isfinite
 
@@ -28,6 +29,7 @@ THERMAL_CONFIG_KNOWN_KEYS = frozenset(
         "penalty_factor",
         "sense",
         "thermal_inertia",
+        "prior_heat",
     }
 )
 # Common singular typo -> (correct list key, what that key controls). The role
@@ -93,6 +95,49 @@ BATTERY_FIRST_IMPORT_PENALTY_FACTOR = 100.0
 # whenever that is possible, while a contradictory target relaxes to the closest
 # reachable SoC instead of returning infeasible.
 SOC_FINAL_DEVIATION_PENALTY_FACTOR = 100.0
+# Big-M factor on grid import under costfun "self-consumption" (see
+# _build_objective_function). The terminal-SoC penalty is scaled by the same factor.
+SELF_CONSUMPTION_BIGM = 1e3
+# Default big-M (deg C) for the per-source max_supply_temperature gate on
+# shared thermal tanks. When allow_k = 0 the gate must leave the tank
+# temperature unconstrained, so M must be at least (highest feasible tank
+# temperature - lowest source cap). 100 covers domestic hot-water tanks; the
+# gate widens it per tank when a configured max_temperatures says the tank can
+# run hotter (e.g. industrial or glycol systems).
+SHARED_TANK_CAP_BIG_M_TEMP = 100.0
+
+# Near-term window (in optimization steps) for start-below-floor recovery. A
+# shared thermal tank that starts below a minimum it must meet within this many
+# steps (e.g. a heating zone dipping below its comfort floor on a cold morning)
+# cannot jump back into band in a single step, so a hard floor would make the
+# problem infeasible. Such a tank gets its floors priced instead of hard for the
+# run (see SHARED_TANK_START_RECOVERY_PENALTY). A floor that only rises later
+# than this can be reached by planning ahead and does not trigger it.
+SHARED_TANK_START_RECOVERY_STEPS = 6
+
+# Objective weight (per degree C per step) on the shortfall below a configured
+# floor once a tank starts below a near-term one. It dominates energy prices, so
+# the tank recovers as fast as its sources allow and then holds the floor, while
+# a tank that physically cannot catch up yet does not make the run infeasible.
+SHARED_TANK_START_RECOVERY_PENALTY = 1000.0
+
+# How far (deg C) a thermal_battery bound may give way when free gains or losses
+# alone carry the store past it (see _free_gain_breach). The excess is priced
+# at SHARED_TANK_START_RECOVERY_PENALTY, so this only has to be large enough
+# never to bind.
+THERMAL_FREE_GAIN_RELIEF = 100.0
+
+# Highest COP a heat pump is given: utils.calculate_cop_heatpump and
+# utils.cop_from_tank_temperature both clip to it. Bounds a DP-refinable COP,
+# whose value is only known after the refinement.
+HEAT_PUMP_COP_MAX = 8.0
+
+
+def _cop_upper_bound(cops) -> float:
+    """Highest COP a source can have this run. A DP-refinable heat pump's COP is a
+    cp.Parameter that the refinement re-values, so it is bounded by the COP clip
+    rather than by today's value."""
+    return HEAT_PUMP_COP_MAX if isinstance(cops, cp.Parameter) else float(np.max(cops))
 
 
 class Optimization:
@@ -184,6 +229,7 @@ class Optimization:
         self.logger = logger
         self.var_load_cost = var_load_cost
         self.var_prod_price = var_prod_price
+        self._solve_lock = threading.RLock()
         self.optim_status = None
 
         # Prioritize config value over default arg
@@ -263,6 +309,7 @@ class Optimization:
         # price scale; a Parameter (not a baked-in constant) keeps that correct across
         # warm-started re-solves. See SOC_FINAL_DEVIATION_PENALTY_FACTOR.
         self.param_soc_final_penalty = cp.Parameter(nonneg=True, name="soc_final_penalty")
+        self.param_soc_final_reward = cp.Parameter(nonneg=False, name="soc_final_reward")
         self.param_prod_price = cp.Parameter(self.num_timesteps, name="prod_price")
 
         # Per-deferrable-load cost override parameters. When the user supplies a
@@ -321,6 +368,10 @@ class Optimization:
         # Optional intermediate SOC target parameters (issue #553)
         self._init_soc_target_params()
 
+        # Per-battery availability windows and discharge energy budget
+        # (EV / V2G battery that is not always connected)
+        self._init_battery_availability_params()
+
         # Generic multi-component capacity/demand charges (issue #540 Part B).
         # A LIST ``capacity_cost_per_kw`` (len >= 2, after canonicalisation)
         # selects K independent capacity/demand components priced in ONE
@@ -368,6 +419,11 @@ class Optimization:
 
         # Note: The self.prob object will be constructed in a subsequent step
         self.prob = None
+        # thermal_battery loads whose built problem prices a bound instead of
+        # holding it hard (see _thermal_battery_bound_relief). A load enters the
+        # set the first time free gains force its bound and stays in it, so a
+        # load that never needs it keeps exactly the problem it had before.
+        self._thermal_relief_loads: set[int] = set()
 
         # Stress configs built alongside self.prob, kept for the relaxed-retry
         # path: a solve failure on a cached problem rebuilds constraints and
@@ -416,12 +472,9 @@ class Optimization:
         be (re)created whenever the horizon length changes. Called from __init__
         and when resizing the optimization problem.
 
-        One vector per battery (#610), list of length self.n_batt: the target
-        itself is not yet a per-battery runtime input, so every battery's floor
-        is fed the identical target fraction, applied against ITS OWN capacity
-        in perform_optimization. The per-battery Parameter exists now so a
-        future per-battery target only has to change the value each entry
-        receives, not the model structure.
+        One vector per battery (#610), list of length self.n_batt. A bare
+        soc_target is applied to every battery against ITS OWN capacity; a
+        per-battery list sets (or skips, with None) each battery's floor.
         """
         self.param_soc_target_floor = [
             cp.Parameter(self.num_timesteps, nonneg=True, name=f"soc_target_floor_{k}")
@@ -429,6 +482,249 @@ class Optimization:
         ]
         for k in range(self.n_batt):
             self.param_soc_target_floor[k].value = np.zeros(self.num_timesteps)
+
+    def _init_battery_availability_params(self) -> None:
+        """Initialize CVXPY parameters for per-battery availability windows.
+
+        A battery that is not always connected (an EV on a bidirectional
+        charger, V2G/V2H) is modelled as battery k with a per-timestep power
+        ceiling. ``param_batt_charge_ceiling[k]`` and
+        ``param_batt_discharge_ceiling[k]`` are horizon vectors in W, with the
+        same battery-side convention as battery_charge/discharge_power_max.
+        ``param_batt_discharge_energy_max[k]`` caps the energy battery k may
+        deliver over the horizon (Wh, battery side), e.g. a V2G warranty or
+        cycle budget.
+
+        The ``availability * power_max`` product is formed numerically at
+        set-time (as for ``param_soc_target_floor``), so the problem stays DPP /
+        warm-start safe. The defaults are the plain power limits and a budget
+        the battery cannot reach, which makes all three constraints redundant:
+        behaviour is unchanged unless a runtime value is passed. They are
+        vector params, so they are re-created on every horizon resize.
+        """
+        charge_list = self._batt_list(self.plant_conf, "battery_charge_power_max", default=0)
+        discharge_list = self._batt_list(self.plant_conf, "battery_discharge_power_max", default=0)
+        self.param_batt_charge_ceiling = [
+            cp.Parameter(self.num_timesteps, nonneg=True, name=f"batt_charge_ceiling_{k}")
+            for k in range(self.n_batt)
+        ]
+        self.param_batt_discharge_ceiling = [
+            cp.Parameter(self.num_timesteps, nonneg=True, name=f"batt_discharge_ceiling_{k}")
+            for k in range(self.n_batt)
+        ]
+        self.param_batt_discharge_energy_max = [
+            cp.Parameter(nonneg=True, name=f"batt_discharge_energy_max_{k}")
+            for k in range(self.n_batt)
+        ]
+        for k in range(self.n_batt):
+            chg = float(charge_list[k] or 0)
+            dis = float(discharge_list[k] or 0)
+            self.param_batt_charge_ceiling[k].value = np.full(self.num_timesteps, chg)
+            self.param_batt_discharge_ceiling[k].value = np.full(self.num_timesteps, dis)
+            self.param_batt_discharge_energy_max[k].value = (
+                dis * self.time_step * self.num_timesteps + 1.0
+            )
+
+    def _normalize_battery_availability(self, value, n: int) -> list:
+        """Normalise the ``battery_availability`` runtime input.
+
+        Returns a list of ``self.n_batt`` numpy arrays of length ``n`` with
+        values in ``[0, 1]`` (1 = connected at full power, 0 = not connected, a
+        fraction scales both power limits for that step). See
+        ``_normalize_availability`` for the accepted shapes and the validation.
+        """
+        return self._normalize_availability(
+            value, n, self.n_batt, "battery_availability", "number_of_batteries"
+        )
+
+    def _normalize_availability(self, value, n: int, count: int, name: str, count_name: str):
+        """Normalise a per-unit availability runtime input (``battery_availability``,
+        ``def_availability``).
+
+        Returns a list of ``count`` numpy arrays of length ``n`` with values in
+        ``[0, 1]``. A value outside ``[0, 1]`` (for instance a percentage) or a
+        non-numeric value raises ValueError; NaN reads as 1.
+
+        Accepted shapes: ``None`` (always available), a scalar (broadcast to
+        every unit and step), or a list with one entry per unit where each
+        entry is ``None``, a scalar or a per-timestep list. With ``count == 1``
+        a flat list of numbers is read as the time series of unit 0. A time
+        series shorter than the horizon is padded with its last value, a
+        longer one is truncated.
+        """
+
+        def _series(entry, k):
+            if entry is None:
+                return np.ones(n)
+            try:
+                if isinstance(entry, list | tuple | np.ndarray):
+                    arr = np.asarray(entry, dtype=float).ravel()
+                else:
+                    arr = np.full(n, float(entry))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{name}[{k}] must be a number or a list of numbers in [0, 1], got {entry!r}"
+                ) from exc
+            if arr.size == 0:
+                return np.ones(n)
+            arr = np.nan_to_num(arr, nan=1.0)
+            if np.any(arr < 0.0) or np.any(arr > 1.0):
+                raise ValueError(
+                    f"{name}[{k}] must be a fraction in [0, 1] (NOT "
+                    f"percent), got values in [{arr.min()}, {arr.max()}]"
+                )
+            if arr.size != n:
+                self.logger.warning(
+                    f"{name}[{k}] has {arr.size} values for a "
+                    f"{n}-step horizon; padding/truncating to the horizon."
+                )
+                if arr.size < n:
+                    arr = np.concatenate([arr, np.full(n - arr.size, arr[-1])])
+                else:
+                    arr = arr[:n]
+            return arr
+
+        if value is None:
+            return [np.ones(n) for _ in range(count)]
+        if not isinstance(value, list | tuple | np.ndarray):
+            return [_series(value, k) for k in range(count)]
+        value = list(value)
+        nested = any(isinstance(v, list | tuple | np.ndarray) or v is None for v in value)
+        if count == 1 and not nested and len(value) != 1:
+            return [_series(value, 0)]
+        if len(value) != count:
+            raise ValueError(f"{name} must have {count} entries ({count_name}), got {len(value)}")
+        return [_series(value[k], k) for k in range(count)]
+
+    def _sequence_placements(self, k: int, n: int) -> np.ndarray:
+        """Power profile of every placement the sequence load k can take.
+
+        Row ``s`` is the (remaining) power sequence started at step ``s``. A load
+        that is already running keeps its single placement at t=0, and a
+        sequence longer than the horizon is truncated to one placement. Shared
+        by the constraint builder and the ``def_availability`` check, so both
+        see the same placements.
+        """
+        power_sequence = self.optim_conf["nominal_power_of_deferrable_loads"][k]
+        elapsed_steps = int(self.param_current_operating_timesteps[k].value)
+        if elapsed_steps > 0:
+            power_sequence = power_sequence[elapsed_steps:]
+        sequence_length = len(power_sequence)
+        if self.param_def_current_state[k].value:
+            y_len = 1
+        else:
+            y_len = max(n - sequence_length + 1, 1)
+        rows = np.zeros((y_len, n))
+        for start_t in range(y_len):
+            end_t = min(start_t + sequence_length, n)
+            rows[start_t, start_t:end_t] = power_sequence[: (end_t - start_t)]
+        return rows
+
+    def _apply_def_availability(self, avail_list: list) -> None:
+        """Apply the ``def_availability`` runtime input to the deferrable loads.
+
+        ``avail_list[k]`` (see ``_normalize_availability``) multiplies the
+        window mask of load k, so the existing constraint
+        ``p_deferrable[k] <= nominal_power * window_mask[k]`` becomes a
+        per-step power ceiling of ``availability * nominal_power`` and ``0``
+        keeps the load off. This is a parameter change only: no new
+        constraint or variable, so a cached problem picks up a new mask
+        without a rebuild.
+
+        A semi-continuous load runs at its ON level or not at all, and a
+        sequence load runs its fixed power profile, so for both any value below
+        1 blocks the step: their mask is set to 0 there instead of scaled. That
+        keeps the step blocked when the ON level is lowered below nominal (a
+        thermal cap) and in the relaxed retry, which treats every load as
+        continuous. A sequence must still have one complete placement in the
+        available steps, else a ValueError names the load (the alternative is
+        an infeasible model).
+
+        A load cannot run where the ceiling leaves no room for its ON state:
+        ``0``, a blocked step as above, else a ceiling below the minimum power
+        of this call (``_min_power_of_deferrable_loads``). A forced
+        run of the load (single-constant pin, min-on remainder, current-power
+        force-on) ends at the first such step, and a single-constant load loses
+        its "already running" credit there, so the rest of its run counts as a
+        new block. A ``def_current_power`` pin above the ceiling at t=0 is
+        dropped. Without that release the mask and a force-on would make the
+        model infeasible.
+        """
+        nominal_powers = self.optim_conf["nominal_power_of_deferrable_loads"]
+        # The minimum powers this call builds its constraints with (a direct
+        # perform_optimization caller can override the configured ones).
+        min_powers = getattr(self, "_min_power_of_deferrable_loads", None)
+        if min_powers is None:
+            min_powers = self.optim_conf.get("minimum_power_of_deferrable_loads") or []
+        semi_cont = self.optim_conf["treat_deferrable_load_as_semi_cont"]
+        max_cost = self.optim_conf.get("deferrable_load_max_cost") or []
+        for k in range(min(len(avail_list), len(self.param_window_masks))):
+            avail = avail_list[k]
+            if np.all(avail >= 1.0):
+                continue
+            nominal = nominal_powers[k]
+            is_sequence = isinstance(nominal, list)
+            nominal = float(max(nominal)) if is_sequence else float(nominal)
+            window = np.asarray(self.param_window_masks[k].value, dtype=float).copy()
+
+            if is_sequence or (k < len(semi_cont) and semi_cont[k]):
+                cannot_run = avail < 1.0
+                self.param_window_masks[k].value = np.where(cannot_run, 0.0, window)
+            else:
+                min_power = float(min_powers[k]) if k < len(min_powers) else 0.0
+                cannot_run = (avail <= 0.0) | (avail * nominal < min_power - 1e-9)
+                self.param_window_masks[k].value = window * avail
+
+            if is_sequence:
+                # Every placement is a fixed profile; the model has to pick one
+                # (unless a max cost lets it skip a load that is not running).
+                may_skip = (
+                    k < len(max_cost)
+                    and max_cost[k] > 0
+                    and not self.param_def_current_state[k].value
+                )
+                if not may_skip:
+                    rows = self._sequence_placements(k, len(avail))
+
+                    def _fits(mask, rows=rows, m=nominal):
+                        return bool(np.any(np.all(rows <= m * mask + 1e-6, axis=1)))
+
+                    if _fits(window) and not _fits(self.param_window_masks[k].value):
+                        raise ValueError(
+                            f"def_availability[{k}] leaves no complete placement for the "
+                            f"power sequence of deferrable load {k}: a value below 1 blocks "
+                            "a step of a sequence load, and a sequence that is already "
+                            "running cannot be interrupted."
+                        )
+            if k < len(self.param_running_lb):
+                lb = np.asarray(self.param_running_lb[k].value, dtype=float).copy()
+                blocked_forced = np.flatnonzero(cannot_run & (lb > 0))
+                if blocked_forced.size:
+                    # The forced run ends at the first step the load cannot run.
+                    lb[blocked_forced[0] :] = 0.0
+                    self.param_running_lb[k].value = lb
+                    if k < len(self.param_already_running_sc):
+                        self.param_already_running_sc[k].value = 0.0
+            if (
+                k < len(self.param_def_current_power_active)
+                and self.param_def_current_power_active[k].value > 0
+                and self.param_def_current_power[k].value > avail[0] * nominal + 1e-9
+            ):
+                self.param_def_current_power_active[k].value = 0.0
+                self.logger.warning(
+                    "Deferrable load %d: def_current_power %.0f W is above its "
+                    "def_availability ceiling at t=0 (%.0f W); the power pin is dropped.",
+                    k,
+                    self.param_def_current_power[k].value,
+                    avail[0] * nominal,
+                )
+            self.logger.debug(
+                "Deferrable load %d: def_availability blocks %d and limits %d of %d timesteps",
+                k,
+                int(np.sum(avail <= 0.0)),
+                int(np.sum((avail > 0.0) & (avail < 1.0))),
+                len(avail),
+            )
 
     def _init_current_period_peak_param(self) -> None:
         """Initialize the CVXPY parameter for the peak grid import already
@@ -750,6 +1046,20 @@ class Optimization:
         # Dict keyed by load index k, stores all parameters needed for thermal constraints
         # This allows updating runtime values (forecasts, temperatures) without rebuilding constraints
         self.param_thermal = {}
+        # Effective per-step floor of each shared tank (static list and
+        # min_temperature_curve combined), keyed by tank index; filled when the
+        # tank is built and published as min_temp_heater{k} for its members.
+        self._shared_tank_min_floors = {}
+        # COP refinement mode, validated once: an unknown value (e.g. a typo) falls
+        # back to the default instead of silently running the DP.
+        cop_solver = str(self.optim_conf.get("cop_solver", "static")).strip().lower()
+        if cop_solver not in ("static", "auto", "dp"):
+            self.logger.warning(
+                "cop_solver=%r is not one of 'static', 'auto', 'dp'; using 'static'",
+                self.optim_conf.get("cop_solver"),
+            )
+            cop_solver = "static"
+        self._cop_solver = cop_solver
         def_load_config = self.optim_conf.get("def_load_config", []) or []
         for k in range(num_def_loads):
             if k < len(def_load_config) and def_load_config[k]:
@@ -821,8 +1131,15 @@ class Optimization:
                         "heating_demand": cp.Parameter(
                             n, name=f"thermal_battery_heating_demand_{k}"
                         ),
+                        "thermal_balance": cp.Parameter(n, name=f"thermal_battery_balance_{k}"),
                         "heatpump_cops": cp.Parameter(n, name=f"thermal_battery_cops_{k}"),
                         "desired_temps": cp.Parameter(n, name=f"thermal_battery_desired_temps_{k}"),
+                        # Room a bound gets when free gains alone carry the store
+                        # past it (zero: the bound is hard). A Parameter, so a
+                        # cached problem follows the forecast of each run.
+                        "bound_relief": cp.Parameter(
+                            n, nonneg=True, name=f"thermal_battery_bound_relief_{k}"
+                        ),
                     }
                     # Initialize with default values
                     self.param_thermal[k]["outdoor_temp"].value = np.full(n, 15.0)
@@ -834,6 +1151,8 @@ class Optimization:
                     )
                     self.param_thermal[k]["thermal_losses"].value = np.zeros(n)
                     self.param_thermal[k]["heating_demand"].value = np.zeros(n)
+                    self.param_thermal[k]["thermal_balance"].value = np.zeros(n)
+                    self.param_thermal[k]["bound_relief"].value = np.zeros(n)
                     self.param_thermal[k]["heatpump_cops"].value = np.full(n, 3.0)
                     self.param_thermal[k]["desired_temps"].value = self._pad_temp_array(
                         desired_temps, n, 22.0
@@ -1336,7 +1655,9 @@ class Optimization:
             ),
         }
 
-    def _normalize_soc_arg(self, value: float | list | None) -> list:
+    def _normalize_soc_arg(
+        self, value: float | list | None, name: str = "soc_init/soc_final"
+    ) -> list:
         """
         Normalise a perform_optimization soc_init/soc_final argument into a
         length self.n_batt list (#610). A bare float (or None) broadcasts to
@@ -1348,10 +1669,10 @@ class Optimization:
         """
         if value is None:
             return [None] * self.n_batt
-        if isinstance(value, list):
+        if isinstance(value, list | tuple):
             if len(value) != self.n_batt:
                 raise ValueError(
-                    f"soc_init/soc_final list must have {self.n_batt} entries "
+                    f"{name} list must have {self.n_batt} entries "
                     f"(number_of_batteries), got {len(value)}"
                 )
             return list(value)
@@ -1543,7 +1864,7 @@ class Optimization:
                         np.full(n, base_loss)
                     )
                     draw_off_arr = self._tile_profile(draw_off_profile, n)
-                    params["heating_demand"].value = draw_off_arr
+                    params["thermal_balance"].value = draw_off_arr
                 else:
                     # Building heating mode: outdoor-temp-dependent losses.
                     # calculate_thermal_loss_signed returns a signed kW magnitude;
@@ -1584,7 +1905,7 @@ class Optimization:
                         if internal_gains_factor > 0:
                             internal_gains_forecast = p_load
 
-                        heating_demand = utils.calculate_heating_demand_physics(
+                        thermal_balance = utils.calculate_thermal_balance_physics(
                             u_value=hc["u_value"],
                             envelope_area=hc["envelope_area"],
                             ventilation_rate=hc["ventilation_rate"],
@@ -1599,11 +1920,52 @@ class Optimization:
                             internal_gains_factor=internal_gains_factor,
                             sense=hc.get("sense") or "heat",
                         )
-                        params["heating_demand"].value = np.array(heating_demand[:n])
+                        params["thermal_balance"].value = np.array(thermal_balance[:n])
+                    elif "specific_heating_demand" in hc and "area" in hc:
+                        demand = utils.calculate_heating_demand(
+                            specific_heating_demand=hc["specific_heating_demand"],
+                            floor_area=hc["area"],
+                            outdoor_temperature_forecast=outdoor_temp.tolist(),
+                            base_temperature=hc.get("base_temperature", 18.0),
+                            annual_reference_hdd=hc.get("annual_reference_hdd", 3000.0),
+                            optimization_time_step=int(self.freq.total_seconds() / 60),
+                        )
+                        params["thermal_balance"].value = np.array(demand[:n])
                     else:
-                        params["heating_demand"].value = np.zeros(n)
+                        params["thermal_balance"].value = np.zeros(n)
+
+                # Surface solar gain (pool, outdoor tank, solar-thermal). Subtracts
+                # absorbed irradiance from the signed balance. No-op when
+                # solar_absorption_area is unset.
+                params["thermal_balance"].value = self._apply_surface_solar_gain(
+                    hc, data_opt, params["thermal_balance"].value, n
+                )
+                sense = utils.normalize_heat_cool_mode(
+                    hc.get("sense") or "heat", field_name="sense", context="thermal demand"
+                )
+                params["heating_demand"].value = (
+                    params["thermal_balance"].value
+                    if sense == "cool"
+                    else np.maximum(params["thermal_balance"].value, 0.0)
+                )
 
                 self._persist_q_input(k, params, hc)
+                relief = self._thermal_battery_bound_relief(
+                    k,
+                    hc,
+                    new_start_temp,
+                    params["thermal_balance"].value,
+                    params["thermal_losses"].value,
+                    params["min_temps"].value,
+                    params["max_temps"].value,
+                    n,
+                )
+                params["bound_relief"].value = np.full(n, relief)
+                if relief > 0 and k not in self._thermal_relief_loads:
+                    # The cached problem holds this bound hard: rebuild it once
+                    # with the priced form (the constraint builder adds the load
+                    # to the set).
+                    self.prob = None
 
     def _get_clean_outdoor_temp(self, data_opt: pd.DataFrame, n: int) -> np.ndarray:
         """Extract and clean outdoor temperature from data_opt."""
@@ -1658,7 +2020,7 @@ class Optimization:
         self.logger.info(f"{limit_name} configured as time-varying with {data_length} values")
         return limit_array
 
-    def _setup_stress_cost(self, cost_conf_key, max_power, var_name_prefix):
+    def _setup_stress_cost(self, cost_conf_key, segments_conf_key, max_power, var_name_prefix):
         """
         Generic setup for a stress cost (battery or inverter).
         """
@@ -1681,7 +2043,7 @@ class Optimization:
             "unit_cost": stress_unit_cost,
             "max_power": max_power,
             # Defaults to 10 segments if not provided in config
-            "segments": self.plant_conf.get(f"{var_name_prefix}_stress_segments", 10),
+            "segments": self.plant_conf.get(segments_conf_key, 10),
         }
 
     def _build_stress_segments(self, max_power, stress_unit_cost, segments):
@@ -2058,6 +2420,10 @@ class Optimization:
         and every multi-component (issue #540 Part B) component; ``warn_prefix``
         (``"capacity_cost_per_kw[k]: "``) attributes a bad value to its
         component."""
+        # A one-entry list is one value (the runtime parameter is declared as an
+        # array, so a single-component tariff may receive [7000]).
+        if isinstance(value, list | tuple) and len(value) == 1:
+            value = value[0]
         try:
             peak_floor_w = float(value)
         except (TypeError, ValueError):
@@ -2555,7 +2921,7 @@ class Optimization:
 
         elif self.costfun == "self-consumption":
             if type_self_conso == "bigm":
-                bigm = 1e3
+                bigm = SELF_CONSUMPTION_BIGM
                 cost_term = bigm * cp.multiply(unit_load_cost, p_grid_pos)
                 prod_term = cp.multiply(unit_prod_price, p_grid_neg)
                 objective_terms.append(-scale * cp.sum(cost_term + prod_term))
@@ -2618,8 +2984,12 @@ class Optimization:
                 penalty = self.optim_conf["set_deferrable_startup_penalty"][k]
                 if penalty > 0:
                     nominal_power = self.optim_conf["nominal_power_of_deferrable_loads"][k]
-                    # Vectorized cost calculation for this load's startups
-                    startup_cost_vector = cp.multiply(p_def_start[k], unit_load_cost)
+                    # Vectorized cost calculation for this load's startups. The
+                    # price is clipped to non-negative (param_load_cost_pos, as
+                    # for battery_first): at a negative price the penalty would
+                    # otherwise reward every start and split a run into
+                    # one-step pieces.
+                    startup_cost_vector = cp.multiply(p_def_start[k], self.param_load_cost_pos)
                     total_startup_cost = cp.sum(startup_cost_vector)
 
                     term = -scale * penalty * nominal_power * total_startup_cost
@@ -2706,16 +3076,20 @@ class Optimization:
                 )
                 objective_terms.append(-cp.sum(sum(soc_surplus_cost)))
 
-        # Terminal-SoC deviation penalty. param_soc_final_penalty is already in currency
-        # per Wh (it folds in the kWh conversion and the dominance factor), so the slacks
-        # enter the objective directly. Charging both directions keeps the target an
-        # equality rather than a one-sided bound. Summed over the per-battery slack
-        # pairs (#610); every battery's miss is priced at the same rate.
+        # Terminal-SoC deviation
+        # penalty/reward. param_soc_final_penalty/reward are already
+        # in currency per Wh (it folds in the kWh conversion and the
+        # dominance factor), so the slacks enter the objective
+        # directly. Coming in under the target is heavily penalized,
+        # coming in over the target is rewarded by the value of the
+        # energy in the battery at the end of the optimization
+        # period. Summed over the per-battery slack pairs (#610);
+        # every battery's miss is priced at the same rate.
         soc_final_under = self.vars.get("soc_final_under")
         if soc_final_under is not None:
             objective_terms.append(
-                -self.param_soc_final_penalty
-                * (sum(soc_final_under) + sum(self.vars["soc_final_over"]))
+                -self.param_soc_final_penalty * sum(soc_final_under)
+                + self.param_soc_final_reward * sum(self.vars["soc_final_over"])
             )
 
         # Battery-first priority penalty (issue #834/#1002). battery_first_penalty
@@ -2848,6 +3222,60 @@ class Optimization:
         # -p_grid_neg <= max_to_grid[t] * (1 - D[t])
         constraints.append(-p_grid_neg <= cp.multiply(max_power_to_grid_arr, (1 - D)))
 
+    def _inverter_power_curve(self, parameter_name: str, direction: str):
+        """Return the validated (ac_points, dc_points) of one inverter curve, or None.
+
+        None (absent parameter or explicit empty list) means the scalar efficiency of
+        that direction applies. Any other value is validated and a malformed one raises
+        ValueError naming the parameter: it is a physical model, so silently falling
+        back to the scalar would hide the error.
+        """
+        raw = self.plant_conf.get(parameter_name, [])
+        if utils.inverter_power_curve_is_unset(raw):
+            return None
+        points = utils.validate_inverter_power_curve(raw, parameter_name, direction)
+        return [p[0] for p in points], [p[1] for p in points]
+
+    def _add_inverter_pwl_transfer(self, constraints, name, dc_var, curve, gate):
+        """Exact piecewise-linear transfer dc = f(ac) by the incremental method.
+
+        The curve is indexed on the AC side, the power the user commands and
+        measures; ``dc_var`` (p_dc_ac or p_ac_dc) is the DC-bus flow it implies.
+        Segment k (k = 0..K-1) has width w_k = ac_{k+1} - ac_k and slope
+        s_k = (dc_{k+1} - dc_k) / w_k. With fill fractions u_k in [0, 1]:
+
+            ac = sum_k w_k u_k          dc = sum_k s_k w_k u_k
+
+        and K-1 binaries b_k force the segments to fill in order
+        (u_{k+1} <= b_k <= u_k), so dc is exactly f(ac) on every timestep, convex
+        or not, and a flat segment (zero DC for positive AC) is just s_k = 0. The AC
+        power is an expression of the fill fractions, not a free variable, so every
+        watt of AC is accounted for. ``gate`` (the existing is_dc_sourcing direction
+        binary, or its complement) bounds the first segment, so no extra on/off
+        binary is needed and the direction cannot be active together with the
+        opposite one. The curve's last AC point is the supported power domain: no
+        extrapolation. Returns the AC-side power expression.
+        """
+        ac_pts, dc_pts = curve
+        n = self.num_timesteps
+        n_seg = len(ac_pts) - 1
+        widths = [ac_pts[k + 1] - ac_pts[k] for k in range(n_seg)]
+        slopes = [(dc_pts[k + 1] - dc_pts[k]) / widths[k] for k in range(n_seg)]
+        u = [cp.Variable(n, nonneg=True, name=f"{name}_u{k}") for k in range(n_seg)]
+        b = [cp.Variable(n, boolean=True, name=f"{name}_b{k}") for k in range(n_seg - 1)]
+        for u_k in u:
+            constraints.append(u_k <= 1)
+        constraints.append(
+            dc_var == sum((s * w) * u_k for s, w, u_k in zip(slopes, widths, u, strict=True))
+        )
+        constraints.append(u[0] <= gate)
+        for k in range(n_seg - 1):
+            constraints.append(u[k + 1] <= b[k])
+            constraints.append(b[k] <= u[k])
+        self.vars[f"{name}_u"] = u
+        self.vars[f"{name}_b"] = b
+        return sum(w * u_k for w, u_k in zip(widths, u, strict=True))
+
     def _add_hybrid_inverter_constraints(self, constraints, inv_stress_conf):
         """Add constraints specific to hybrid inverters (Vectorized)."""
         if not self.plant_conf["inverter_is_hybrid"]:
@@ -2901,11 +3329,17 @@ class Optimization:
         if p_nom_inverter_input is None:
             p_nom_inverter_input = p_nom_inverter_output
 
-        eff_dc_ac = self.plant_conf.get("inverter_efficiency_dc_ac", 1.0)
-        eff_ac_dc = self.plant_conf.get("inverter_efficiency_ac_dc", 1.0)
-
-        p_dc_ac_max = p_nom_inverter_output / eff_dc_ac
-        p_ac_dc_max = p_nom_inverter_input * eff_ac_dc
+        # Optional exact piecewise-linear AC<->DC transfer curves (issue #746). A
+        # direction with a curve ignores its scalar efficiency entirely, so the scalar
+        # (and any limit derived from it) is only read for a scalar direction.
+        curve_dc_ac = self._inverter_power_curve("inverter_power_curve_dc_ac", "dc_ac")
+        curve_ac_dc = self._inverter_power_curve("inverter_power_curve_ac_dc", "ac_dc")
+        if curve_dc_ac is None:
+            eff_dc_ac = self.plant_conf.get("inverter_efficiency_dc_ac", 1.0)
+            p_dc_ac_max = p_nom_inverter_output / eff_dc_ac
+        if curve_ac_dc is None:
+            eff_ac_dc = self.plant_conf.get("inverter_efficiency_ac_dc", 1.0)
+            p_ac_dc_max = p_nom_inverter_input * eff_ac_dc
 
         n = self.num_timesteps
 
@@ -2931,15 +3365,42 @@ class Optimization:
 
         constraints.append(e_dc_balance == 0)
 
+        # An empty/absent curve keeps the scalar efficiency of that direction, so
+        # with both curves absent the expressions and constraints below are exactly
+        # the legacy ones. A curve is an EQUALITY between the AC-side power and the
+        # DC-side variable (p_dc_ac / p_ac_dc): never an inequality, which would let
+        # the solver import extra AC that no DC power accounts for. A genuine
+        # dead zone (AC input that reaches the DC bus as 0 W, e.g. 50 W -> 0 W) is a
+        # flat segment of that equality: the AC is consumed as inverter losses.
+        if curve_dc_ac is None:
+            ac_out = p_dc_ac * eff_dc_ac
+        else:
+            ac_out = self._add_inverter_pwl_transfer(
+                constraints, "inv_curve_dc_ac", p_dc_ac, curve_dc_ac, is_dc_sourcing
+            )
+        if curve_ac_dc is None:
+            ac_in = p_ac_dc * (1.0 / eff_ac_dc)
+        else:
+            ac_in = self._add_inverter_pwl_transfer(
+                constraints, "inv_curve_ac_dc", p_ac_dc, curve_ac_dc, 1 - is_dc_sourcing
+            )
+
         # AC Bus Balance
         # p_hybrid == converted_DC_to_AC - converted_AC_to_DC
-        constraints.append(
-            p_hybrid_inverter == (p_dc_ac * eff_dc_ac) - (p_ac_dc * (1.0 / eff_ac_dc))
-        )
+        constraints.append(p_hybrid_inverter == ac_out - ac_in)
 
-        # Enforce Binary Logic (Cannot source and sink DC simultaneously)
-        constraints.append(p_ac_dc <= (1 - is_dc_sourcing) * p_ac_dc_max)
-        constraints.append(p_dc_ac <= is_dc_sourcing * p_dc_ac_max)
+        # Enforce Binary Logic (Cannot source and sink DC simultaneously).
+        # A curved direction is limited on its AC side (the curve's last AC point
+        # is enforced by the transfer segments); a scalar direction keeps the
+        # legacy DC-side bound.
+        if curve_ac_dc is None:
+            constraints.append(p_ac_dc <= (1 - is_dc_sourcing) * p_ac_dc_max)
+        else:
+            constraints.append(ac_in <= (1 - is_dc_sourcing) * p_nom_inverter_input)
+        if curve_dc_ac is None:
+            constraints.append(p_dc_ac <= is_dc_sourcing * p_dc_ac_max)
+        else:
+            constraints.append(ac_out <= is_dc_sourcing * p_nom_inverter_output)
 
         # Stress Cost
         if inv_stress_conf and inv_stress_conf["active"]:
@@ -3069,6 +3530,17 @@ class Optimization:
             # Charge limit based on binary E[k] (1-E[k])
             # p_sto_neg[k] >= -1/eff * max * (1-E[k])  --> (p_sto_neg is negative)
             constraints.append(p_sto_neg[k] >= -(1 / eff_chg) * max_chg * (1 - E[k]))
+
+            # Availability window (EV / V2G): per-timestep power ceilings.
+            # Redundant at their defaults (the plain power limits); zero while
+            # the battery is not connected, which freezes its SoC.
+            constraints.append(p_sto_pos[k] <= eff_dis * self.param_batt_discharge_ceiling[k])
+            constraints.append(p_sto_neg[k] >= -(1 / eff_chg) * self.param_batt_charge_ceiling[k])
+            # Energy delivered by this battery over the horizon (Wh, battery side)
+            constraints.append(
+                cp.sum(p_sto_pos[k]) * (self.time_step / eff_dis)
+                <= self.param_batt_discharge_energy_max[k]
+            )
 
             # SOC Constraints (Vectorized Accumulation)
 
@@ -3305,6 +3777,53 @@ class Optimization:
                 battery_first_penalty >= p_grid_pos - cp.multiply(max_from_grid, import_gate)
             )
 
+    # ------------------------------------------------------------------
+    # Shared thermal-comfort building blocks (used by the classic
+    # thermal_config, the thermal_battery, and the shared-tank models, to
+    # avoid re-implementing the same min/max bounds, overshoot indicator and
+    # comfort penalty three times). Behaviour-preserving extraction.
+    # ------------------------------------------------------------------
+    def _add_temp_bound(self, constraints, predicted_temp, config_list, param, n, lower):
+        """Per-step hard temperature bound (lower=True -> min, else max), skipping
+        index 0 (pinned by start_temperature) and any None/nan entries (an
+        unbounded step). Uses a cp.Parameter when given (warm-start), else the raw
+        config values."""
+        if not config_list:
+            return
+        valid = [
+            i for i, v in enumerate(config_list) if v is not None and not np.isnan(v) and 0 < i < n
+        ]
+        if not valid:
+            return
+        rhs = param[valid] if param is not None else np.array([config_list[i] for i in valid])
+        constraints.append(predicted_temp[valid] >= rhs if lower else predicted_temp[valid] <= rhs)
+
+    def _overshoot_indicator(self, constraints, predicted_temp, overshoot, sense, big_m, name, n):
+        """Two-sided big-M indicator: is_overshoot[t] == 1 iff the temperature is
+        past the overshoot threshold (above it for sense='heat'). The caller adds
+        the model-specific power suppression that links it to the load."""
+        is_overshoot = cp.Variable(n, boolean=True, name=name)
+        if sense == "heat":
+            constraints.append(predicted_temp - overshoot - big_m * is_overshoot <= 0)
+            constraints.append(predicted_temp - overshoot + big_m * (1 - is_overshoot) >= 0)
+        else:
+            constraints.append(predicted_temp - overshoot + big_m * is_overshoot >= 0)
+            constraints.append(predicted_temp - overshoot - big_m * (1 - is_overshoot) <= 0)
+        return is_overshoot
+
+    def _comfort_penalty(self, predicted_temp, desired_list, param, penalty_factor, sense_coeff, n):
+        """Comfort-shortfall penalty toward a desired band: prices only deviation
+        below desired (heat) / above (cool). Returns the summed penalty term, or
+        None when there is no valid target."""
+        valid = [
+            i for i, v in enumerate(desired_list) if v is not None and not np.isnan(v) and 0 < i < n
+        ]
+        if not valid:
+            return None
+        target = param[valid] if param is not None else np.array([desired_list[i] for i in valid])
+        deviation = (predicted_temp[valid] - target) * sense_coeff
+        return cp.sum(-cp.pos(-deviation * penalty_factor))
+
     def _add_thermal_load_constraints(self, constraints, k, data_opt, def_init_temp):
         """
         Handle constraints for thermal deferrable loads (Vectorized).
@@ -3399,110 +3918,78 @@ class Optimization:
             )
 
         # Startup "Dead Zone" Dynamics
+        # This horizon's own power has not arrived yet, but heat committed before the
+        # horizon still can: prior_heat is that in-flight input power (W, oldest
+        # first), converted by the same heat_factor as p_deferrable. Zero when absent,
+        # so a plain day-ahead solve keeps its cold-start assumption.
+        prior_heat = self._resolve_prior_heat(
+            hc.get("prior_heat"), L, f"Load {k}", full_lag=int(thermal_inertia / self.time_step)
+        )
         if L > 0:
             constraints.append(
                 predicted_temp[1 : 1 + L]
-                == predicted_temp[:L] - (cool_factor * (predicted_temp[:L] - outdoor_temp[:L]))
+                == predicted_temp[:L]
+                + (prior_heat * sense_coeff * heat_factor)
+                - (cool_factor * (predicted_temp[:L] - outdoor_temp[:L]))
             )
 
-        # Min/Max Temperature Constraints
-        # Only add constraints if config actually specifies min/max temps
-        # Skip index 0 (already constrained by start_temperature)
-        min_temps_config = hc.get("min_temperatures", [])
-        max_temps_config = hc.get("max_temperatures", [])
+        # Hard min/max temperature bounds (shared helper).
+        self._add_temp_bound(
+            constraints,
+            predicted_temp,
+            hc.get("min_temperatures", []),
+            min_temps_param,
+            required_len,
+            lower=True,
+        )
+        self._add_temp_bound(
+            constraints,
+            predicted_temp,
+            hc.get("max_temperatures", []),
+            max_temps_param,
+            required_len,
+            lower=False,
+        )
 
-        if min_temps_config:
-            if min_temps_param is not None:
-                # Use parameter (allows warm-start updates), but only for valid config indices
-                valid_indices = [
-                    i
-                    for i, v in enumerate(min_temps_config)
-                    if v is not None and i < required_len and i > 0
-                ]
-                if valid_indices:
-                    constraints.append(
-                        predicted_temp[valid_indices] >= min_temps_param[valid_indices]
-                    )
-            else:
-                valid_indices = [
-                    i
-                    for i, v in enumerate(min_temps_config)
-                    if v is not None and i < required_len and i > 0
-                ]
-                if valid_indices:
-                    limit_vals = np.array([min_temps_config[i] for i in valid_indices])
-                    constraints.append(predicted_temp[valid_indices] >= limit_vals)
-
-        if max_temps_config:
-            if max_temps_param is not None:
-                valid_indices = [
-                    i
-                    for i, v in enumerate(max_temps_config)
-                    if v is not None and i < required_len and i > 0
-                ]
-                if valid_indices:
-                    constraints.append(
-                        predicted_temp[valid_indices] <= max_temps_param[valid_indices]
-                    )
-            else:
-                valid_indices = [
-                    i
-                    for i, v in enumerate(max_temps_config)
-                    if v is not None and i < required_len and i > 0
-                ]
-                if valid_indices:
-                    limit_vals = np.array([max_temps_config[i] for i in valid_indices])
-                    constraints.append(predicted_temp[valid_indices] <= limit_vals)
-
-        # Overshoot Logic
-        penalty_expr = 0
+        # Soft comfort: shared overshoot indicator + load-specific power
+        # suppression + shared comfort penalty.
+        total_penalty = 0
         desired_temps_list = hc.get("desired_temperatures", [])
-
         if desired_temps_list and overshoot_temperature is not None:
-            is_overshoot = cp.Variable(required_len, boolean=True, name=f"is_overshoot_{k}")
-            big_m = 100
-            if sense == "heat":
-                constraints.append(
-                    predicted_temp - overshoot_temperature - (big_m * is_overshoot) <= 0
-                )
-                constraints.append(
-                    predicted_temp - overshoot_temperature + (big_m * (1 - is_overshoot)) >= 0
-                )
+            is_overshoot = self._overshoot_indicator(
+                constraints,
+                predicted_temp,
+                overshoot_temperature,
+                sense,
+                100,
+                f"is_overshoot_{k}",
+                required_len,
+            )
+            # Suppress heating past the overshoot threshold: no heat at step t when
+            # the temperature at t+1 is beyond it. p_def_bin2 only tracks power for
+            # semi-continuous loads; a continuous load's p_def_bin2 is never linked
+            # to its power, so bound the power itself, with the same timing. (Gating
+            # on the temperature at t instead would forbid heating at t=0 whenever
+            # the measured start is above the threshold, even when the floor at t+1
+            # needs heat.)
+            if self.optim_conf["treat_deferrable_load_as_semi_cont"][k]:
+                constraints.append(is_overshoot[1:] + p_def_bin2[:-1] <= 1)
             else:
-                constraints.append(
-                    predicted_temp - overshoot_temperature - (-big_m * is_overshoot) >= 0
-                )
-                constraints.append(
-                    predicted_temp - overshoot_temperature + (-big_m * (1 - is_overshoot)) <= 0
-                )
-
-            constraints.append(is_overshoot[1:] + p_def_bin2[:-1] <= 1)
-
-            # Penalty Calculation
-            # Filter for valid indices (not None, within bounds, skip index 0)
-            penalty_factor = hc.get("penalty_factor", 10)
-            valid_indices = [
-                i
-                for i, val in enumerate(desired_temps_list)
-                if val is not None and i < required_len and i > 0
-            ]
-            if valid_indices:
-                if desired_temps_param is not None:
-                    # Use parameter for actual values (allows warm-start value updates)
-                    deviation = (
-                        predicted_temp[valid_indices] - desired_temps_param[valid_indices]
-                    ) * sense_coeff
-                else:
-                    # Fallback to raw values
-                    des_temps = np.array([desired_temps_list[i] for i in valid_indices])
-                    deviation = (predicted_temp[valid_indices] - des_temps) * sense_coeff
-                penalty_expr = -cp.pos(-deviation * penalty_factor)
+                constraints.append(p_deferrable[:-1] <= nominal_power * (1 - is_overshoot[1:]))
+            pen = self._comfort_penalty(
+                predicted_temp,
+                desired_temps_list,
+                desired_temps_param,
+                hc.get("penalty_factor", 10),
+                sense_coeff,
+                required_len,
+            )
+            total_penalty = pen if pen is not None else 0
 
         # Semi-Continuous Constraint
         if self.optim_conf["treat_deferrable_load_as_semi_cont"][k]:
             constraints.append(p_deferrable == p_def_bin2 * nominal_power)
 
-        total_penalty = cp.sum(penalty_expr) if not isinstance(penalty_expr, int) else 0
         return predicted_temp, None, total_penalty
 
     @staticmethod
@@ -3527,6 +4014,76 @@ class Optimization:
         unchanged. Accepts a scalar or a NumPy array.
         """
         return loss_kw * self.time_step
+
+    def _resolve_prior_heat(self, raw, lag_steps, label, full_lag=None):
+        """Return the length-`lag_steps` initial condition for a lagged thermal model.
+
+        With `thermal_inertia` the heat produced at step t only reaches the store at
+        t+1+L, so the first L steps of a fresh solve have no source term. That is
+        self-consistent for a one-shot day-ahead plan (nothing precedes the horizon),
+        but a rolling MPC re-solve starts mid-flight: heat committed by the previous
+        runs is physically still on its way. Without it the model's temperature over
+        that window is independent of any power choice, so the optimizer cannot see
+        the effect of its own past actions and keeps re-injecting (#539).
+
+        `raw` is that in-flight heat, oldest first, in the unit the caller's model
+        speaks (thermal kWh per step for shared tanks, input W for the per-load
+        path). A short list is right-aligned - it is the MOST RECENT steps that are
+        still in flight - and a long one keeps its last `lag_steps` entries; either
+        is logged. None or empty yields zeros, i.e. exactly the previous behaviour.
+        With no lag the value is ignored, which is logged too.
+
+        `full_lag` is the lag before it was clamped to the horizon. When it is
+        longer than `lag_steps`, the list is aligned to the full lag and the
+        OLDEST in-flight values are used: they are the ones that arrive within
+        the horizon.
+        """
+        prior = np.zeros(max(int(lag_steps), 0))
+        if raw is None:
+            return prior
+        if prior.size == 0:
+            self.logger.info(
+                "%s: prior_heat ignored, there is no thermal_inertia lag to seed", label
+            )
+            return prior
+        if isinstance(raw, str) or not isinstance(raw, list | tuple | np.ndarray):
+            raise ValueError(
+                f"{label}: prior_heat must be a list of numbers, got {type(raw).__name__}"
+            )
+        if any(isinstance(v, bool | np.bool_) for v in raw):
+            # float(True) would be 1.0: a boolean is not heat.
+            raise ValueError(f"{label}: prior_heat entries must be numbers, not booleans")
+        try:
+            vals = [float(v) for v in raw]
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{label}: prior_heat entries must be numeric ({exc})") from exc
+        if any(not np.isfinite(v) for v in vals):
+            raise ValueError(f"{label}: prior_heat entries must be finite")
+        if any(v < 0 for v in vals):
+            raise ValueError(
+                f"{label}: prior_heat entries must be >= 0 (magnitude of delivered heat; "
+                "the tank's sense already sets the direction)"
+            )
+        # The heat in flight is a queue of the full lag; the horizon (clamped lag)
+        # sees its oldest part.
+        queue = np.zeros(max(int(full_lag or 0), prior.size))
+        if len(vals) != queue.size:
+            # Not an error (a short list is expected after a restart), but the
+            # alignment must not be silent: a misjudged lag shifts the heat in flight.
+            self.logger.info(
+                "%s: prior_heat has %d values for a %d-step lag; %s",
+                label,
+                len(vals),
+                queue.size,
+                "using the most recent ones"
+                if len(vals) > queue.size
+                else "aligned to the most recent steps, earlier ones are 0",
+            )
+        vals = vals[-queue.size :]
+        if vals:
+            queue[queue.size - len(vals) :] = vals
+        prior[:] = queue[: prior.size]
+        return prior
 
     def _resolve_draw_off_demand(self, hc, base_loss, required_len):
         """Return (demand_arr, loss_arr) if hot-water-tank mode (draw_off_demand present), else None."""
@@ -3558,6 +4115,49 @@ class Optimization:
         if solar_gain is None:
             return heating_demand
         return heating_demand - solar_gain
+
+    def _thermal_battery_bound_relief(
+        self, k, hc, start_temperature, thermal_balance, thermal_losses, min_temps, max_temps, n
+    ):
+        """Room (deg C) the bound of a thermal_battery gets this run: 0.0 when a
+        plan can keep it, THERMAL_FREE_GAIN_RELIEF when free gains or losses alone
+        carry the store past it (the maximum when heating, the minimum when
+        cooling). See _free_gain_breach."""
+        sense = utils.normalize_heat_cool_mode(
+            hc.get("sense") or "heat", field_name="sense", context=f"Load {k} thermal_battery"
+        )
+        conversion = 3600 / (hc.get("density", 2400) * hc.get("heat_capacity", 0.88) * hc["volume"])
+        # Heat already in the inertia filter keeps arriving whatever the plan does.
+        tail = None
+        tau_hours = float(hc.get("thermal_inertia_time_constant", 0.0) or 0.0)
+        if tau_hours > 0:
+            q_start = self.param_thermal.get(k, {}).get("q_input_start", 0.0)
+            q_start = float(getattr(q_start, "value", q_start) or 0.0)
+            tail = q_start * (1.0 - min(self.time_step / tau_hours, 1.0)) ** np.arange(n)
+        is_cool = sense == "cool"
+        breach = self._free_gain_breach(
+            start_temperature=start_temperature,
+            conversion=conversion,
+            net_out=np.asarray(thermal_balance, dtype=float)
+            + np.asarray(thermal_losses, dtype=float),
+            zone_loss=None,
+            outdoor=None,
+            hold=max_temps if is_cool else min_temps,
+            limit=min_temps if is_cool else max_temps,
+            n=n,
+            sense=sense,
+            source_tail=tail,
+        )
+        if breach <= 1e-6:
+            return 0.0
+        self.logger.info(
+            "Load %s: free gains or losses alone carry the thermal_battery %.1f C past its "
+            "%s - that bound is priced instead of hard this run",
+            k,
+            breach,
+            "minimum" if is_cool else "maximum",
+        )
+        return max(THERMAL_FREE_GAIN_RELIEF, float(breach) * 1.5 + 10.0)
 
     def _add_thermal_battery_constraints(self, constraints, k, data_opt, p_load):
         """
@@ -3625,6 +4225,7 @@ class Optimization:
             heatpump_cops = params["heatpump_cops"]
             thermal_losses = params["thermal_losses"]
             heating_demand = params["heating_demand"]
+            thermal_balance = params["thermal_balance"]
             min_temps_param = params["min_temps"]
             max_temps_param = params["max_temps"]
 
@@ -3645,6 +4246,7 @@ class Optimization:
             hot_water = self._resolve_draw_off_demand(hc, base_loss, required_len)
             if hot_water is not None:
                 params["heating_demand"].value, params["thermal_losses"].value = hot_water
+                params["thermal_balance"].value = params["heating_demand"].value
             else:
                 losses = utils.calculate_thermal_loss_signed(
                     outdoor_temperature_forecast=outdoor_temp_arr.tolist(),
@@ -3677,7 +4279,7 @@ class Optimization:
                             vals = np.concatenate((vals, np.zeros(required_len - len(vals))))
                         solar_irradiance = vals[:required_len]
 
-                    demand = utils.calculate_heating_demand_physics(
+                    balance = utils.calculate_thermal_balance_physics(
                         u_value=hc["u_value"],
                         envelope_area=hc["envelope_area"],
                         ventilation_rate=hc["ventilation_rate"],
@@ -3692,7 +4294,7 @@ class Optimization:
                         internal_gains_factor=internal_gains_factor,
                         sense=sense,
                     )
-                    params["heating_demand"].value = np.array(demand[:required_len])
+                    params["thermal_balance"].value = np.array(balance[:required_len])
 
                     gains_info = []
                     if solar_irradiance is not None:
@@ -3732,13 +4334,18 @@ class Optimization:
                         annual_reference_hdd=annual_reference_hdd,
                         optimization_time_step=int(self.freq.total_seconds() / 60),
                     )
-                    params["heating_demand"].value = np.array(demand[:required_len])
+                    params["thermal_balance"].value = np.array(demand[:required_len])
 
             # Surface solar gain (pool, outdoor tank, solar-thermal). Subtracts
-            # absorbed irradiance from the residual heating demand. No-op when
+            # absorbed irradiance from the signed balance. No-op when
             # solar_absorption_area is unset.
-            params["heating_demand"].value = self._apply_surface_solar_gain(
-                hc, data_opt, params["heating_demand"].value, required_len
+            params["thermal_balance"].value = self._apply_surface_solar_gain(
+                hc, data_opt, params["thermal_balance"].value, required_len
+            )
+            params["heating_demand"].value = (
+                params["thermal_balance"].value
+                if sense == "cool"
+                else np.maximum(params["thermal_balance"].value, 0.0)
             )
 
             # Set min/max temperature parameters
@@ -3748,6 +4355,22 @@ class Optimization:
             params["max_temps"].value = self._pad_temp_array(
                 max_temperatures_list, required_len, 26.0
             )
+            bound_relief = params["bound_relief"]
+            bound_relief.value = np.full(
+                required_len,
+                self._thermal_battery_bound_relief(
+                    k,
+                    hc,
+                    start_temp_float,
+                    params["thermal_balance"].value,
+                    params["thermal_losses"].value,
+                    params["min_temps"].value,
+                    params["max_temps"].value,
+                    required_len,
+                ),
+            )
+            if bound_relief.value[0] > 0:
+                self._thermal_relief_loads.add(k)
 
         else:
             # Fallback for loads not in param dict (shouldn't happen normally)
@@ -3765,7 +4388,8 @@ class Optimization:
             # draw_off_demand units: kWh per timestep (see parameterized path comment)
             hot_water = self._resolve_draw_off_demand(hc, base_loss, required_len)
             if hot_water is not None:
-                heating_demand, thermal_losses = hot_water
+                raw_demand, thermal_losses = hot_water
+                thermal_balance = raw_demand
             else:
                 # Signed kW magnitude -> kWh/timestep (see _loss_kw_to_timestep_energy).
                 thermal_losses = self._loss_kw_to_timestep_energy(
@@ -3783,8 +4407,23 @@ class Optimization:
                     key in hc
                     for key in ["u_value", "envelope_area", "ventilation_rate", "heated_volume"]
                 ):
-                    indoor_target_temp = hc.get("indoor_target_temperature", 20.0)
-                    demand = utils.calculate_heating_demand_physics(
+                    indoor_target_temp = hc.get(
+                        "indoor_target_temperature",
+                        min_temperatures_list[0] if min_temperatures_list else 20.0,
+                    )
+                    window_area = hc.get("window_area", None)
+                    shgc = hc.get("shgc", 0.6)
+                    internal_gains_factor = hc.get("internal_gains_factor", 0.0)
+
+                    internal_gains_forecast = p_load if internal_gains_factor > 0 else None
+                    solar_irradiance = None
+                    if "ghi" in data_opt.columns and window_area is not None:
+                        vals = data_opt["ghi"].values
+                        if len(vals) < required_len:
+                            vals = np.concatenate((vals, np.zeros(required_len - len(vals))))
+                        solar_irradiance = vals[:required_len]
+
+                    balance = utils.calculate_thermal_balance_physics(
                         u_value=hc["u_value"],
                         envelope_area=hc["envelope_area"],
                         ventilation_rate=hc["ventilation_rate"],
@@ -3792,8 +4431,14 @@ class Optimization:
                         indoor_target_temperature=indoor_target_temp,
                         outdoor_temperature_forecast=outdoor_temp_arr.tolist(),
                         optimization_time_step=int(self.freq.total_seconds() / 60),
+                        solar_irradiance_forecast=solar_irradiance,
+                        window_area=window_area,
+                        shgc=shgc,
+                        internal_gains_forecast=internal_gains_forecast,
+                        internal_gains_factor=internal_gains_factor,
                         sense=sense,
                     )
+                    thermal_balance = balance
                 else:
                     if sense == "cool":
                         self.logger.warning(
@@ -3812,13 +4457,27 @@ class Optimization:
                         annual_reference_hdd=hc.get("annual_reference_hdd", 3000.0),
                         optimization_time_step=int(self.freq.total_seconds() / 60),
                     )
-                heating_demand = np.array(demand[:required_len])
+                    thermal_balance = demand
+                thermal_balance = np.array(thermal_balance[:required_len])
             # Surface solar gain (fallback path - mirrors parameterized path).
-            heating_demand = self._apply_surface_solar_gain(
-                hc, data_opt, heating_demand, required_len
+            thermal_balance = self._apply_surface_solar_gain(
+                hc, data_opt, thermal_balance, required_len
+            )
+            heating_demand = (
+                thermal_balance if sense == "cool" else np.maximum(thermal_balance, 0.0)
             )
             min_temps_param = None
             max_temps_param = None
+            bound_relief = self._thermal_battery_bound_relief(
+                k,
+                hc,
+                start_temp_float,
+                thermal_balance,
+                thermal_losses,
+                min_temperatures_list,
+                max_temperatures_list,
+                required_len,
+            )
 
         # Build constraints using parameters
         predicted_temp_thermal = cp.Variable(required_len, name=f"temp_thermal_batt_{k}")
@@ -3893,15 +4552,14 @@ class Optimization:
 
             # Temperature uses filtered Q_input instead of raw heat
             # sense_coeff: +1 for heating (pump adds heat), -1 for cooling (pump removes heat)
-            # Sign convention: heating_demand is >=0 for heating and <=0 for
-            # cooling (calculate_heating_demand_physics returns a signed heat
-            # gain), so subtracting it cools the tank when heating and warms it
-            # when cooling, matching the thermal_losses sign convention.
+            # Sign convention: heating-mode demand is kept non-negative for reporting,
+            # while thermal_balance is signed for temperature dynamics. Subtracting
+            # a negative balance warms the zone when gains exceed losses.
             constraints.append(
                 predicted_temp_thermal[1:]
                 == predicted_temp_thermal[:-1]
                 + conversion
-                * (sense_coeff * q_input[:-1] - heating_demand[:-1] - thermal_losses[:-1])
+                * (sense_coeff * q_input[:-1] - thermal_balance[:-1] - thermal_losses[:-1])
             )
 
             # Store reference for auto-persistence on cache hit
@@ -3918,31 +4576,41 @@ class Optimization:
                 * (
                     sense_coeff
                     * (cp.multiply(heatpump_cops[:-1], p_deferrable[:-1]) / 1000 * self.time_step)
-                    - heating_demand[:-1]
+                    - thermal_balance[:-1]
                     - thermal_losses[:-1]
                 )
             )
 
-        # Min/Max Temperature Constraints using parameters
-        if min_temps_param is not None:
-            constraints.append(predicted_temp_thermal[1:] >= min_temps_param[1:])
-        elif valid_indices := [
-            i
-            for i, v in enumerate(min_temperatures_list)
-            if v is not None and i < required_len and i > 0
-        ]:
-            limit_vals = np.array([min_temperatures_list[i] for i in valid_indices])
-            constraints.append(predicted_temp_thermal[valid_indices] >= limit_vals)
-
-        if max_temps_param is not None:
-            constraints.append(predicted_temp_thermal[1:] <= max_temps_param[1:])
-        elif valid_indices := [
-            i
-            for i, v in enumerate(max_temperatures_list)
-            if v is not None and i < required_len and i > 0
-        ]:
-            limit_vals = np.array([max_temperatures_list[i] for i in valid_indices])
-            constraints.append(predicted_temp_thermal[valid_indices] <= limit_vals)
+        # Min/Max Temperature Constraints using parameters. Free gains or losses
+        # can force one of them (the maximum when heating, the minimum when
+        # cooling); for a load where that has happened, that bound gives way by
+        # `bound_relief` (zero on a run where a plan can keep it) and what lies
+        # beyond it is priced. Every other bound keeps its hard form.
+        relieved = k in self._thermal_relief_loads if k in self.param_thermal else bound_relief > 0
+        relief_term = None
+        for lower, param, values in (
+            (True, min_temps_param, min_temperatures_list),
+            (False, max_temps_param, max_temperatures_list),
+        ):
+            if param is not None:
+                temp, limit = predicted_temp_thermal[1:], param[1:]
+            else:
+                valid_indices = [
+                    i for i, v in enumerate(values) if v is not None and i < required_len and i > 0
+                ]
+                if not valid_indices:
+                    continue
+                temp = predicted_temp_thermal[valid_indices]
+                limit = np.array([values[i] for i in valid_indices])
+            if relieved and lower == (sense == "cool"):
+                beyond = (limit - temp) if lower else (temp - limit)
+                relief_term = cp.sum(cp.pos(beyond))
+                # A cached problem keeps the bound, with room that follows each
+                # run; the uncached form is rebuilt every run and needs none.
+                if param is not None:
+                    constraints.append(beyond <= bound_relief[1:])
+            else:
+                constraints.append(temp >= limit if lower else temp <= limit)
 
         # Return heating_demand array for result building
         heating_demand_arr = (
@@ -3958,61 +4626,54 @@ class Optimization:
         sense_coeff = 1 if sense == "heat" else -1
 
         if desired_temps_list and overshoot_temperature is not None:
-            is_overshoot = cp.Variable(required_len, boolean=True, name=f"is_overshoot_tb_{k}")
-            big_m = 100
-
-            if sense == "heat":
-                constraints.append(
-                    predicted_temp_thermal - overshoot_temperature - (big_m * is_overshoot) <= 0
-                )
-                constraints.append(
-                    predicted_temp_thermal - overshoot_temperature + (big_m * (1 - is_overshoot))
-                    >= 0
-                )
-            else:
-                constraints.append(
-                    predicted_temp_thermal - overshoot_temperature - (-big_m * is_overshoot) >= 0
-                )
-                constraints.append(
-                    predicted_temp_thermal - overshoot_temperature + (-big_m * (1 - is_overshoot))
-                    <= 0
-                )
-
-            # Prevent heating when in overshoot — use p_def_bin2 if available, else bound power directly
+            is_overshoot = self._overshoot_indicator(
+                constraints,
+                predicted_temp_thermal,
+                overshoot_temperature,
+                sense,
+                100,
+                f"is_overshoot_tb_{k}",
+                required_len,
+            )
+            # Prevent heating when in overshoot - p_def_bin2 if semi-cont, else bound power.
             if self.optim_conf["treat_deferrable_load_as_semi_cont"][k]:
                 p_def_bin2 = self.vars["p_def_bin2"][k]
                 constraints.append(is_overshoot[1:] + p_def_bin2[:-1] <= 1)
             else:
-                # For non-semi-cont loads, suppress power directly when in overshoot
                 nominal_power = self.optim_conf["nominal_power_of_deferrable_loads"][k]
                 if isinstance(nominal_power, list):
                     nominal_power = max(nominal_power)
                 constraints.append(p_deferrable <= nominal_power * (1 - is_overshoot))
 
-            # Penalty calculation
-            penalty_factor = hc.get("penalty_factor", 10)
-            if valid_indices := [
-                i
-                for i, val in enumerate(desired_temps_list)
-                if val is not None and i < required_len and i > 0
-            ]:
-                if k in self.param_thermal and "desired_temps" in self.param_thermal[k]:
-                    desired_temps_param = self.param_thermal[k]["desired_temps"]
-                    deviation = (
-                        predicted_temp_thermal[valid_indices] - desired_temps_param[valid_indices]
-                    ) * sense_coeff
-                else:
-                    des_temps = np.array([desired_temps_list[i] for i in valid_indices])
-                    deviation = (predicted_temp_thermal[valid_indices] - des_temps) * sense_coeff
-
-                penalty_expr = -cp.pos(-deviation * penalty_factor)
+            desired_param = (
+                self.param_thermal[k]["desired_temps"]
+                if k in self.param_thermal and "desired_temps" in self.param_thermal[k]
+                else None
+            )
+            pen = self._comfort_penalty(
+                predicted_temp_thermal,
+                desired_temps_list,
+                desired_param,
+                hc.get("penalty_factor", 10),
+                sense_coeff,
+                required_len,
+            )
+            penalty_expr = pen if pen is not None else 0
 
         penalty_term = None if isinstance(penalty_expr, int) else cp.sum(penalty_expr)
+        if relief_term is not None:
+            relief_term = -SHARED_TANK_START_RECOVERY_PENALTY * relief_term
+            penalty_term = relief_term if penalty_term is None else penalty_term + relief_term
         return predicted_temp_thermal, heating_demand_arr, q_input, penalty_term
 
     def _get_shared_thermal_tanks(self) -> list[dict]:
         """Return the configured shared_thermal_tanks list (or empty)."""
         return list(self.optim_conf.get("shared_thermal_tanks", []) or [])
+
+    def _get_tank_transfers(self) -> list[dict]:
+        """Return tank->tank heat transfers (e.g. a buffer feeding a room through
+        emitters). Each: {from, to, transfer_coefficient (kW/K), max_transfer_power (W)}."""
+        return list(self.optim_conf.get("tank_transfers", []) or [])
 
     def _load_shared_tank_membership(self) -> dict[int, int]:
         """Map load index -> shared_thermal_tanks index (-1 if standalone)."""
@@ -4031,13 +4692,218 @@ class Optimization:
         cfg = self.optim_conf["def_load_config"][k]
         return cfg.get("thermal_source") or cfg.get("thermal_battery") or {}
 
-    def _add_shared_thermal_tank_constraints(self, constraints, tank_idx, data_opt, p_load):
+    @staticmethod
+    def _free_gain_breach(
+        start_temperature,
+        conversion,
+        net_out,
+        zone_loss,
+        outdoor,
+        hold,
+        limit,
+        n,
+        sense,
+        source_tail=None,
+    ):
+        """How far (deg C) free gains or losses alone carry a store past a hard bound.
+
+        Steps the store forward with every source off. When heating, that is the
+        lowest path any plan can follow, held up only by the hard minimums
+        (`hold`): where it lies above a hard maximum (`limit`), no plan can keep
+        that maximum. When cooling it is the highest path, held down by the hard
+        maximums (`hold`) and compared with the hard minimums (`limit`).
+
+        `net_out` is the heat leaving the store per step with the sources off
+        (demand plus flat loss, kWh, negative for a net gain); `zone_loss` is
+        UA * dt (kWh/K per step) for a state-dependent loss, else None;
+        `source_tail` is source heat already on its way (kWh per step, from the
+        first step; steps past its end get none). Returns
+        the largest excess, 0.0 when the bound can be kept.
+        """
+
+        def _hard(values, t):
+            if values is None or t >= len(values) or values[t] is None:
+                return None
+            v = float(values[t])
+            return None if np.isnan(v) else v
+
+        is_cool = sense == "cool"
+        temp = float(start_temperature)
+        breach = 0.0
+        for t in range(n - 1):
+            heat = -float(net_out[t])
+            if zone_loss is not None:
+                heat -= zone_loss * (temp - float(outdoor[t]))
+            if source_tail is not None and t < len(source_tail):
+                heat += (-1.0 if is_cool else 1.0) * float(source_tail[t])
+            temp += conversion * heat
+            held = _hard(hold, t + 1)
+            if held is not None:
+                temp = min(temp, held) if is_cool else max(temp, held)
+            bound = _hard(limit, t + 1)
+            if bound is not None:
+                breach = max(breach, (bound - temp) if is_cool else (temp - bound))
+        return breach
+
+    def _shared_tank_temp_range(self, tank_id):
+        """(lowest, highest) temperature a shared tank can reach this run (see
+        _shared_tank_reachable_range). Used to size big-M terms."""
+        reach = getattr(self, "_shared_tank_reach", {}).get(tank_id)
+        if reach is not None:
+            return reach
+        return -SHARED_TANK_CAP_BIG_M_TEMP, 2 * SHARED_TANK_CAP_BIG_M_TEMP
+
+    @staticmethod
+    def _shared_tank_reachable_range(
+        start_temperature,
+        conversion,
+        source_heat,
+        sense,
+        lag,
+        transfer_heat,
+        demand,
+        flat_loss,
+        zone_loss,
+        outdoor,
+        min_temperatures,
+        max_temperatures,
+        n,
+    ):
+        """(lowest, highest) temperature a shared tank can physically reach.
+
+        Steps the same dynamics forward with the most heat in and the most heat
+        out each step (sources at full power, every transfer at its maximum, the
+        demand and the loss), and clips to the hard bounds where a step has one.
+        A step without a hard bound (a short or null list, a floor priced for
+        recovery or in the lag dead zone) stays open, so a big-M built from this
+        range is valid at any temperature the plan can produce. Heat quantities
+        are kWh per step; zone_loss is UA * dt (kWh/K per step).
+        """
+
+        def _hard(values, t):
+            if not values or t >= len(values) or values[t] is None:
+                return None
+            v = float(values[t])
+            return None if np.isnan(v) else v
+
+        lo = hi = float(start_temperature)
+        low, high = lo, hi
+        for t in range(n - 1):
+            heat = source_heat if t >= lag else 0.0
+            gain = transfer_heat + max(-float(demand[t]), 0.0)
+            drain = transfer_heat + max(float(demand[t]), 0.0)
+            if sense == "heat":
+                gain += heat
+            else:
+                drain += heat
+            if flat_loss is not None:
+                gain += max(-float(flat_loss[t]), 0.0)
+                drain += max(float(flat_loss[t]), 0.0)
+                next_lo, next_hi = lo, hi
+            else:
+                # T + a * (outdoor - T) is linear in T: its extremes lie at the
+                # ends of the current range (a > 1 flips them).
+                a = conversion * zone_loss
+                ends = [(1 - a) * v + a * float(outdoor[t]) for v in (lo, hi)]
+                next_lo, next_hi = min(ends), max(ends)
+            lo = next_lo - conversion * drain
+            hi = next_hi + conversion * gain
+            floor, ceiling = _hard(min_temperatures, t + 1), _hard(max_temperatures, t + 1)
+            if floor is not None:
+                lo = max(lo, floor)
+            if ceiling is not None:
+                hi = min(hi, ceiling)
+            hi = max(hi, lo)
+            low, high = min(low, lo), max(high, hi)
+        return low, high
+
+    def _warn_bound_beyond_every_overshoot(
+        self, tank_id, load_ids, source_overshoots, sense, min_temperatures, max_temperatures
+    ):
+        """Warn when a resolved bound lies beyond every source's threshold.
+
+        A continuous source does not heat (or cool) in a step that would end
+        beyond its overshoot_temperature, so when every source of the tank is
+        continuous and has one, a floor above all of them (a ceiling below them
+        when cooling) can only be held by a tank that already starts there. The
+        compiler checks the static list; this checks the bound the solver uses,
+        including a weather-resolved min_temperature_curve.
+        """
+        if not source_overshoots or any(o is None for o in source_overshoots):
+            return
+        if any(self.optim_conf["treat_deferrable_load_as_semi_cont"][k] for k in load_ids):
+            return
+        is_cool = sense == "cool"
+        limit = min(source_overshoots) if is_cool else max(source_overshoots)
+        bounds = max_temperatures if is_cool else min_temperatures
+        name = "max_temperatures" if is_cool else "min_temperatures"
+        for t, val in enumerate(bounds):
+            if t == 0 or val is None:
+                continue
+            if (float(val) < limit) if is_cool else (float(val) > limit):
+                self.logger.warning(
+                    "Shared tank %s: %s[%s]=%s lies beyond the overshoot_temperature "
+                    "(%s) of every source feeding it; overshoot_temperature stops a "
+                    "continuous source in any step that would end beyond it, so only "
+                    "a tank that already starts there can hold that bound.",
+                    tank_id,
+                    name,
+                    t,
+                    val,
+                    limit,
+                )
+                return
+
+    def _warn_capped_level_below_min_power(
+        self, tank_id, k, cop_vals, thermal_cap, n_steps, after_dp=False
+    ):
+        """Warn when a capped source cannot run at some steps.
+
+        Where cap/COP < min_power, `cop * p <= cap` and `p >= min_power * bin` leave
+        OFF as the only feasible state, whether the source is semi-continuous (its
+        ON level is min(nominal, cap/COP)) or continuous, so the source is dropped
+        at those steps. That is physically right (the unit cannot modulate below
+        its floor), but it must not happen silently: warn rather than lower the
+        floor. After the DP refinement, or in the relaxed-LP rebuild, the warning
+        is repeated only when the number of affected steps changed. Returns that
+        number.
+        """
+        cap_over_cop = float(thermal_cap) / np.maximum(np.asarray(cop_vals, dtype=float), 1e-9)
+        min_powers = getattr(self, "_min_power_of_deferrable_loads", None)
+        if min_powers is None:
+            min_powers = self.optim_conf.get("minimum_power_of_deferrable_loads") or []
+        min_power_k = float(min_powers[k]) if k < len(min_powers) and min_powers[k] else 0.0
+        below_min = int(np.count_nonzero(cap_over_cop < min_power_k)) if min_power_k > 0 else 0
+        counts = self.__dict__.setdefault("_capped_below_min_counts", {})
+        repeat = after_dp or getattr(self, "_relaxed_rebuild", False)
+        if repeat and counts.get(k) == below_min:
+            return below_min
+        counts[k] = below_min
+        if below_min > 0:
+            self.logger.warning(
+                "Shared tank '%s': deferrable load %s cannot run at %s/%s steps%s; its "
+                "min_power (%s W) exceeds the level max_thermal_power allows "
+                "(cap/COP), so those steps are forced off.",
+                tank_id,
+                k,
+                below_min,
+                n_steps,
+                " after the DP COP refinement" if after_dp else "",
+                min_power_k,
+            )
+        return below_min
+
+    def _add_shared_thermal_tank_constraints(
+        self, constraints, tank_idx, data_opt, p_load, transfer_vars=None
+    ):
         """Build dynamics for ONE shared thermal tank fed by MULTIPLE sources.
 
         Each source `k` in `tank['load_ids']` contributes
             cop_k[t] * p_deferrable[k][t] / 1000 * dt  (kWh thermal)
         where cop_k is resolved via utils.resolve_thermal_battery_cop (Carnot
-        for heat pumps, flat for constant-efficiency sources like gas).
+        for heat pumps, flat for constant-efficiency sources like gas). A tank may
+        also exchange heat with another tank via `transfer_vars` (e.g. a buffer
+        feeding a room) - the matching transfer power is added/subtracted here.
 
         Returns: (predicted_temp_var, heating_demand_arr, penalty_term) where
         penalty_term is the signed comfort penalty (<= 0, added to the Maximize
@@ -4047,18 +4913,61 @@ class Optimization:
         tank_id = tank.get("id", f"tank{tank_idx}")
         required_len = self.num_timesteps
         load_ids = [int(k) for k in tank.get("load_ids", [])]
-        if not load_ids:
+        # A tank with no sources is still real if another tank feeds it (a room
+        # heated only by the buffer) - build it when it is a transfer endpoint.
+        is_transfer_endpoint = any(
+            tr["from"] == tank_id or tr["to"] == tank_id for tr in self._get_tank_transfers()
+        )
+        if not load_ids and not is_transfer_endpoint:
             return None, None, None
 
-        # Tank physics
-        volume = tank["volume"]
-        density = tank.get("density", 1000)
-        heat_capacity = tank.get("heat_capacity", 4.186)
-        if density <= 0 or heat_capacity <= 0 or volume <= 0:
-            raise ValueError(
-                f"Shared tank {tank_id}: positive volume/density/heat_capacity required"
+        # Tank physics. A building zone can declare its heat capacity directly via
+        # `thermal_mass` (kWh/K); a water store derives it from volume/density/cp.
+        # conversion is degC gained per kWh of net heat (== 1 / heat_capacity).
+        thermal_mass = tank.get("thermal_mass")
+        if thermal_mass is not None:
+            thermal_mass = float(thermal_mass)
+            if thermal_mass <= 0:
+                raise ValueError(f"Shared tank {tank_id}: thermal_mass must be > 0 kWh/K")
+            conversion = 1.0 / thermal_mass
+        else:
+            volume = tank.get("volume")
+            density = tank.get("density", 1000)
+            heat_capacity = tank.get("heat_capacity", 4.186)
+            if volume is None or volume <= 0 or density <= 0 or heat_capacity <= 0:
+                raise ValueError(
+                    f"Shared tank {tank_id}: positive volume/density/heat_capacity "
+                    "(or a thermal_mass) required"
+                )
+            conversion = 3600 / (density * heat_capacity * volume)
+
+        # Optional building-zone behaviour. None/0 keeps the existing fixed-loss,
+        # zero-lag water-tank dynamics unchanged.
+        #   loss_coefficient (kW/K) -> state-dependent loss UA*(T-outdoor)
+        #   thermal_inertia  (h)    -> heat input lags the temperature by L steps
+        loss_coefficient = tank.get("loss_coefficient")
+        if loss_coefficient is not None:
+            loss_coefficient = float(loss_coefficient)
+            if loss_coefficient < 0:
+                raise ValueError(f"Shared tank {tank_id}: loss_coefficient must be >= 0 kW/K")
+        # Same whole-step convention as the per-load thermal_config path (truncate),
+        # clamped to the horizon so the lagged window never runs past it.
+        lag_steps = max(
+            0,
+            min(
+                int(float(tank.get("thermal_inertia", 0.0)) / self.time_step),
+                required_len - 1,
+            ),
+        )
+        if lag_steps > 0 and not load_ids:
+            # The lag applies to this storage's own sources; tank-to-tank transfers
+            # are not lagged, so on a storage fed only by transfers it does nothing.
+            self.logger.warning(
+                "Shared tank '%s': thermal_inertia has no effect on a storage fed only "
+                "by tank-to-tank transfers (transfers are not lagged)",
+                tank_id,
             )
-        conversion = 3600 / (density * heat_capacity * volume)
+            lag_steps = 0
 
         start_temperature = float(tank.get("start_temperature", 20.0))
         max_temperatures_list = tank.get("max_temperatures", [])
@@ -4081,12 +4990,22 @@ class Optimization:
                 f"Shared tank {tank_id}: requires non-empty min_temperatures "
                 "or min_temperature_curve"
             )
+        self._shared_tank_min_floors[tank_idx] = list(min_temperatures_list)
 
-        # Heating demand resolution: same options as single-source thermal_battery
-        # (draw_off_demand for hot-water tanks; physics or HDD for space heating)
+        # Heating demand resolution: demand models are ADDITIVE (issue #539).
+        # The heat_topology compiler folds a `profile` consumer AND a
+        # `building_demand` consumer into the same storage, so a tank may
+        # serve hot-water draw-off and space heating at once. Standing losses
+        # are counted exactly once: the flat hot-water loss when a draw-off
+        # profile is present (the tank is then a hot-water store), the signed
+        # indoor/outdoor loss otherwise - single-model configs keep their
+        # previous behaviour. The two building models (explicit physics vs
+        # HDD) stay mutually exclusive: a building is modelled one way.
+        thermal_balance = np.zeros(required_len)
         hot_water = self._resolve_draw_off_demand(tank, base_loss, required_len)
         if hot_water is not None:
-            heating_demand, thermal_losses = hot_water
+            draw_off_demand, thermal_losses = hot_water
+            thermal_balance = thermal_balance + np.asarray(draw_off_demand)[:required_len]
         else:
             # Signed kW magnitude -> kWh/timestep (see _loss_kw_to_timestep_energy).
             thermal_losses = self._loss_kw_to_timestep_energy(
@@ -4098,68 +5017,70 @@ class Optimization:
                     )[:required_len]
                 )
             )
-            if all(
-                key in tank
-                for key in ["u_value", "envelope_area", "ventilation_rate", "heated_volume"]
-            ):
-                indoor_target_temp = tank.get(
-                    "indoor_target_temperature",
-                    min_temperatures_list[0] if min_temperatures_list else 20.0,
-                )
-                # Window solar and internal gains belong INSIDE the physics demand
-                # model, exactly as the per-load thermal_battery path passes them.
-                # The heat_topology compiler folds window_area / shgc /
-                # internal_gains_factor from a building_demand consumer onto the
-                # tank; dropping them here left the demand at the raw envelope
-                # loss (U*A*dT + ventilation).
-                window_area = tank.get("window_area", None)
-                # An explicit JSON null means "use the default", as elsewhere.
-                shgc = float(tank.get("shgc") if tank.get("shgc") is not None else 0.6)
-                internal_gains_factor = float(tank.get("internal_gains_factor") or 0.0)
-                solar_irradiance = None
-                if "ghi" in data_opt.columns and window_area is not None:
-                    vals = np.asarray(data_opt["ghi"].values, dtype=float)
-                    if len(vals) < required_len:
-                        vals = np.concatenate((vals, np.zeros(required_len - len(vals))))
-                    solar_irradiance = vals[:required_len]
-                internal_gains_forecast = p_load if internal_gains_factor > 0 else None
-                demand = utils.calculate_heating_demand_physics(
-                    u_value=tank["u_value"],
-                    envelope_area=tank["envelope_area"],
-                    ventilation_rate=tank["ventilation_rate"],
-                    heated_volume=tank["heated_volume"],
-                    indoor_target_temperature=indoor_target_temp,
-                    outdoor_temperature_forecast=outdoor_temp_arr.tolist(),
-                    optimization_time_step=int(self.freq.total_seconds() / 60),
-                    solar_irradiance_forecast=solar_irradiance,
-                    window_area=window_area,
-                    shgc=shgc,
-                    internal_gains_forecast=internal_gains_forecast,
-                    internal_gains_factor=internal_gains_factor,
-                    sense=tank.get("sense") or "heat",
-                )
-            elif "specific_heating_demand" in tank and "area" in tank:
-                if str(tank.get("sense") or "heat").strip().lower() == "cool":
-                    self.logger.warning(
-                        "Shared tank %s: the degree-day (specific_heating_demand) "
-                        "demand model is heating-only; sense='cool' will be treated "
-                        "as heating. Configure the physics model (u_value, "
-                        "envelope_area, ventilation_rate, heated_volume) for cooling "
-                        "demand.",
-                        tank_id,
-                    )
-                demand = utils.calculate_heating_demand(
-                    specific_heating_demand=tank["specific_heating_demand"],
-                    floor_area=tank["area"],
-                    outdoor_temperature_forecast=outdoor_temp_arr.tolist(),
-                    base_temperature=tank.get("base_temperature", 18.0),
-                    annual_reference_hdd=tank.get("annual_reference_hdd", 3000.0),
-                    optimization_time_step=int(self.freq.total_seconds() / 60),
-                )
+        if all(
+            key in tank for key in ["u_value", "envelope_area", "ventilation_rate", "heated_volume"]
+        ):
+            # Without an explicit target, a building-only store is assumed to be
+            # the room itself (its floor is the indoor target). A combi tank with
+            # a draw-off profile is a hot-water store, whose floor is far above
+            # room temperature, so it falls back to 20 C instead.
+            if hot_water is not None or not min_temperatures_list:
+                default_indoor = 20.0
             else:
-                # No heating demand model - idle tank with losses only
-                demand = [0.0] * required_len
-            heating_demand = np.array(demand[:required_len])
+                default_indoor = min_temperatures_list[0]
+            indoor_target_temp = tank.get("indoor_target_temperature", default_indoor)
+            # Window solar and internal gains belong INSIDE the physics demand
+            # model, exactly as the per-load thermal_battery path passes them.
+            # The heat_topology compiler folds window_area / shgc /
+            # internal_gains_factor from a building_demand consumer onto the
+            # tank; dropping them here left the demand at the raw envelope
+            # loss (U*A*dT + ventilation).
+            window_area = tank.get("window_area", None)
+            # An explicit JSON null means "use the default", as elsewhere.
+            shgc = float(tank.get("shgc") if tank.get("shgc") is not None else 0.6)
+            internal_gains_factor = float(tank.get("internal_gains_factor") or 0.0)
+            solar_irradiance = None
+            if "ghi" in data_opt.columns and window_area is not None:
+                vals = np.asarray(data_opt["ghi"].values, dtype=float)
+                if len(vals) < required_len:
+                    vals = np.concatenate((vals, np.zeros(required_len - len(vals))))
+                solar_irradiance = vals[:required_len]
+            internal_gains_forecast = p_load if internal_gains_factor > 0 else None
+            demand = utils.calculate_thermal_balance_physics(
+                u_value=tank["u_value"],
+                envelope_area=tank["envelope_area"],
+                ventilation_rate=tank["ventilation_rate"],
+                heated_volume=tank["heated_volume"],
+                indoor_target_temperature=indoor_target_temp,
+                outdoor_temperature_forecast=outdoor_temp_arr.tolist(),
+                optimization_time_step=int(self.freq.total_seconds() / 60),
+                solar_irradiance_forecast=solar_irradiance,
+                window_area=window_area,
+                shgc=shgc,
+                internal_gains_forecast=internal_gains_forecast,
+                internal_gains_factor=internal_gains_factor,
+                sense=tank.get("sense") or "heat",
+            )
+            thermal_balance = thermal_balance + np.array(demand[:required_len])
+        elif "specific_heating_demand" in tank and "area" in tank:
+            if str(tank.get("sense") or "heat").strip().lower() == "cool":
+                self.logger.warning(
+                    "Shared tank %s: the degree-day (specific_heating_demand) "
+                    "demand model is heating-only; sense='cool' will be treated "
+                    "as heating. Configure the physics model (u_value, "
+                    "envelope_area, ventilation_rate, heated_volume) for cooling "
+                    "demand.",
+                    tank_id,
+                )
+            demand = utils.calculate_heating_demand(
+                specific_heating_demand=tank["specific_heating_demand"],
+                floor_area=tank["area"],
+                outdoor_temperature_forecast=outdoor_temp_arr.tolist(),
+                base_temperature=tank.get("base_temperature", 18.0),
+                annual_reference_hdd=tank.get("annual_reference_hdd", 3000.0),
+                optimization_time_step=int(self.freq.total_seconds() / 60),
+            )
+            thermal_balance = thermal_balance + np.array(demand[:required_len])
 
         # Apply surface solar gain if configured at the tank level
         solar_gain = utils.calculate_surface_solar_gain(
@@ -4169,17 +5090,117 @@ class Optimization:
             length=required_len,
         )
         if solar_gain is not None:
-            heating_demand = heating_demand - solar_gain
+            thermal_balance = thermal_balance - solar_gain
+
+        # Window solar gain for a building zone (kWh/step): sunlight transmitted
+        # through glazing (window_area m2 * SHGC) offsets the heat the zone needs,
+        # so on a sunny day the plan coasts instead of heating. Reuses the GHI
+        # forecast already fetched for PV. Only for zone tanks (loss_coefficient):
+        # a building_demand tank receives its window solar and internal gains inside
+        # the physics demand call above.
+        if (
+            tank.get("loss_coefficient") is not None
+            and tank.get("window_area")
+            and "ghi" in data_opt.columns
+        ):
+            ghi = np.asarray(data_opt["ghi"].values)[:required_len]
+            shgc = float(tank.get("shgc", 0.6))
+            dt_h = self.freq.total_seconds() / 3600.0
+            window_gain = ghi * float(tank["window_area"]) * shgc / 1000.0 * dt_h
+            thermal_balance = thermal_balance - window_gain
+
+        tank_sense_norm = utils.normalize_heat_cool_mode(
+            tank.get("sense") or "heat",
+            field_name="sense",
+            context=f"shared tank {tank_id}",
+        )
+        heating_demand = (
+            thermal_balance if tank_sense_norm == "cool" else np.maximum(thermal_balance, 0.0)
+        )
 
         # Per-source COP arrays (HP uses Carnot, gas / oil / district use flat
         # efficiency). Resolve each source's conversion factor from its config.
-        cop_arrays: list[np.ndarray] = []
+        cop_arrays: list = []
+        # Optional per-source temperature ceiling (e.g. a heat pump capped at its
+        # supply temperature). None = no cap (e.g. an electric booster).
+        source_caps: list[float | None] = []
+        # Optional per-source thermal-output ceiling (W): caps cop * p_deferrable
+        # so a high COP cannot deliver more heat than the unit's rated output.
+        # None = uncapped.
+        source_thermal_caps: list[float | None] = []
+        # Optional per-source soft threshold: the source is switched off while
+        # the tank sits beyond it (used with the tank's desired_temperatures).
+        # A source without its own value inherits the tank-level
+        # overshoot_temperature, matching the compiler's storage-level field.
+        source_overshoots: list[float | None] = []
+        tank_overshoot = tank.get("overshoot_temperature")
+        # The heat pump - the source whose COP depends on the achieved tank
+        # temperature - is held as a cp.Parameter so the post-solve DP refinement
+        # (see _refine_cop_with_dp) can correct it to the value consistent with the
+        # globally-optimal temperature and re-solve. Other sources
+        # (flat-efficiency gas/oil/district) stay constant numpy arrays.
+        dp_hp_info = None
         for k in load_ids:
             src_cfg = self._get_load_source_config(k)
-            cops = utils.resolve_thermal_battery_cop(
-                src_cfg, outdoor_temp_arr.tolist(), length=required_len
+            cops = np.asarray(
+                utils.resolve_thermal_battery_cop(
+                    src_cfg, outdoor_temp_arr.tolist(), length=required_len
+                )
             )
-            cop_arrays.append(np.asarray(cops))
+            # Only a HEATING-CURVE heat pump is DP-refinable: its supply (hence COP)
+            # tracks the achieved tank temperature, so driving the tank above the curve
+            # makes the static COP optimistic. A fixed supply_temperature source is
+            # physically capped at its supply - its COP is constant by design and the
+            # static value is already exact - so it is left as a constant array.
+            is_hp = src_cfg.get("efficiency") is None and bool(
+                src_cfg.get("heating_curve") or src_cfg.get("cooling_curve")
+            )
+            # With cop_solver 'static' the refinement never runs, so the COP stays a
+            # constant array and the problem is exactly the one without this feature.
+            refinable = is_hp and self._cop_solver != "static"
+            if refinable and dp_hp_info is None:
+                cop_param = cp.Parameter(
+                    required_len, nonneg=True, value=cops, name=f"cop_{tank_id}_{k}"
+                )
+                cop_arrays.append(cop_param)
+                dp_hp_info = {
+                    "load_idx": k,
+                    "sense": utils.normalize_heat_cool_mode(
+                        src_cfg.get("sense") or "heat", field_name="sense", context="thermal_source"
+                    ),
+                    "cop_param": cop_param,
+                    "cop_static": cops,
+                    "carnot": float(src_cfg.get("carnot_efficiency", 0.4)),
+                    "approach": float(self.optim_conf.get("cop_hx_approach", 5.0)),
+                    "nominal_power": float(src_cfg.get("nominal_power", 0.0))
+                    or float(
+                        max(np.atleast_1d(self.optim_conf["nominal_power_of_deferrable_loads"][k]))
+                    ),
+                    # Rated thermal ceiling (W, None = uncapped): forwarded to the DP so
+                    # its trajectories respect the same physical limit the LP's
+                    # max_thermal_power constraint enforces on cop * p_deferrable.
+                    "max_thermal_power": src_cfg.get("max_thermal_power"),
+                }
+            else:
+                if refinable:
+                    # A second curve-driven heat pump on the same tank: only the
+                    # first is DP-refined (one COP Parameter per tank), so this one
+                    # keeps its pre-solve static COP. Say so - a silently mispriced
+                    # source is invisible to the user.
+                    self.logger.warning(
+                        "Shared tank '%s': load %s is a second curve-driven heat pump; "
+                        "only the first is DP-refined, this one keeps its static COP.",
+                        tank_id,
+                        k,
+                    )
+                cop_arrays.append(cops)
+            # scalar, per-step list, or None (uncapped)
+            source_caps.append(src_cfg.get("max_supply_temperature"))
+            # scalar W, or None (uncapped thermal output)
+            source_thermal_caps.append(src_cfg.get("max_thermal_power"))
+            # null on the source means "not set": inherit the storage's threshold.
+            own_overshoot = src_cfg.get("overshoot_temperature")
+            source_overshoots.append(own_overshoot if own_overshoot is not None else tank_overshoot)
 
         # Comfort sense (heat vs cool). The compiler propagates the destination
         # storage's comfort_sense onto tank["sense"]; default to heat for legacy
@@ -4196,96 +5217,1022 @@ class Optimization:
         predicted_temp = cp.Variable(required_len, name=f"temp_shared_{tank_id}")
         constraints.append(predicted_temp[0] == start_temperature)
 
-        # Heat input is the SUM of contributions from all member sources
-        # raw_heat[t] = sum_k(cop_k[t] * p_deferrable[k][t] / 1000 * dt)
-        raw_heat = 0
-        for k, cops in zip(load_ids, cop_arrays):
-            p_k = self.vars["p_deferrable"][k]
-            raw_heat = raw_heat + cp.multiply(cops[:-1], p_k[:-1]) / 1000 * self.time_step
+        # Per-step loss (kWh). With a loss_coefficient the loss is STATE-dependent
+        # - UA*(T[t]-outdoor[t]) - so a building-zone tank's temperature is free to
+        # drift inside its comfort band (the term is linear in the temperature
+        # variable, so the problem stays DPP/affine). Otherwise the precomputed
+        # fixed-reference standing loss is used, unchanged.
+        if loss_coefficient is not None:
+            loss_vec = loss_coefficient * (predicted_temp - outdoor_temp_arr) * self.time_step
+        else:
+            loss_vec = thermal_losses
 
-        # First-order thermal dynamics
-        # T[t+1] = T[t] + conversion * (sense_coeff*raw_heat[t] - demand[t] - loss[t])
-        # In cool mode (sense_coeff = -1) running a source LOWERS the tank temperature.
-        constraints.append(
-            predicted_temp[1:]
-            == predicted_temp[:-1]
-            + conversion * (sense_coeff * raw_heat - heating_demand[:-1] - thermal_losses[:-1])
+        # Heat input is the SUM of contributions from all member sources
+        # raw_heat[t] = sum_k(cop_k[t] * p_deferrable[k][t] / 1000 * dt). With
+        # thermal_inertia the heat from L steps earlier is what moves T[t+1].
+        L = lag_steps
+
+        def _raw_heat(upper):
+            total = 0
+            for k, cops in zip(load_ids, cop_arrays):
+                p_k = self.vars["p_deferrable"][k]
+                total = total + cp.multiply(cops[:upper], p_k[:upper]) / 1000 * self.time_step
+            return total
+
+        # Net tank->tank transfer per step (kWh): +inflow (this tank is a 'to'),
+        # -outflow (this tank is a 'from'). Length required_len-1; zeros if none.
+        xfer_net = np.zeros(required_len - 1)
+        # The same for the last step, whose end lies past the horizon (used only
+        # by the overshoot gate below), and a bound on how far it can move.
+        xfer_last = 0.0
+        xfer_last_span = 0.0
+        for tr in self._get_tank_transfers() if transfer_vars else []:
+            q_var = transfer_vars.get((tr["from"], tr["to"]))
+            if q_var is None:
+                continue
+            if tr["to"] == tank_id:
+                xfer_net = xfer_net + q_var[:-1] * self.time_step
+                xfer_last = xfer_last + q_var[-1] * self.time_step
+            if tr["from"] == tank_id:
+                xfer_net = xfer_net - q_var[:-1] * self.time_step
+                xfer_last = xfer_last - q_var[-1] * self.time_step
+            if tank_id in (tr["to"], tr["from"]):
+                xfer_last_span += float(tr["max_transfer_power"]) / 1000 * self.time_step
+
+        # First-order thermal dynamics: T[t+1] = T[t] + conversion*(heat - demand - loss).
+        # sense_coeff flips the SOURCE term so a cool-sense tank's sources remove heat
+        # (a reversible heat pump in cooling mode lowers the tank temperature); the
+        # tank->tank transfers, demand and losses keep their physical signs.
+        prior_heat = self._resolve_prior_heat(
+            tank.get("prior_heat"),
+            L,
+            f"Shared tank {tank_id}",
+            full_lag=int(float(tank.get("thermal_inertia", 0.0)) / self.time_step),
+        )
+        if L <= 0:
+            constraints.append(
+                predicted_temp[1:]
+                == predicted_temp[:-1]
+                + conversion
+                * (sense_coeff * _raw_heat(-1) + xfer_net - thermal_balance[:-1] - loss_vec[:-1])
+            )
+        else:
+            # Dead zone: the first L steps receive no heat from THIS horizon's own
+            # sources yet (transfers still apply - they are not subject to the source
+            # lag). They do receive heat committed BEFORE the horizon that is still in
+            # flight: prior_heat (thermal kWh per step, oldest first). Zero when absent,
+            # which reproduces the previous cold-start behaviour exactly.
+            constraints.append(
+                predicted_temp[1 : 1 + L]
+                == predicted_temp[:L]
+                + conversion
+                * (sense_coeff * prior_heat + xfer_net[:L] - thermal_balance[:L] - loss_vec[:L])
+            )
+            # At the top of the clamp (L == required_len - 1) the dead zone above
+            # already covers the whole remaining horizon, so this block spans zero
+            # rows: there is nothing left for it to constrain, and building it anyway
+            # is a cvxpy dimension error.
+            if 1 + L < required_len:
+                constraints.append(
+                    predicted_temp[1 + L :]
+                    == predicted_temp[L:-1]
+                    + conversion
+                    * (
+                        sense_coeff * _raw_heat(-1 - L)
+                        + xfer_net[L:]
+                        - thermal_balance[L:-1]
+                        - loss_vec[L:-1]
+                    )
+                )
+
+        # Recovery grace: if the tank STARTS below a hard minimum it must satisfy
+        # soon (a momentary out-of-band sensor read - e.g. a zone dips below its
+        # comfort floor on a cold morning), demanding the full min from t=1 is
+        # infeasible for a rate-limited tank that cannot jump back into band in one
+        # step, and the relaxed-LP fallback cannot rescue that conflict. Instead the
+        # tank's floors are priced for this run (see below). Index 0 is the pinned
+        # live start and is never bounded (see _add_temp_bound), so only the
+        # constrained floors at t >= 1 drive the trigger - a setback floor that
+        # rises only at t >= 1 (where min_temperatures[0] may sit below the start)
+        # is caught too. Only near-term floors (the first
+        # SHARED_TANK_START_RECOVERY_STEPS steps) trigger it: a floor that steps up
+        # later (e.g. a scheduled legionella cycle) can be reached by planning
+        # ahead and stays hard.
+        constrained_floors = [
+            v
+            for t, v in enumerate(min_temperatures_list)
+            if 1 <= t <= SHARED_TANK_START_RECOVERY_STEPS and v is not None
+        ]
+        max_deficit = max((v - start_temperature for v in constrained_floors), default=0.0)
+        recovery_idx, recovery_floor = [], []
+        if max_deficit > 1e-6:
+            # Every floor from t=1 on is priced instead of hard: how long recovery
+            # takes depends on the sources, the losses (which grow as the tank
+            # warms) and any heat arriving through transfers, and no estimate of
+            # that is safe. The penalty dominates energy prices, so the floor is
+            # still met wherever the tank can reach it.
+            min_temperatures_list = list(min_temperatures_list)
+            for t in range(1, min(len(min_temperatures_list), required_len)):
+                cfg = min_temperatures_list[t]
+                if cfg is None:
+                    continue
+                recovery_idx.append(t)
+                recovery_floor.append(cfg)
+                min_temperatures_list[t] = None
+            if recovery_idx:
+                self.logger.info(
+                    "Shared tank '%s': start %.1f C below a near-term floor (max shortfall "
+                    "%.1f C) - its floors are priced instead of hard this run so it can "
+                    "recover as fast as its sources allow",
+                    tank_id,
+                    start_temperature,
+                    max_deficit,
+                )
+
+        # Thermal-inertia dead zone: over the first L steps no source heat arrives,
+        # so the temperature there does not depend on this run's source decisions.
+        # A hard floor at those steps would make a zone that sits on its floor
+        # (where the optimizer parks it) infeasible on the next run; price the
+        # shortfall instead, like the recovery window above.
+        if L > 0:
+            min_temperatures_list = list(min_temperatures_list)
+            recovered = set(recovery_idx)
+            for t in range(1, min(L, required_len - 1) + 1):
+                if t < len(min_temperatures_list) and min_temperatures_list[t] is not None:
+                    if t not in recovered:
+                        recovery_idx.append(t)
+                        recovery_floor.append(min_temperatures_list[t])
+                    min_temperatures_list[t] = None
+
+        # Free gains or losses past a bound: sun through the windows can carry a
+        # heated zone past its maximum with every source off (a cold night does
+        # the same to a cooled store and its minimum). No plan can then keep that
+        # bound, so the run would be infeasible; it is priced for this run
+        # instead, like a store that starts below its minimum. The check only
+        # fires on a store no plan could keep in band: a transfer that could
+        # carry the heat away, or a zone whose loss per step exceeds its
+        # capacity (where the stepped path is not monotone), is left alone.
+        relief_idx, relief_limit = [], []
+        is_cool = tank_sense == "cool"
+        transfers = self._get_tank_transfers() if transfer_vars else []
+        sheds_by_transfer = any(tr["to" if is_cool else "from"] == tank_id for tr in transfers)
+        zone_step = None if loss_coefficient is None else loss_coefficient * self.time_step
+        if not sheds_by_transfer and (zone_step is None or conversion * zone_step <= 1.0):
+            breach = self._free_gain_breach(
+                start_temperature=start_temperature,
+                conversion=float(conversion),
+                net_out=np.asarray(thermal_balance, dtype=float)
+                + (0.0 if loss_coefficient is not None else np.asarray(thermal_losses)),
+                zone_loss=zone_step,
+                outdoor=outdoor_temp_arr,
+                hold=max_temperatures_list if is_cool else min_temperatures_list,
+                limit=min_temperatures_list if is_cool else max_temperatures_list,
+                n=required_len,
+                sense=tank_sense,
+                # Heat committed by earlier runs still arrives in the lag's dead
+                # zone, whatever this run decides.
+                source_tail=prior_heat,
+            )
+            if breach > 1e-6:
+                if is_cool:
+                    min_temperatures_list = list(min_temperatures_list)
+                    priced = set(recovery_idx)
+                    for t in range(1, min(len(min_temperatures_list), required_len)):
+                        if min_temperatures_list[t] is not None and t not in priced:
+                            recovery_idx.append(t)
+                            recovery_floor.append(min_temperatures_list[t])
+                        min_temperatures_list[t] = None
+                else:
+                    max_temperatures_list = list(max_temperatures_list)
+                    for t in range(1, min(len(max_temperatures_list), required_len)):
+                        if max_temperatures_list[t] is not None:
+                            relief_idx.append(t)
+                            relief_limit.append(max_temperatures_list[t])
+                            max_temperatures_list[t] = None
+                self.logger.info(
+                    "Shared tank '%s': free gains or losses alone carry it %.1f C past its "
+                    "%s - that bound is priced instead of hard this run",
+                    tank_id,
+                    breach,
+                    "minimum" if is_cool else "maximum",
+                )
+
+        # Hard min/max temperature bounds (shared helper; index 0 already pinned).
+        self._add_temp_bound(
+            constraints, predicted_temp, min_temperatures_list, None, required_len, lower=True
+        )
+        self._add_temp_bound(
+            constraints, predicted_temp, max_temperatures_list, None, required_len, lower=False
+        )
+        source_heat = sum(
+            _cop_upper_bound(cops)
+            * float(np.max(np.atleast_1d(self.optim_conf["nominal_power_of_deferrable_loads"][k])))
+            / 1000
+            * self.time_step
+            for k, cops in zip(load_ids, cop_arrays)
+        )
+        self._shared_tank_reach[tank_id] = self._shared_tank_reachable_range(
+            start_temperature=start_temperature,
+            conversion=float(conversion),
+            source_heat=source_heat,
+            sense=tank_sense,
+            lag=L,
+            transfer_heat=xfer_last_span,
+            demand=np.asarray(thermal_balance, dtype=float),
+            flat_loss=None if loss_coefficient is not None else np.asarray(thermal_losses),
+            zone_loss=None
+            if loss_coefficient is None
+            else float(loss_coefficient) * self.time_step,
+            outdoor=np.asarray(outdoor_temp_arr, dtype=float),
+            min_temperatures=min_temperatures_list,
+            max_temperatures=max_temperatures_list,
+            n=required_len,
         )
 
-        # Hard min/max temperature constraints (skipping index 0 - already pinned)
-        min_idx = [
-            i for i, v in enumerate(min_temperatures_list) if v is not None and 0 < i < required_len
-        ]
-        if min_idx:
-            min_vals = np.array([min_temperatures_list[i] for i in min_idx])
-            constraints.append(predicted_temp[min_idx] >= min_vals)
-        max_idx = [
-            i for i, v in enumerate(max_temperatures_list) if v is not None and 0 < i < required_len
-        ]
-        if max_idx:
-            max_vals = np.array([max_temperatures_list[i] for i in max_idx])
-            constraints.append(predicted_temp[max_idx] <= max_vals)
-
-        # Soft comfort constraints (overshoot/desired/penalty) — same pattern as the
-        # per-load thermal_battery path. Without this the hard min/max are the ONLY
-        # temperature pressure, so in cool mode the zone drifts up to (just under) the
-        # hard max and no cooling is ever scheduled. The signed penalty creates the
-        # incentive to hold the tank near `desired_temperatures` in the comfort sense.
-        penalty_expr = 0
-        desired_temps_raw = tank.get("desired_temperatures", [])
-        # The compiler may store a scalar desired_temperature; broadcast to horizon.
-        if isinstance(desired_temps_raw, int | float):
-            desired_temps_list = [float(desired_temps_raw)] * required_len
-        else:
-            desired_temps_list = list(desired_temps_raw)
-        overshoot_temperature = tank.get("overshoot_temperature", None)
-
-        if desired_temps_list and overshoot_temperature is not None:
-            is_overshoot = cp.Variable(
-                required_len, boolean=True, name=f"is_overshoot_shared_{tank_id}"
+        # Per-source temperature ceiling. A source with `max_supply_temperature`
+        # (e.g. a heat pump that cannot raise water above its supply/condenser
+        # temperature) may only inject heat while the tank is at or below that
+        # ceiling; a source without a cap (e.g. an electric booster) can drive the
+        # tank up to the tank's own max_temperatures. Big-M gate: allow_k[t] == 1
+        # permits source k at step t, and is only allowed while temp[t] <= cap.
+        # The gate is a physical limit, so it is kept (booleans included) in the
+        # relaxed-LP fallback rebuild too - same treatment as the tank's hard
+        # min/max temperatures; the fallback must not publish a plan the
+        # hardware cannot execute.
+        finite_max_temps = [v for v in max_temperatures_list if v is not None]
+        tank_temp_ub = max(finite_max_temps) if finite_max_temps else None
+        if relief_idx:
+            # The maximum is priced this run: size big-M terms from what the
+            # store can physically reach instead.
+            tank_temp_ub = self._shared_tank_reach[tank_id][1]
+        # The ceiling is a heating limit: on a cooling storage the gate would keep
+        # a capped source off exactly while the storage is warm and needs cooling.
+        if tank_sense == "cool" and any(cap is not None for cap in source_caps):
+            self.logger.warning(
+                "Shared tank %s cools: max_supply_temperature is a heating ceiling "
+                "and is ignored for its sources.",
+                tank_id,
             )
-            big_m = 100
-
-            if tank_sense == "heat":
+            source_caps = [None] * len(source_caps)
+        for k, cap in zip(load_ids, source_caps):
+            if cap is None:
+                continue
+            # cap may be a scalar or a per-step list (e.g. a weather-dependent
+            # supply temperature). Broadcast / pad to the horizon length.
+            if isinstance(cap, list | tuple | np.ndarray):
+                cap_list = [float(x) for x in cap]
+                if len(cap_list) < required_len:
+                    cap_list += [cap_list[-1]] * (required_len - len(cap_list))
+                cap_arr = np.array(cap_list[:required_len])
+            else:
+                cap_arr = np.full(required_len, float(cap))
+            # M must dominate (max feasible tank temperature - cap), otherwise
+            # allow_k = 0 would wrongly bound the tank temperature itself.
+            # The start temperature counts too: index 0 is never bounded by the
+            # tank's own maximum, so it can sit above every configured limit.
+            big_m_temp = SHARED_TANK_CAP_BIG_M_TEMP
+            temp_ub = max(v for v in (tank_temp_ub, float(start_temperature)) if v is not None)
+            big_m_temp = max(big_m_temp, temp_ub - float(cap_arr.min()))
+            nominal_k = self.optim_conf["nominal_power_of_deferrable_loads"][k]
+            if isinstance(nominal_k, list | np.ndarray):
+                nominal_k = max(nominal_k)
+            allow_k = cp.Variable(required_len, boolean=True, name=f"src_below_cap_{tank_id}_{k}")
+            p_k = self.vars["p_deferrable"][k]
+            # A capped source may only inject heat at step t when the tank stays at or
+            # below its ceiling BOTH at the start of the step (it cannot heat water
+            # already hotter than its supply temperature) AND at t+1 (it must not push
+            # the tank past the cap). Both ends are held to step t's ceiling: the heat
+            # of step t is delivered under cap[t], even when cap[t+1] is higher.
+            # allow_k[t] == 0 forces p_k[t] == 0; an uncapped source (e.g. an
+            # electric booster) has no such gate and can go higher. Under
+            # thermal_inertia the heat of step t reaches the tank L steps later, so
+            # both ends are those of the step it arrives in; heat that arrives
+            # past the horizon is not checked here.
+            n_arrive = required_len - L
+            constraints.append(
+                predicted_temp[L:] - cap_arr[:n_arrive] <= big_m_temp * (1 - allow_k[:n_arrive])
+            )
+            if n_arrive > 1:
                 constraints.append(
-                    predicted_temp - overshoot_temperature - (big_m * is_overshoot) <= 0
+                    predicted_temp[L + 1 :] - cap_arr[: n_arrive - 1]
+                    <= big_m_temp * (1 - allow_k[: n_arrive - 1])
                 )
-                constraints.append(
-                    predicted_temp - overshoot_temperature + (big_m * (1 - is_overshoot)) >= 0
+            constraints.append(p_k <= nominal_k * allow_k)
+
+        # The temperature at the end of the last step lies past the horizon. It is
+        # modelled here for the overshoot gate of continuous sources (their rule is
+        # "no heat in a step that would end beyond the threshold") and for the
+        # last-step bound of tank-to-tank transfers. end_step_span bounds how far
+        # one step can move it.
+        def _nominal(j):
+            nom = self.optim_conf["nominal_power_of_deferrable_loads"][j]
+            return max(nom) if isinstance(nom, list | np.ndarray) else nom
+
+        # Same terms as the dynamics above: the source heat that arrives in
+        # the last step (from L steps earlier under thermal_inertia), the
+        # transfers, the demand and the (state-dependent, for a zone) loss.
+        arrive = required_len - 1 - L
+        heat_last = 0
+        end_step_span = 0.0
+        for j, cops in zip(load_ids, cop_arrays):
+            # A DP-refinable heat pump's COP is a cp.Parameter that the
+            # refinement re-values, so it stays symbolic here.
+            if arrive >= 0:
+                heat_last = (
+                    heat_last
+                    + cops[arrive] * self.vars["p_deferrable"][j][arrive] / 1000 * self.time_step
+                )
+            end_step_span += float(_nominal(j)) * _cop_upper_bound(cops) / 1000 * self.time_step
+        if loss_coefficient is not None:
+            loss_last = (
+                loss_coefficient * (predicted_temp[-1] - outdoor_temp_arr[-1]) * self.time_step
+            )
+            temps = [v for v in (tank_temp_ub, float(start_temperature)) if v is not None]
+            temps += [v for v in min_temperatures_list if v is not None]
+            loss_span = (
+                loss_coefficient
+                * max(
+                    abs(t - o)
+                    for t in temps
+                    for o in (min(outdoor_temp_arr), max(outdoor_temp_arr))
+                )
+                * self.time_step
+            )
+        else:
+            loss_last = thermal_losses[-1]
+            loss_span = abs(float(thermal_losses[-1]))
+        temp_end = predicted_temp[-1] + conversion * (
+            sense_coeff * heat_last + xfer_last - thermal_balance[-1] - loss_last
+        )
+        end_step_span = conversion * (
+            end_step_span + xfer_last_span + abs(float(thermal_balance[-1])) + loss_span
+        )
+
+        self._shared_tank_end[tank_id] = (temp_end, end_step_span)
+
+        # Per-source thermal-output ceiling. A source with `max_thermal_power`
+        # caps its delivered heat (cop * electrical power) so a high COP - e.g. a
+        # small mild-weather Carnot lift - cannot make the model deliver more heat
+        # than the physical unit's rated thermal output. Unlike the temperature
+        # ceiling above this is a straight linear power bound (no big-M gate) and
+        # is DPP-safe: `cops` is either a cp.Parameter (a DP-refinable heat pump,
+        # re-valued by _refine_cop_with_dp) or a constant array, and
+        # parameter/const * variable <= const is affine - so the cap re-applies
+        # with the refined COP on any DP re-solve.
+        for k, thermal_cap, cops in zip(load_ids, source_thermal_caps, cop_arrays):
+            if thermal_cap is None:
+                continue
+            p_k = self.vars["p_deferrable"][k]
+            constraints.append(cp.multiply(cops, p_k) <= float(thermal_cap))
+            source_id = self._get_load_source_config(k).get("source_id")
+            if source_id is not None:
+                self._thermal_cap_flows.setdefault(source_id, (float(thermal_cap), []))[1].append(
+                    cp.multiply(cops, p_k)
+                )
+            # A semi-continuous member's ON level must come down with the cap:
+            # its convention is the strict p == ON_level * bin equality, so with
+            # the plain nominal a binding cap (cap/COP < nominal) leaves OFF as
+            # the only feasible state and the source is silently abandoned.
+            # Lower the ON level to min(nominal, cap/COP) per step - the unit
+            # runs flat-out against whichever limit binds.
+            on_level = getattr(self, "_semi_cont_on_level", {}).get(k)
+            cop_vals = np.asarray(cops.value if hasattr(cops, "value") else cops, dtype=float)
+            if on_level is not None:
+                on_level.value = np.minimum(
+                    on_level.value, float(thermal_cap) / np.maximum(cop_vals, 1e-9)
+                )
+            self._warn_capped_level_below_min_power(tank_id, k, cop_vals, thermal_cap, required_len)
+
+        # Soft comfort constraints (issue #539): the tank's desired_temperatures
+        # set a comfort target whose shortfall is penalized in the objective
+        # (same pattern as thermal_config / thermal_battery loads), and each
+        # source with an overshoot_temperature is switched off while the tank
+        # sits beyond its threshold - e.g. the heat pump stops at 55 C while
+        # the electric element keeps going to 75 C. The desired temperature is
+        # soft; the threshold is a hard stop for its source, like thermal_config's
+        # overshoot_temperature (the compiler warns when it sits below a floor
+        # every feeding source would need to reach).
+        penalty_term = None
+        desired_raw = tank.get("desired_temperatures")
+        if isinstance(desired_raw, int | float):
+            desired_temps_list = [float(desired_raw)] * required_len
+        else:
+            desired_temps_list = list(desired_raw or [])
+        if desired_temps_list:
+            sense = utils.normalize_heat_cool_mode(
+                tank.get("sense") or "heat",
+                field_name="sense",
+                context=f"Shared tank {tank_id}",
+            )
+            sense_coeff = 1 if sense == "heat" else -1
+            finite_min_temps = [v for v in min_temperatures_list if v is not None]
+
+            self._warn_bound_beyond_every_overshoot(
+                tank_id,
+                load_ids,
+                source_overshoots,
+                sense,
+                min_temperatures_list,
+                max_temperatures_list,
+            )
+            for k, overshoot in zip(load_ids, source_overshoots):
+                if overshoot is None:
+                    continue
+                overshoot = float(overshoot)
+                # The indicator is two-sided, so M must dominate the distance
+                # from the threshold to BOTH feasible temperature extremes,
+                # including the pinned start temperature (index 0 is not bounded
+                # by the configured band).
+                big_m_os = SHARED_TANK_CAP_BIG_M_TEMP
+                upper = [v for v in (tank_temp_ub, float(start_temperature)) if v is not None]
+                big_m_os = max(big_m_os, max(upper) - overshoot)
+                lower = [*finite_min_temps, float(start_temperature)]
+                big_m_os = max(big_m_os, overshoot - min(lower))
+                is_overshoot = self._overshoot_indicator(
+                    constraints,
+                    predicted_temp,
+                    overshoot,
+                    sense,
+                    big_m_os,
+                    f"is_overshoot_shared_{tank_id}_{k}",
+                    required_len,
+                )
+                # Suppress THIS source beyond its threshold. A continuous source
+                # can modulate, so it may heat at t as long as the tank at t+1
+                # stays at or below the threshold; that also lets it heat from a
+                # start above the threshold when the floor needs it. A
+                # semi-continuous source runs at full power, so gating it on t+1
+                # would forbid it from ever crossing the threshold (infeasible
+                # when one full-power step lifts the tank past it); it is switched
+                # off while the tank is beyond the threshold at the start of the
+                # step instead.
+                nominal_k = self.optim_conf["nominal_power_of_deferrable_loads"][k]
+                if isinstance(nominal_k, list | np.ndarray):
+                    nominal_k = max(nominal_k)
+                p_k = self.vars["p_deferrable"][k]
+                # Under thermal_inertia the heat of step t reaches the tank at
+                # t+L+1, so each gate looks L steps further ahead.
+                if self.optim_conf["treat_deferrable_load_as_semi_cont"][k]:
+                    if L > 0:
+                        constraints.append(p_k[:-L] <= nominal_k * (1 - is_overshoot[L:]))
+                        constraints.append(p_k[-L:] <= nominal_k * (1 - is_overshoot[-1]))
+                    else:
+                        constraints.append(p_k <= nominal_k * (1 - is_overshoot))
+                else:
+                    # Steps whose heat lands inside the horizon are gated on the
+                    # temperature it lands at; the rest on the modelled end
+                    # temperature, so their heat cannot cross the threshold either.
+                    cut = required_len - 1 - L
+                    if cut > 0:
+                        constraints.append(p_k[:cut] <= nominal_k * (1 - is_overshoot[1 + L :]))
+                    allow_end = cp.Variable(boolean=True, name=f"os_end_{tank_id}_{k}")
+                    big_m_end = big_m_os + end_step_span
+                    if sense == "heat":
+                        constraints.append(temp_end - overshoot <= big_m_end * (1 - allow_end))
+                    else:
+                        constraints.append(temp_end - overshoot >= -big_m_end * (1 - allow_end))
+                    constraints.append(p_k[max(cut, 0) :] <= nominal_k * allow_end)
+
+            # Comfort-shortfall penalty toward the desired band (shared helper):
+            # only deviation below desired (heat) / above (cool) is priced.
+            penalty_term = self._comfort_penalty(
+                predicted_temp,
+                desired_temps_list,
+                None,
+                tank.get("penalty_factor", 10),
+                sense_coeff,
+                required_len,
+            )
+
+        # Inside the recovery window the configured floor is soft: price every
+        # degree below it so the tank recovers as fast as its sources allow.
+        if recovery_idx:
+            shortfall = cp.pos(np.array(recovery_floor) - predicted_temp[recovery_idx])
+            recovery_term = -SHARED_TANK_START_RECOVERY_PENALTY * cp.sum(shortfall)
+            penalty_term = recovery_term if penalty_term is None else penalty_term + recovery_term
+        if relief_idx:
+            excess = cp.pos(predicted_temp[relief_idx] - np.array(relief_limit))
+            relief_term = -SHARED_TANK_START_RECOVERY_PENALTY * cp.sum(excess)
+            penalty_term = relief_term if penalty_term is None else penalty_term + relief_term
+
+        # Register a heat-pump tank for the post-solve DP COP refinement. We capture
+        # the handles needed to (a) test COP consistency after the solve and (b) run
+        # the buffer DP on the tank's realised demand. Constant-efficiency-only tanks
+        # (no heat pump) are never registered - the static COP is already exact there.
+        # A tank is registered when it has a curve-driven (refinable) heat-pump source,
+        # heating OR cooling (thermal_dp runs in the matching mode; sense is carried in
+        # dp_hp_info). A fixed-supply source has a constant COP (is_hp is False above,
+        # so dp_hp_info stays None) and keeps its exact static COP. The one cooling
+        # exception - a cool tank with a COUPLED store - is skipped at registration
+        # below (thermal_dp does not support that combination yet).
+        _dp_active = dp_hp_info is not None and self._cop_solver != "static"
+        if _dp_active:
+            if not hasattr(self, "_dp_tank_entries"):
+                self._dp_tank_entries = []
+            backup = None
+            for k in load_ids:
+                if k == dp_hp_info["load_idx"]:
+                    continue
+                bcfg = self._get_load_source_config(k)
+                if bcfg.get("efficiency") is not None:  # a flat-efficiency backup (gas/oil)
+                    bnom = max(
+                        np.atleast_1d(self.optim_conf["nominal_power_of_deferrable_loads"][k])
+                    )
+                    backup = {
+                        "load_idx": k,
+                        "efficiency": float(bcfg["efficiency"]),
+                        "nominal_power": float(bnom),
+                    }
+                    break
+            # Optional coupled store: the largest-capacity tank this tank feeds (e.g. a
+            # pool). The DP refines the two jointly so super-heating accounts for what
+            # the coupled store can bank. Its hard floor is the raw min (see below) so
+            # the DP stays as feasible as the LP; comfort toward target is left to the LP.
+            coupled = None
+            for tr in self._get_tank_transfers() if transfer_vars else []:
+                if tr["from"] != tank_id:
+                    continue
+                tgt = next(
+                    (s for s in self._get_shared_thermal_tanks() if s.get("id") == tr["to"]), None
+                )
+                if tgt is None:
+                    continue
+                tm = tgt.get("thermal_mass")
+                if tm is not None:
+                    hc = float(tm)
+                elif tgt.get("volume"):
+                    hc = (
+                        float(tgt.get("density", 1000))
+                        * float(tgt.get("heat_capacity", 4.186))
+                        * float(tgt["volume"])
+                        / 3600.0
+                    )
+                else:
+                    continue
+                if hc < 20.0 or (coupled is not None and hc <= coupled["heat_capacity"]):
+                    continue  # couple only to a substantial banking store, the largest one
+                des = tgt.get("desired_temperatures")
+                des_v = min(np.atleast_1d(des)) if des is not None else None
+                cmins = [v for v in (tgt.get("min_temperatures") or []) if v is not None]
+                cmaxs = [v for v in (tgt.get("max_temperatures") or []) if v is not None]
+                # Hard floor = the coupled store's RAW min, matching the LP's hard
+                # constraint. Using desired-1 here (to keep the pool near target) makes
+                # the coupled DP STRICTER than the LP, so it declares infeasible - and
+                # skips COP refinement entirely - on configs the LP solves by letting the
+                # pool drain softly. Comfort toward `desired` is still enforced by the LP
+                # re-solve; the DP only needs the true bankable capacity (down to min).
+                floor = (
+                    float(min(cmins))
+                    if cmins
+                    else (
+                        (float(des_v) - 1.0)
+                        if des_v is not None
+                        else float(tgt.get("start_temperature", 26.0)) - 1.0
+                    )
+                )
+                coupled = {
+                    "to": tr["to"],
+                    "heat_capacity": hc,
+                    "loss_coefficient": float(tgt.get("loss_coefficient") or 0.0),
+                    "min_temp": floor,
+                    "max_temp": float(max(cmaxs))
+                    if cmaxs
+                    else float(tgt.get("start_temperature", 30.0)) + 3.0,
+                    "start_temperature": float(tgt.get("start_temperature", floor + 0.5)),
+                    "coupling_coeff": float(tr.get("transfer_coefficient", 1.0)),
+                    "coupling_max_power": float(tr.get("max_transfer_power", 20000.0)),
+                    "q_var": transfer_vars.get((tr["from"], tr["to"])),
+                }
+            # Non-coupled receivers: every OTHER downstream store this tank feeds (the
+            # coupled store above is excluded). At refinement time their draw on this tank
+            # is replaced by their own comfort need (the loss to hold their target), not
+            # the realised transfer - which scales with this tank's banked temperature and
+            # would poison the DP's demand.
+            coupled_to = coupled["to"] if coupled is not None else None
+            non_coupled_receivers = []
+            for tr in self._get_tank_transfers() if transfer_vars else []:
+                if tr["from"] != tank_id or tr["to"] == coupled_to:
+                    continue
+                rq = transfer_vars.get((tr["from"], tr["to"]))
+                if rq is None:
+                    continue
+                rtgt = next(
+                    (s for s in self._get_shared_thermal_tanks() if s.get("id") == tr["to"]), None
+                )
+                if rtgt is None or rtgt.get("loss_coefficient") is None:
+                    # Only a zone's need can be estimated independently of this tank
+                    # (loss to hold its target). For another receiver (e.g. a hot-water
+                    # tank with a draw-off profile) keep the realised transfer in the
+                    # demand rather than dropping it to zero.
+                    continue
+                rdes = rtgt.get("desired_temperatures")
+                rdes_v = (
+                    float(np.mean(np.atleast_1d(rdes)))
+                    if rdes is not None
+                    else float(rtgt.get("start_temperature", 20.0))
+                )
+                non_coupled_receivers.append(
+                    {
+                        "q_var": rq,
+                        "loss_coefficient": float(rtgt.get("loss_coefficient") or 0.0),
+                        "desired": rdes_v,
+                    }
+                )
+            if coupled is not None and dp_hp_info.get("sense") == "cool":
+                # thermal_dp does not support a coupled store in cooling mode yet -
+                # solving it would raise NotImplementedError deep inside the
+                # refinement, where the generic failure handler swallows the reason
+                # into an opaque warning. Skip registration with a clear message
+                # instead; the tank keeps its static cooling COP (docs promise this).
+                self.logger.info(
+                    "Shared tank '%s': cool-sense with a coupled store ('%s') is not "
+                    "yet DP-refined; keeping its static cooling COP.",
+                    tank_id,
+                    coupled["to"],
                 )
             else:
-                constraints.append(
-                    predicted_temp - overshoot_temperature - (-big_m * is_overshoot) >= 0
-                )
-                constraints.append(
-                    predicted_temp - overshoot_temperature + (-big_m * (1 - is_overshoot)) <= 0
+                self._dp_tank_entries.append(
+                    {
+                        "coupled": coupled,
+                        "non_coupled_receivers": non_coupled_receivers,
+                        "tank_id": tank_id,
+                        "predicted_temp": predicted_temp,
+                        "conversion": float(conversion),
+                        "heating_demand": np.asarray(thermal_balance, dtype=float),
+                        "xfer_net": xfer_net,  # cvxpy expr or zeros, length required_len-1
+                        "loss_coefficient": loss_coefficient,
+                        "thermal_losses": (
+                            None
+                            if loss_coefficient is not None
+                            else np.asarray(thermal_losses, dtype=float)
+                        ),
+                        "outdoor": np.asarray(outdoor_temp_arr, dtype=float),
+                        "start_temperature": float(start_temperature),
+                        "min_temp": min(
+                            (v for v in min_temperatures_list if v is not None), default=20.0
+                        ),
+                        "max_temp": max(
+                            (v for v in max_temperatures_list if v is not None), default=65.0
+                        ),
+                        "hp": dp_hp_info,
+                        "backup": backup,
+                        # The LP's comfort term prices predicted_temp[1..n-1]; the
+                        # DP's step t ends at index t+1.
+                        "comfort_target": np.array(
+                            [
+                                np.nan if v is None else float(v)
+                                for v in desired_temps_list[1:required_len]
+                            ],
+                            dtype=float,
+                        ),
+                        "comfort_penalty": (
+                            float(tank.get("penalty_factor", 10)) if desired_temps_list else 0.0
+                        ),
+                        # The heat pump's max_supply_temperature: the DP must not
+                        # plan it to heat the tank past what the LP allows.
+                        "hp_max_temp": dict(zip(load_ids, source_caps)).get(dp_hp_info["load_idx"]),
+                    }
                 )
 
-            # Suppress every member source while the tank is in the comfortable region.
-            for k in load_ids:
-                nominal_power = self.optim_conf["nominal_power_of_deferrable_loads"][k]
-                if isinstance(nominal_power, list):
-                    nominal_power = max(nominal_power)
-                constraints.append(
-                    self.vars["p_deferrable"][k] <= nominal_power * (1 - is_overshoot)
-                )
-
-        if desired_temps_list:
-            penalty_factor = tank.get("penalty_factor", 10)
-            valid_indices = [
-                i
-                for i, val in enumerate(desired_temps_list)
-                if val is not None and 0 < i < required_len
-            ]
-            if valid_indices:
-                des_temps = np.array([desired_temps_list[i] for i in valid_indices])
-                # deviation in the comfort sense: heat penalises T < desired,
-                # cool penalises T > desired (sense_coeff = -1 flips the sign).
-                deviation = (predicted_temp[valid_indices] - des_temps) * sense_coeff
-                penalty_expr = -cp.pos(-deviation * penalty_factor)
-
-        penalty_term = None if isinstance(penalty_expr, int) else cp.sum(penalty_expr)
         return predicted_temp, heating_demand, penalty_term
+
+    @staticmethod
+    def _dp_marginal_price(tariff, p_grid_neg, export_price):
+        """Marginal cost of heat-pump electricity per step for the DP.
+
+        Where the system imports, the heat pump's marginal cost is the import
+        ``tariff``. Where PV is in surplus, running the heat pump instead forgoes the
+        export revenue, so its true marginal cost is the (lower) ``export_price``.
+        Feeding this to the DP makes it super-heat into free solar rather than just
+        the cheapest tariff hour.
+
+        ``p_grid_neg`` is the export power, non-positive by convention
+        (``cp.Variable(nonpos=True)``): a surplus shows up as ``p_grid_neg < 0``. The
+        ``< -1.0`` threshold (W) ignores numerically negligible export.
+        """
+        tariff = np.asarray(tariff, dtype=float)
+        p_exp = np.asarray(p_grid_neg, dtype=float)
+        export_price = np.asarray(export_price, dtype=float)
+        return np.where(p_exp < -1.0, export_price, tariff)
+
+    def _refine_cop_with_dp(self, selected_solver, solver_opts):
+        """Post-solve COP refinement via the thermal DP.
+
+        For each registered heat-pump tank, test whether the COP the solve used
+        matches COP(achieved tank temperature). If it does, the static solve is
+        already self-consistent and nothing happens (the DP never runs - the
+        automatic skip when it is not needed). If it does not, the temperature
+        decision was made on a wrong COP: run the exact DP on the tank's realised
+        demand to find the globally-optimal temperature trajectory, correct the COP
+        parameter to the value consistent with that optimum, cap the tank to the DP
+        optimum (so the re-solve cannot exploit the now-fixed favourable COP by
+        super-heating past it), and re-solve once. The DP is exact in a single pass.
+        """
+        entries = getattr(self, "_dp_tank_entries", [])
+        mode = self._cop_solver
+        if not entries or mode == "static" or self.prob is None or self.prob.value is None:
+            return
+        feasible_incumbent = self.prob.status == "user_limit" and self._has_feasible_incumbent(
+            self.prob
+        )
+        if self._needs_relaxed_retry(self.prob.status, self.prob.value, feasible_incumbent):
+            return  # a failed solve, or a time-out without a solution, has nothing to refine
+        from emhass.thermal_dp import ThermalDPParams, solve_thermal_dp
+
+        # The refinement re-values Parameters of the cached problem (the heat
+        # pump's COP, a capped source's ON level). Keep the static values, so a
+        # rejected re-solve leaves the problem exactly as the static solve had it.
+        saved_params = [
+            (p, None if p.value is None else np.copy(p.value)) for p in self.prob.parameters()
+        ]
+
+        def _restore_static_solve(saved_values):
+            for v, val in saved_values:
+                v.value = val
+            for p, val in saved_params:
+                p.value = val
+
+        tol = float(self.optim_conf.get("cop_solver_tolerance", 0.5))
+        dt = self.time_step
+        n = self.num_timesteps
+        # Marginal cost of heat-pump electricity per step: the import tariff where the
+        # system buys from the grid, and the (much lower) foregone export price where PV
+        # is in surplus. Feeding this to the DP instead of the raw tariff makes it
+        # super-heat into free solar, not just the cheapest tariff hour. Taken from the
+        # first solve's grid position; the re-solve then places the load against PV.
+        tariff = np.asarray(self.param_load_cost.value, dtype=float)[:n]
+        try:
+            price = self._dp_marginal_price(
+                tariff,
+                np.asarray(self.vars["p_grid_neg"].value, dtype=float)[:n],
+                np.asarray(self.param_prod_price.value, dtype=float)[:n],
+            )
+        except Exception:
+            price = tariff
+        self.logger.info(
+            "DP COP solver (mode=%s): eligible heating-curve heat-pump tanks %s",
+            mode,
+            [e.get("tank_id") for e in entries],
+        )
+        extra_constraints = []
+        refined = False
+        for e in entries:
+            # Isolate each tank: a bad config or solve on one tank must not abort the
+            # refinement of the others (it degrades to that tank's static COP).
+            try:
+                temp = e["predicted_temp"].value
+                if temp is None:
+                    continue
+                hp = e["hp"]
+                sense = hp.get("sense", "heat")
+                sense_sign = -1.0 if sense == "cool" else 1.0
+                cop_now = np.asarray(hp["cop_param"].value, dtype=float)
+                cop_consistent = utils.cop_from_tank_temperature(
+                    temp[:n], hp["carnot"], e["outdoor"][:n], approach=hp["approach"], mode=sense
+                )
+                max_err = float(np.max(np.abs(cop_now - cop_consistent)))
+                if mode == "auto" and max_err <= tol:
+                    self.logger.info(
+                        "DP COP solver: tank '%s' COP already consistent (err %.2f <= %.2f) - skipped",
+                        e["tank_id"],
+                        max_err,
+                        tol,
+                    )
+                    continue  # static solve already self-consistent: DP not needed here
+                # External demand (kW) the buffer must supply: draw-off + net outflow.
+                # Standing loss is left to the DP so it captures the loss-vs-temperature
+                # trade-off that drives the super-heating decision.
+                xfer = e["xfer_net"]
+                xfer_val = np.asarray(getattr(xfer, "value", xfer), dtype=float)
+                ext = e["heating_demand"][:n].astype(float).copy()
+                ext[: len(xfer_val)] -= xfer_val  # xfer_net = inflow - outflow
+                # A tank without loss_coefficient loses a flat thermal_losses per
+                # step (kWh), which the LP subtracts like a demand; the DP only
+                # models the temperature-dependent loss, so add the flat one here.
+                if e.get("thermal_losses") is not None:
+                    flat = np.asarray(e["thermal_losses"], dtype=float)[:n]
+                    ext[: len(flat)] += flat
+                coupled = e.get("coupled")
+                if coupled is not None and coupled.get("q_var") is not None:
+                    # ext currently = draw-off + outflow-to-coupled + other outflow. The
+                    # flow to the coupled store is the DP's coupling decision (re-optimised),
+                    # not a fixed demand, so subtract it back out of the demand.
+                    pool_xfer = np.asarray(coupled["q_var"].value, dtype=float) * dt
+                    m = min(len(xfer_val), len(pool_xfer))
+                    ext[:m] -= pool_xfer[:m]
+                # Non-coupled receivers (e.g. the house): the realised transfer folded into
+                # `ext` was inflated by the first solve banking this tank hot. Swap it for
+                # the receiver's own comfort need (loss to hold its target), which does NOT
+                # depend on this tank's temperature - so the DP is not poisoned by the very
+                # over-banking it exists to correct.
+                outdoor_full = np.asarray(e["outdoor"], dtype=float)[:n]
+                for rcv in e.get("non_coupled_receivers", []):
+                    if rcv.get("q_var") is None:
+                        continue
+                    realised = np.asarray(rcv["q_var"].value, dtype=float) * dt
+                    mb = min(len(ext), len(realised))
+                    ext[:mb] -= realised[:mb]  # back out the banking-inflated realised flow
+                    need = (
+                        np.maximum(rcv["loss_coefficient"] * (rcv["desired"] - outdoor_full), 0.0)
+                        * dt
+                    )
+                    mn = min(len(ext), len(need))
+                    ext[:mn] += need[:mn]  # add the receiver's true comfort demand
+                # ext is the LP heating_demand (signed): a positive heat draw for a heat
+                # tank, a negative signed gain for a cool tank. sense_sign maps either to
+                # the DP's load convention; negative values (net solar/window gain beyond
+                # losses) pass through as free heat - the LP's own dynamics credit them,
+                # so clamping them to zero would make the DP over-provision exactly the
+                # sunny steps. The DP sheds any surplus its grid cannot absorb at zero
+                # cost, so gains never force a purchase or an infeasibility.
+                demand_kw = sense_sign * ext / dt
+                outdoor_arr = np.asarray(e["outdoor"], dtype=float)[:n]
+                backup = e["backup"]
+                backup_price = 1e6
+                if backup is not None and getattr(self, "param_cost_per_load", None):
+                    idx = backup["load_idx"]
+                    if (
+                        idx < len(self.param_cost_per_load)
+                        and self.param_cost_per_load[idx].value is not None
+                    ):
+                        backup_price = float(np.mean(self.param_cost_per_load[idx].value))
+                coupled_kwargs = {}
+                if coupled is not None:
+                    coupled_kwargs = {
+                        "coupled_heat_capacity": coupled["heat_capacity"],
+                        "coupled_loss_coeff": coupled["loss_coefficient"],
+                        "coupled_min_temp": coupled["min_temp"],
+                        "coupled_max_temp": coupled["max_temp"],
+                        "coupling_coeff": coupled["coupling_coeff"],
+                        "coupling_max_power": coupled["coupling_max_power"] / 1000.0,
+                    }
+                params = ThermalDPParams(
+                    heat_capacity=1.0 / e["conversion"],
+                    loss_coeff=(e["loss_coefficient"] or 0.0),
+                    min_temp=e["min_temp"],
+                    max_temp=e["max_temp"],
+                    carnot_efficiency=hp["carnot"],
+                    hx_approach=hp["approach"],
+                    hp_max_power=hp["nominal_power"] / 1000.0,
+                    max_thermal_power=(
+                        float(hp["max_thermal_power"]) / 1000.0
+                        if hp.get("max_thermal_power")
+                        else None
+                    ),
+                    backup_efficiency=(backup["efficiency"] if backup else 0.95),
+                    backup_max_power=(backup["nominal_power"] / 1000.0 if backup else 0.0),
+                    backup_price=backup_price,
+                    demand_kw=demand_kw,
+                    comfort_target=e.get("comfort_target"),
+                    comfort_penalty=e.get("comfort_penalty", 0.0),
+                    hp_max_temp=e.get("hp_max_temp"),
+                    mode=sense,
+                    # Per-step: EMHASS tanks lose to outdoor, and the LP prices that
+                    # loss per step - a horizon mean would misprice diurnal swings.
+                    ambient_temperature=outdoor_arr,
+                    **coupled_kwargs,
+                )
+                res = solve_thermal_dp(
+                    price,
+                    outdoor_arr,
+                    params,
+                    time_step=dt,
+                    tank_start=e["start_temperature"],
+                    coupled_start=(coupled["start_temperature"] if coupled else 26.5),
+                )
+                if res.meta.get("infeasible"):
+                    # The DP found no feasible trajectory, so it cannot refine this
+                    # tank's COP. Falling back to the RAW static COP is optimistic: that
+                    # COP is computed at the heating-curve supply, so it does not
+                    # penalise driving the tank ABOVE that supply (where the real COP is
+                    # far lower) - which lets the solver bank heat into the un-priced
+                    # high-temperature region. Keep the static COP but conservatively cap
+                    # the tank at the temperature that COP is valid for - each step's
+                    # curve supply minus the heat-exchanger approach - so it cannot be
+                    # driven into the optimistic region the DP would otherwise have
+                    # priced down.
+                    if sense == "cool":
+                        # Cool-mode DP infeasible (rare): keep the static cooling COP rather
+                        # than applying a heating-shaped temperature cap.
+                        self.logger.warning(
+                            "DP COP solver: cool tank '%s' DP infeasible - keeping its static COP",
+                            e["tank_id"],
+                        )
+                        continue
+                    src_cfg = self._get_load_source_config(hp["load_idx"])
+                    curve = src_cfg.get("heating_curve") or {}
+                    valid_temp = (
+                        np.asarray(utils.apply_heating_curve(curve, outdoor_arr), dtype=float)
+                        - float(hp["approach"])
+                    )[:n]
+                    extra_constraints.append(e["predicted_temp"][1:] <= valid_temp[:-1] + 1.0)
+                    self.logger.warning(
+                        "DP COP solver: tank '%s' demand exceeds deliverable heat - cannot "
+                        "refine; capping it at up to %.0f C (the static-COP-valid "
+                        "temperature) instead of trusting the optimistic static COP",
+                        e["tank_id"],
+                        float(valid_temp.max()),
+                    )
+                    continue
+                traj = np.asarray(res.tank_trajectory, dtype=float)  # length n + 1
+                # Set the MILP COP at each step's TARGET (end) temperature, matching how
+                # the DP priced the charge (the HP runs at the supply needed to reach
+                # T[t+1]), so the re-solve is consistent with the trajectory the DP found.
+                end_temp = traj[1 : n + 1]
+                hp["cop_param"].value = utils.cop_from_tank_temperature(
+                    end_temp, hp["carnot"], outdoor_arr, approach=hp["approach"], mode=sense
+                )
+                # The semi-continuous ON level follows the COP: re-derive
+                # min(nominal, cap/COP) with the refined values, else the
+                # re-solve's strict p == ON_level * bin equality would pin the
+                # ON state to a power the (new) thermal cap no longer allows.
+                cap_w = hp.get("max_thermal_power")
+                on_level = getattr(self, "_semi_cont_on_level", {}).get(hp["load_idx"])
+                if cap_w:
+                    new_cop = np.asarray(hp["cop_param"].value, dtype=float)[:n]
+                    if on_level is not None:
+                        base = np.broadcast_to(
+                            np.asarray(
+                                self.optim_conf["nominal_power_of_deferrable_loads"][
+                                    hp["load_idx"]
+                                ],
+                                dtype=float,
+                            ),
+                            on_level.shape,
+                        )
+                        on_level.value = np.minimum(
+                            base, float(cap_w) / np.maximum(new_cop[: on_level.size], 1e-9)
+                        )
+                    self._warn_capped_level_below_min_power(
+                        e["tank_id"], hp["load_idx"], new_cop, cap_w, n, after_dp=True
+                    )
+                # Bound the re-solve to the range the DP priced: at most 1 C above its
+                # peak (below its trough when cooling). A per-step bound at the DP's
+                # trajectory would keep the COP exact, but the DP models a receiver
+                # fed through a gradient-limited transfer (e.g. a house) only as a
+                # fixed demand, so a per-step bound starves it. The trade-off: a step
+                # the re-solve takes hotter than the DP priced it keeps a COP that is
+                # optimistic there.
+                if sense == "cool":
+                    dp_level = float(traj[:n].min())  # coldest temperature the DP priced
+                    extra_constraints.append(e["predicted_temp"][1:] >= dp_level - 1.0)
+                else:
+                    dp_level = float(traj[:n].max())  # hottest temperature the DP priced
+                    extra_constraints.append(e["predicted_temp"][1:] <= dp_level + 1.0)
+                refined = True
+                self.logger.info(
+                    "DP COP refinement on tank '%s': COP inconsistency %.2f > %.2f - "
+                    "re-optimised to %.0f C, gas %.1f kWh",
+                    e["tank_id"],
+                    max_err,
+                    tol,
+                    dp_level,
+                    float(np.sum(res.backup_input_per_step) * dt),
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "DP COP refinement failed for tank '%s' (%s); skipping it, keeping its static COP",
+                    e.get("tank_id"),
+                    exc,
+                )
+                continue
+        # Re-solve if any tank was refined OR a conservative cap was added for a tank
+        # the DP could not refine (the cap must be applied to take effect).
+        if not refined and not extra_constraints:
+            return
+        prob2 = cp.Problem(self.prob.objective, self.prob.constraints + extra_constraints)
+        # prob2 shares the static solve's CVXPY variables, so prob2.solve() OVERWRITES
+        # their .value - and CVXPY nulls every variable to None on an infeasible/failed
+        # solve. self.prob.value stays cached-good (so the downstream status guard would
+        # NOT catch it), yet the published plan is read from the variables' .value, which
+        # would then be None: a silently corrupted/empty plan. Snapshot the good static
+        # values and restore them whenever the re-solve is rejected.
+        saved_values = [(v, v.value) for v in self.prob.variables()]
+        try:
+            # Half the time budget: the main solve may already have spent the full
+            # limit. prob2 is a new cp.Problem, so the solver starts cold; the
+            # warm_start flag only helps solvers that seed from variable values.
+            prob2.solve(
+                solver=selected_solver, warm_start=True, **self._dp_resolve_opts(solver_opts)
+            )
+            # Accept with EXACTLY the main path's policy (shared predicate): any
+            # result the main path would discard for the relaxed fallback
+            # (infeasible, unbounded, no value, or time-limited without a feasible
+            # solution) restores the static solve instead.
+            if self._accept_dp_resolve(
+                prob2.status,
+                prob2.value,
+                prob2.status == "user_limit" and self._has_feasible_incumbent(prob2),
+            ):
+                return prob2  # hand it to the caller; never replace the cached self.prob (#1048)
+            else:
+                _restore_static_solve(saved_values)
+                self.logger.warning(
+                    "DP COP refinement re-solve status %s; keeping static solve", prob2.status
+                )
+        except Exception as exc:
+            _restore_static_solve(saved_values)
+            self.logger.warning("DP COP refinement re-solve failed (%s); keeping static solve", exc)
 
     def _add_deferrable_load_constraints(
         self,
@@ -4311,6 +6258,10 @@ class Optimization:
         q_inputs = {}
         penalty_terms_total = 0
         n = self.num_timesteps
+        # Per-step semi-continuous ON level per load (a cp.Parameter defaulting to
+        # nominal). The shared-tank builder lowers it for thermal-capped sources,
+        # and the DP COP refinement re-derives it when it re-values the COP.
+        self._semi_cont_on_level: dict[int, cp.Parameter] = {}
 
         # Compute shared-tank membership once. Used by the per-load loop to
         # skip loads that belong to a shared tank (handled after the loop)
@@ -4397,17 +6348,9 @@ class Optimization:
                     # Constraint: Choose exactly one start time
                     constraints.append(cp.sum(y) == 1)
 
-                # Detailed power shape constraint (Convolution-like)
-                # We build the matrix explicitly here
-                mat_rows = []
-                for start_t in range(y_len):
-                    row = np.zeros(n)
-                    end_t = min(start_t + sequence_length, n)
-                    seq_slice = power_sequence[: (end_t - start_t)]
-                    row[start_t:end_t] = seq_slice
-                    mat_rows.append(row)
-
-                mat_np = np.array(mat_rows)  # Shape (y_len, n)
+                # Detailed power shape constraint (Convolution-like): one row
+                # per placement, shared with the def_availability check.
+                mat_np = self._sequence_placements(k, n)  # Shape (y_len, n)
 
                 constraints.append(p_deferrable[k] == cp.matmul(y, mat_np))
 
@@ -4620,6 +6563,13 @@ class Optimization:
                     p_def_start[k][0] >= p_def_bin2[k][0] - self.param_def_current_state[k]
                 )
                 constraints.append(p_def_start[k][1:] >= p_def_bin2[k][1:] - p_def_bin2[k][:-1])
+                # A start also needs the load on: without this upper bound a
+                # negative price turns the startup penalty into a reward for starts
+                # in steps where the load stays off. Only a priced start needs it:
+                # without a penalty it leaves the optimum unchanged, and on problems
+                # with many semi-continuous loads it can slow the solver down a lot.
+                if has_startup_penalty:
+                    constraints.append(p_def_start[k] <= p_def_bin2[k])
 
                 # Startup Limit: Start[t] + Bin[t-1] <= 1
                 constraints.append(p_def_start[k][0] + self.param_def_current_state[k] <= 1)
@@ -4782,10 +6732,26 @@ class Optimization:
                                 + M_timesteps * (1 - self.param_timesteps_active[k])
                             )
 
-                    # Semi-continuous
+                    # Semi-continuous. EMHASS's convention is the strict equality
+                    # p == ON_level * bin (ON means running at exactly the ON level,
+                    # not modulating). The ON level is a per-step Parameter that
+                    # defaults to nominal; for a thermal load with max_thermal_power
+                    # the shared-tank builder (which runs after this loop and knows
+                    # the per-step COP) lowers it to min(nominal, cap/COP) - a real
+                    # unit at its thermal ceiling runs flat-out against whichever
+                    # limit binds. With a plain nominal equality, a binding cap
+                    # (cap/COP < nominal) would make OFF the only feasible state
+                    # and silently abandon the source.
                     if is_semi_cont:
                         nominal = self.optim_conf["nominal_power_of_deferrable_loads"][k]
-                        constraints.append(p_deferrable[k] == nominal * p_def_bin1[k])
+                        on_level = cp.Parameter(
+                            n,
+                            nonneg=True,
+                            name=f"semi_cont_on_level_{k}",
+                            value=np.broadcast_to(np.asarray(nominal, dtype=float), n).copy(),
+                        )
+                        self._semi_cont_on_level[k] = on_level
+                        constraints.append(p_deferrable[k] == cp.multiply(on_level, p_def_bin1[k]))
                         constraints.append(p_def_bin1[k] == p_def_bin2[k])
 
             else:
@@ -4831,25 +6797,119 @@ class Optimization:
                     - M * (1 - self.param_def_current_power_active[k])
                 )
 
+        # Pre-create one transfer-power variable per tank->tank flow (kW), bounded
+        # by its max delivered power. The temperature-gradient bound is added after
+        # both endpoint tanks have been built (their temperature variables exist).
+        transfers = self._get_tank_transfers()
+        transfer_vars = {}
+        for tr in transfers:
+            q_var = cp.Variable(
+                self.num_timesteps, nonneg=True, name=f"xfer_{tr['from']}_{tr['to']}"
+            )
+            constraints.append(q_var <= tr["max_transfer_power"] / 1000.0)
+            transfer_vars[(tr["from"], tr["to"])] = q_var
+
         # Process shared thermal tanks once each, after the per-load loop. Each
-        # shared tank is fed by N >= 1 deferrable loads; their per-load
-        # thermal_battery dynamics were skipped above.
+        # shared tank is fed by N >= 0 deferrable loads and/or tank->tank transfers.
+        n_loads = self.optim_conf["number_of_deferrable_loads"]
+        tank_temp_by_id = {}
+        self._shared_tank_end = {}
+        self._shared_tank_reach = {}
+        # Delivered-heat terms of the capped flows, by source (see the joint cap below).
+        self._thermal_cap_flows = {}
+        self._dp_tank_entries = []  # reset the DP COP-refinement registry for this build
         for tank_idx, tank in enumerate(self._get_shared_thermal_tanks()):
             shared_pred_temp, shared_demand, shared_penalty = (
-                self._add_shared_thermal_tank_constraints(constraints, tank_idx, data_opt, p_load)
+                self._add_shared_thermal_tank_constraints(
+                    constraints, tank_idx, data_opt, p_load, transfer_vars
+                )
             )
             if shared_penalty is not None:
                 penalty_terms_total += shared_penalty
             if shared_pred_temp is not None:
-                # Surface the tank state on the first member load so downstream
-                # publishing has a temperature column to report. Subsequent
-                # members reuse the same predicted_temp.
-                for k in tank.get("load_ids", []):
-                    k = int(k)
-                    if k not in predicted_temps:
-                        predicted_temps[k] = shared_pred_temp
-                    if k not in heating_demands and shared_demand is not None:
-                        heating_demands[k] = shared_demand
+                tank_temp_by_id[tank["id"]] = shared_pred_temp
+                load_ids = [int(k) for k in tank.get("load_ids", [])]
+                if load_ids:
+                    # Surface the tank state on its member loads (predicted_temp_heater{k}).
+                    for k in load_ids:
+                        if k not in predicted_temps:
+                            predicted_temps[k] = shared_pred_temp
+                        if k not in heating_demands and shared_demand is not None:
+                            heating_demands[k] = shared_demand
+                else:
+                    # Transfer-only tank (e.g. the room): no member load, so surface
+                    # under a synthetic index beyond the real loads to get a column.
+                    predicted_temps[n_loads + tank_idx] = shared_pred_temp
+
+        # A source that feeds several storages compiles into one load per flow,
+        # each capped above; its rated thermal output caps them together too.
+        for thermal_cap, heat_terms in self._thermal_cap_flows.values():
+            if len(heat_terms) > 1:
+                constraints.append(sum(heat_terms) <= thermal_cap)
+
+        # Couple each transfer to the temperature gradient: a pumped emitter can only
+        # move heat from the hotter tank to the cooler one, at a rate bounded by the
+        # conductance * (T_from - T_to). One-directional, gated on/off by a binary.
+        # Without the binary, `q <= k*(from-to)` together with `q >= 0` has an EMPTY
+        # feasible set the instant the receiving tank is hotter than the feeder (e.g.
+        # an anchored buffer cooler than a warm pool) - making the WHOLE optimisation
+        # infeasible rather than simply setting the flow to zero. xfer_on=0 forces
+        # q=0 (feasible at any gradient); xfer_on=1 applies the gradient limit.
+        for tr in transfers:
+            q_var = transfer_vars[(tr["from"], tr["to"])]
+            t_from = tank_temp_by_id.get(tr["from"])
+            t_to = tank_temp_by_id.get(tr["to"])
+            if t_from is not None and t_to is not None:
+                k_xfer = tr["transfer_coefficient"]
+                qmax = tr["max_transfer_power"] / 1000.0
+                xfer_on = cp.Variable(
+                    self.num_timesteps, boolean=True, name=f"xfer_on_{tr['from']}_{tr['to']}"
+                )
+                # Off, any gradient is allowed: M covers how much hotter the
+                # receiver can be than the feeder, starts included.
+                lo_from = self._shared_tank_temp_range(tr["from"])[0]
+                hi_to = self._shared_tank_temp_range(tr["to"])[1]
+                big_m_xfer = k_xfer * max(SHARED_TANK_CAP_BIG_M_TEMP, hi_to - lo_from + 1.0)
+                constraints.append(q_var <= k_xfer * (t_from - t_to) + big_m_xfer * (1 - xfer_on))
+                # The same limit at the END of the step: the gradient at the start
+                # alone lets one step move more heat than it takes to equalise the
+                # two tanks, leaving the receiver hotter than the tank that fed it.
+                constraints.append(
+                    q_var[:-1] <= k_xfer * (t_from[1:] - t_to[1:]) + big_m_xfer * (1 - xfer_on[:-1])
+                )
+                # The last step ends past the horizon: bound it with both tanks'
+                # modelled end temperatures.
+                end_from = self._shared_tank_end.get(tr["from"])
+                end_to = self._shared_tank_end.get(tr["to"])
+                if end_from is not None and end_to is not None:
+                    big_m_end = big_m_xfer + k_xfer * (end_from[1] + end_to[1])
+                    constraints.append(
+                        q_var[-1]
+                        <= k_xfer * (end_from[0] - end_to[0]) + big_m_end * (1 - xfer_on[-1])
+                    )
+                constraints.append(q_var <= qmax * xfer_on)
+            else:
+                # One or both endpoint temperatures are absent (a tank id in
+                # tank_transfers that no shared tank produced a temperature variable
+                # for). Without both temperatures the hot->cold gradient guard cannot
+                # be built; leaving q bounded only by 0 <= q <= max_power would let the
+                # solver pump energy uphill (cold -> hot) with no thermodynamic check.
+                # Force the transfer to zero and warn rather than fail silently.
+                missing = [
+                    tid for tid, temp in ((tr["from"], t_from), (tr["to"], t_to)) if temp is None
+                ]
+                self.logger.warning(
+                    "tank_transfers entry %s->%s references tank id(s) %s with no shared-tank "
+                    "temperature variable; forcing this transfer to zero.",
+                    tr["from"],
+                    tr["to"],
+                    missing,
+                )
+                constraints.append(q_var == 0)
+
+        # Expose the per-flow pump decisions so the results frame can surface them
+        # after the solve (read via q_var.value in _build_results_dataframe).
+        self.transfer_vars = transfer_vars
 
         return predicted_temps, heating_demands, penalty_terms_total, q_inputs
 
@@ -4858,8 +6918,13 @@ class Optimization:
 
         Args:
             constraints: List of CVXPY constraints to append to.
-            relaxed: If True, only add shared power budget constraints (skip mutual
-                exclusion, which requires binary variables not available in the relaxed LP).
+            relaxed: If True, this is the relaxed-LP fallback rebuild. The shared
+                power budget and mutual exclusion are BOTH still added - mutual
+                exclusion is a physical constraint (one actuator cannot drive two
+                targets at once), so it must survive the fallback exactly like the
+                max_supply_temperature gate. Only the soft per-load binaries
+                (semi-continuous, single-constant) are dropped by the caller; the
+                mutual-exclusion binaries are re-created here on the spot.
         """
         groups = self.optim_conf.get("deferrable_load_groups", [])
         if not groups:
@@ -4879,15 +6944,20 @@ class Optimization:
                 group_power_sum = sum(p_deferrable[i] for i in indices)
                 constraints.append(group_power_sum <= max_power)
 
-            # Mutual exclusion: at most one load active per timestep.
-            # Reuses p_def_bin2[i] for semi-continuous members; for non-semi-cont
-            # members an anonymous binary plus linking constraint is added on the spot.
-            # Skipped in relaxed mode (no binary variables in the LP relaxation).
-            if mutual_exclusion and not relaxed:
+            # Mutual exclusion: at most one load active per timestep. This is a
+            # PHYSICAL limit (one heat source cannot serve two targets at once), so
+            # it is kept in the relaxed-LP fallback too - otherwise an infeasible or
+            # timed-out MILP silently drops it and schedules both loads at once,
+            # which reads as "mutual_exclusion not honoured". In the relaxed rebuild
+            # the soft per-load binaries are disabled (semi_cont forced False), so
+            # every member takes the anonymous-binary branch below; the resulting
+            # fallback is a small MILP rather than a pure LP, which is the correct
+            # trade for not publishing a plan the hardware cannot execute.
+            if mutual_exclusion:
                 semi_cont = self.optim_conf["treat_deferrable_load_as_semi_cont"]
                 activity_bins = []
                 for i in indices:
-                    if semi_cont[i]:
+                    if semi_cont[i] and not relaxed:
                         activity_bins.append(self.vars["p_def_bin2"][i])
                     else:
                         bin_var = cp.Variable(
@@ -4915,6 +6985,7 @@ class Optimization:
         heating_demands,
         debug,
         q_inputs=None,
+        transfer_vars=None,
     ):
         """Build the final results DataFrame (Vectorized extraction)."""
         opt_tp = pd.DataFrame(index=data_opt.index)
@@ -4948,6 +7019,13 @@ class Optimization:
             p_def_k = get_val(self.vars["p_deferrable"][k])
             opt_tp[f"P_deferrable{k}"] = p_def_k
             p_def_sum += p_def_k
+
+        # Tank-to-tank transfers (modulated pump flows): one additive column per
+        # flow, in W to match the other power columns - the actionable pump schedule.
+        if transfer_vars is None:
+            transfer_vars = getattr(self, "transfer_vars", {})
+        for (frm, to), q_var in transfer_vars.items():
+            opt_tp[f"P_transfer_{frm}_{to}"] = get_val(q_var) * 1000.0  # kW -> W
 
         # Battery Results (#610). This independently recomputes the SOC/P_batt
         # recursion per battery in numpy space over realized values; it must
@@ -5062,14 +7140,30 @@ class Optimization:
         opt_tp["optim_status"] = self.optim_status
 
         # Thermal Details
+        # Shared-tank members carry `thermal_source`, not `thermal_config` /
+        # `thermal_battery`, so their comfort bounds live on the owning tank.
+        shared_tank_membership = self._load_shared_tank_membership()
         for k, pred_temp_var in predicted_temps.items():
             temp_values = get_val(pred_temp_var)
             opt_tp[f"predicted_temp_heater{k}"] = np.round(temp_values, 2)
 
-            if "def_load_config" in self.optim_conf:
-                # Robustly get config (support both thermal_config and thermal_battery)
+            if "def_load_config" in self.optim_conf and k < len(self.optim_conf["def_load_config"]):
+                # Robustly get config (support both thermal_config and thermal_battery).
+                # k beyond the load list = a transfer-only tank (e.g. a room fed by a
+                # buffer); its temperature column is emitted above, no per-load config.
                 load_conf = self.optim_conf["def_load_config"][k]
                 conf = load_conf.get("thermal_config") or load_conf.get("thermal_battery") or {}
+                if not conf and k in shared_tank_membership:
+                    tank = self._get_shared_thermal_tanks()[shared_tank_membership[k]]
+                    desired_raw = tank.get("desired_temperatures")
+                    if isinstance(desired_raw, int | float):
+                        desired_raw = [float(desired_raw)] * self.num_timesteps
+                    conf = {**tank, "desired_temperatures": desired_raw}
+                    # Publish the floor the solver enforced (static list and
+                    # min_temperature_curve combined), not the raw static list.
+                    floor = self._shared_tank_min_floors.get(shared_tank_membership[k])
+                    if floor:
+                        conf["min_temperatures"] = floor
 
                 # Store Target/Desired Temperatures (Legacy behavior)
                 # Only look for 'desired_temperatures'.
@@ -5109,6 +7203,107 @@ class Optimization:
 
         return opt_tp
 
+    @staticmethod
+    def _has_feasible_incumbent(prob, tol: float = 1e-3) -> bool:
+        """Whether a time-limited solve actually holds a feasible solution.
+
+        cvxpy reports ``user_limit`` with an objective value whether or not the
+        solver found a solution before the limit: with HiGHS, a time-out with no
+        incumbent comes back as ``user_limit`` with value 0.0 and every variable
+        at 0, violating the constraints. So a value is no proof. HiGHS reports the
+        primal solution status (2 = feasible); for other solvers the constraints
+        are checked directly, and so are the boolean and integer variables, which
+        are not in the constraint list: values from an LP relaxation satisfy the
+        constraints but can be fractional.
+        """
+        if prob is None or getattr(prob, "value", None) is None:
+            return False
+        try:
+            stats = getattr(prob, "solver_stats", None)
+            extra = getattr(stats, "extra_stats", None)
+            primal_status = getattr(extra, "primal_solution_status", None)
+            if primal_status is not None:
+                return int(primal_status) == 2
+            for constraint in prob.constraints:
+                violation = constraint.violation()
+                if violation is None:
+                    return False
+                if np.max(np.abs(np.atleast_1d(violation)), initial=0.0) > tol:
+                    return False
+            variables = prob.variables() if callable(getattr(prob, "variables", None)) else []
+            for variable in variables:
+                is_boolean = variable.attributes.get("boolean")
+                marked = is_boolean or variable.attributes.get("integer")
+                if not marked:
+                    continue
+                if variable.value is None:
+                    return False
+                values = np.asarray(variable.value, dtype=float)
+                if marked is not True:  # a list of index tuples
+                    values = values[tuple(np.array(marked).T)]
+                values = np.atleast_1d(values)
+                if np.max(np.abs(values - np.round(values)), initial=0.0) > tol:
+                    return False
+                if is_boolean and (
+                    np.min(values, initial=0.0) < -tol or np.max(values, initial=1.0) > 1 + tol
+                ):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _needs_relaxed_retry(status, value, feasible_incumbent: bool = False) -> bool:
+        """Whether a solve is discarded for the binary-relaxed fallback.
+
+        A ``user_limit`` status means the MILP solver hit its time limit. When it
+        carries a feasible incumbent (``feasible_incumbent``, see
+        ``_has_feasible_incumbent``) that near-optimal plan is BETTER than the
+        relaxed fallback (which drops the semi-continuous binaries, so it can run a
+        min-power source below its physical floor), so it is kept. Without proof of
+        a feasible incumbent it is discarded. Otherwise fall back only when the
+        solve is unusable: infeasible, unbounded, no status, or no objective value.
+        """
+        if status == "user_limit":
+            return not feasible_incumbent or value is None
+        return status in ("infeasible", "unbounded", None) or value is None
+
+    @staticmethod
+    def _accept_dp_resolve(status, value, feasible_incumbent: bool = False) -> bool:
+        """Whether the DP refinement's re-solve result is usable.
+
+        Defined as the exact complement of ``_needs_relaxed_retry`` so the DP
+        re-solve accepts and rejects statuses with the SAME policy as the main
+        solve path. A single shared predicate keeps the two from drifting apart.
+        """
+        status_norm = str(status).lower() if status is not None else None
+        return not Optimization._needs_relaxed_retry(status_norm, value, feasible_incumbent)
+
+    @staticmethod
+    def _dp_resolve_opts(solver_opts: dict) -> dict:
+        """Solver options for the DP refinement's re-solve: half the time budget.
+
+        The re-solve runs AFTER the main solve may already have spent its full
+        time limit; handing it the full budget again can nearly double a cycle's
+        wall clock on exactly the hard problems that hit the limit. Half the
+        budget (floor 10 s) applies to each solver's own limit option: HiGHS
+        ``time_limit``, Gurobi ``TimeLimit`` and CPLEX ``cplex_params['timelimit']``.
+        A re-solve that times out without a feasible solution is rejected by
+        ``_accept_dp_resolve`` and the static solve is kept. Returns a copy - never mutates the input.
+        """
+
+        def half(value):
+            return max(10.0, float(value) / 2.0)
+
+        opts = dict(solver_opts)
+        for key in ("time_limit", "TimeLimit"):
+            if key in opts:
+                opts[key] = half(opts[key])
+        cplex = opts.get("cplex_params")
+        if isinstance(cplex, dict) and "timelimit" in cplex:
+            opts["cplex_params"] = {**cplex, "timelimit": half(cplex["timelimit"])}
+        return opts
+
     def perform_optimization(
         self,
         data_opt: pd.DataFrame,
@@ -5118,8 +7313,8 @@ class Optimization:
         unit_prod_price: np.array,
         soc_init: float | list | None = None,
         soc_final: float | list | None = None,
-        soc_target: float | None = None,
-        soc_target_timestep: int | None = None,
+        soc_target: float | list | None = None,
+        soc_target_timestep: int | list | None = None,
         current_period_peak: float | None = None,
         capacity_charge_window: list | None = None,
         capacity_charge_consideration: list | None = None,
@@ -5132,9 +7327,14 @@ class Optimization:
         min_power_of_deferrable_loads: list | None = None,
         debug: bool | None = False,
         stage_times: dict[str, float] | None = None,
+        battery_availability: float | list | None = None,
+        battery_discharge_energy_max: float | list | None = None,
+        def_availability: float | list | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform the actual optimization using Convex Programming (CVXPY).
+        Serializes execution per Optimization instance to prevent concurrent requests
+        from mixing parameter updates and solve state.
         Includes automatic fallback to relaxed LP if MILP fails or times out.
 
         If ``stage_times`` is provided, the wall-clock duration of three
@@ -5149,8 +7349,93 @@ class Optimization:
         ``number_of_batteries`` entries (#610); passing per-battery values
         through from command_line.py at runtime is command_line.py's job -
         this signature already accepts the list shape today.
+
+        ``battery_availability`` (see _normalize_battery_availability) scales
+        each battery's charge/discharge power limit per timestep, so a battery
+        that is only connected part of the horizon (an EV) can be modelled
+        without changing ``number_of_batteries``. ``battery_discharge_energy_max``
+        caps the energy each battery may deliver over the horizon (Wh, battery
+        side; ``None`` = no cap). ``soc_target``/``soc_target_timestep`` accept a
+        per-battery list too; a battery with a target but no timestep gets it at
+        its last connected timestep (the departure); pass that battery's
+        ``soc_final`` equal to the target, since its SOC is frozen afterwards.
+
+        ``def_availability`` is the same per-timestep fraction for each
+        deferrable load (see _apply_def_availability): it scales the load's
+        power ceiling, and ``0`` keeps the load off in that step whatever else
+        would force it on.
         """
+        with self._solve_lock:
+            return self._perform_optimization_locked(
+                data_opt=data_opt,
+                p_pv=p_pv,
+                p_load=p_load,
+                unit_load_cost=unit_load_cost,
+                unit_prod_price=unit_prod_price,
+                soc_init=soc_init,
+                soc_final=soc_final,
+                soc_target=soc_target,
+                soc_target_timestep=soc_target_timestep,
+                current_period_peak=current_period_peak,
+                capacity_charge_window=capacity_charge_window,
+                capacity_charge_consideration=capacity_charge_consideration,
+                capacity_charge_current_interval_history=capacity_charge_current_interval_history,
+                def_total_hours=def_total_hours,
+                def_total_timestep=def_total_timestep,
+                def_start_timestep=def_start_timestep,
+                def_end_timestep=def_end_timestep,
+                def_init_temp=def_init_temp,
+                min_power_of_deferrable_loads=min_power_of_deferrable_loads,
+                debug=debug,
+                stage_times=stage_times,
+                battery_availability=battery_availability,
+                battery_discharge_energy_max=battery_discharge_energy_max,
+                def_availability=def_availability,
+            )
+
+    def _perform_optimization_locked(
+        self,
+        data_opt: pd.DataFrame,
+        p_pv: np.array,
+        p_load: np.array,
+        unit_load_cost: np.array,
+        unit_prod_price: np.array,
+        soc_init: float | list | None = None,
+        soc_final: float | list | None = None,
+        soc_target: float | list | None = None,
+        soc_target_timestep: int | list | None = None,
+        current_period_peak: float | None = None,
+        capacity_charge_window: list | None = None,
+        capacity_charge_consideration: list | None = None,
+        capacity_charge_current_interval_history: list | None = None,
+        def_total_hours: list | None = None,
+        def_total_timestep: list | None = None,
+        def_start_timestep: list | None = None,
+        def_end_timestep: list | None = None,
+        def_init_temp: list | None = None,
+        min_power_of_deferrable_loads: list | None = None,
+        debug: bool | None = False,
+        stage_times: dict[str, float] | None = None,
+        battery_availability: float | list | None = None,
+        battery_discharge_energy_max: float | list | None = None,
+        def_availability: float | list | None = None,
+    ) -> pd.DataFrame:
         _build_start_perf = time.perf_counter() if stage_times is not None else 0.0
+        # Shared thermal tanks bake forecast-dependent physics into constraints as constants.
+        # Rebuild problem when forecast inputs change to ensure fresh forecasts are applied.
+        if self.optim_conf.get("shared_thermal_tanks"):
+            fp_parts = []
+            if "outdoor_temperature_forecast" in data_opt.columns:
+                fp_parts.append(data_opt["outdoor_temperature_forecast"].to_numpy().tobytes())
+            if "ghi" in data_opt.columns:
+                fp_parts.append(data_opt["ghi"].to_numpy().tobytes())
+            if p_load is not None:
+                fp_parts.append(np.asarray(p_load).tobytes())
+            current_fp = hash(tuple(fp_parts))
+            if getattr(self, "_shared_tank_fp", None) != current_fp:
+                if getattr(self, "_shared_tank_fp", None) is not None:
+                    self.prob = None
+                self._shared_tank_fp = current_fp
         # Dynamic Resizing
         # If the input data length differs from the initialized N, we must rebuild the problem.
         current_n = len(data_opt)
@@ -5177,6 +7462,9 @@ class Optimization:
 
             # Re-initialize the intermediate SOC target mask with the new horizon (#553)
             self._init_soc_target_params()
+
+            # Re-initialize the per-battery availability ceilings with the new horizon
+            self._init_battery_availability_params()
 
             # Re-initialize the capacity-charge window mask with the new horizon
             # (issue #623, Phase 3) - it is a vector param, so unlike the scalar
@@ -5239,6 +7527,37 @@ class Optimization:
             soc_init_list = None
             soc_final_list = None
 
+        # Per-battery availability (EV / V2G). Resolved first because the SOC
+        # target below defaults its timestep to the last connected step.
+        n_steps = self.num_timesteps
+        avail_list = None
+        if self.optim_conf["set_use_battery"]:
+            avail_list = self._normalize_battery_availability(battery_availability, n_steps)
+            energy_max_list = self._normalize_soc_arg(
+                battery_discharge_energy_max, "battery_discharge_energy_max"
+            )
+            for k in range(self.n_batt):
+                chg_k = float(batt_conf["charge_power_max"][k])
+                dis_k = float(batt_conf["discharge_power_max"][k])
+                self.param_batt_charge_ceiling[k].value = avail_list[k] * chg_k
+                self.param_batt_discharge_ceiling[k].value = avail_list[k] * dis_k
+                unreachable = dis_k * self.time_step * n_steps + 1.0
+                if energy_max_list[k] is None:
+                    self.param_batt_discharge_energy_max[k].value = unreachable
+                    continue
+                try:
+                    budget_k = float(energy_max_list[k])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"battery_discharge_energy_max[{k}] must be a number (Wh) or "
+                        f"null, got {energy_max_list[k]!r}"
+                    ) from exc
+                if not budget_k >= 0.0:
+                    raise ValueError(
+                        f"battery_discharge_energy_max[{k}] must be >= 0 Wh, got {budget_k}"
+                    )
+                self.param_batt_discharge_energy_max[k].value = min(budget_k, unreachable)
+
         # Optional intermediate SOC target (issue #553).
         # Reset the floor on EVERY call so a target from a previous run is
         # cleared (the constraint is then a no-op). When a target is requested,
@@ -5247,21 +7566,33 @@ class Optimization:
         # elsewhere). The np multiply happens here at set-time, so the problem
         # stays DPP / warm-start safe.
         #
-        # #610: soc_target itself is not yet a per-battery runtime input, so
-        # the identical target FRACTION is applied to every battery's floor,
-        # each against ITS OWN capacity/charge-power (param_soc_target_floor
-        # is already a per-battery Parameter list, so a future per-battery
-        # target only needs to change the value each entry receives).
+        # soc_target and soc_target_timestep accept a bare value (broadcast to
+        # every battery, the #553 behaviour) or one entry per battery; a None
+        # entry means no target for that battery.
+        for k in range(self.n_batt):
+            self.param_soc_target_floor[k].value = np.zeros(self.num_timesteps)
         if self.optim_conf["set_use_battery"] and soc_target is not None:
-            soc_target_raw = float(soc_target)
+            target_list = self._normalize_soc_arg(soc_target, "soc_target")
+            timestep_list = self._normalize_soc_arg(soc_target_timestep, "soc_target_timestep")
             for k in range(self.n_batt):
+                if target_list[k] is None:
+                    continue
+                soc_target_raw = float(target_list[k])
                 soc_min_k = batt_conf["soc_min"][k]
                 soc_max_k = batt_conf["soc_max"][k]
                 soc_target_clamped = min(max(soc_target_raw, soc_min_k), soc_max_k)
-                if soc_target_timestep is None:
-                    k_target = self.num_timesteps - 1
+                avail_k = avail_list[k]
+                connected = np.flatnonzero(avail_k > 0)
+                if connected.size == 0:
+                    self.logger.warning(
+                        f"Battery {k}: soc_target={soc_target_raw} ignored, the battery "
+                        "is not available at any timestep of the horizon."
+                    )
+                    continue
+                if timestep_list[k] is None:
+                    k_target = int(connected[-1])
                 else:
-                    k_target = min(max(int(float(soc_target_timestep)), 0), self.num_timesteps - 1)
+                    k_target = min(max(int(float(timestep_list[k])), 0), self.num_timesteps - 1)
                 # Observability: warn (do not change the constraint) when the request
                 # was out of range or appears unreachable in time given charge power.
                 if soc_target_raw < soc_min_k or soc_target_raw > soc_max_k:
@@ -5270,34 +7601,38 @@ class Optimization:
                         f"[{soc_min_k}, {soc_max_k}], clamping to soc_target={soc_target_clamped}"
                     )
                 cap_k = batt_conf["cap"][k]
-                # Max stored-energy gain per step is battery_charge_power_max * time_step:
-                # the charge constraint caps grid-side power at max_chg / eff so the
-                # battery-side energy added (grid * eff) is max_chg * time_step, i.e. the
+                # Max stored-energy gain per step is the charge ceiling * time_step:
+                # the charge constraint caps grid-side power at ceiling / eff so the
+                # battery-side energy added (grid * eff) is ceiling * time_step, i.e. the
                 # charge efficiency cancels. (Do not multiply by efficiency again here, or
                 # the bound under-estimates reach and warns spuriously when eff < 1.)
-                reach = (
-                    soc_init_list[k]
-                    + (batt_conf["charge_power_max"][k] * self.time_step * (k_target + 1)) / cap_k
-                )
+                charge_ceiling = avail_k[: k_target + 1] * batt_conf["charge_power_max"][k]
+                reach = soc_init_list[k] + float(np.sum(charge_ceiling)) * self.time_step / cap_k
                 if soc_target_clamped > reach + 1e-6:
                     self.logger.warning(
                         f"Battery {k}: intermediate soc_target={soc_target_clamped} may be "
                         f"unreachable by timestep {k_target}: from "
                         f"soc_init={soc_init_list[k]} the maximum reachable SoC is "
-                        f"~{reach:.3f} given battery_charge_power_max; the optimization "
-                        "may be infeasible."
+                        f"~{reach:.3f} given battery_charge_power_max and "
+                        "battery_availability; the optimization may be infeasible."
                     )
                 floor = np.zeros(self.num_timesteps)
                 floor[k_target] = soc_target_clamped * cap_k
                 self.param_soc_target_floor[k].value = floor
+                # After departure the SOC is frozen, so the end-of-horizon SOC
+                # IS the departure SOC: a lower soc_final only adds a constant
+                # terminal penalty and hides the intent. Point the caller at it.
+                if avail_k[-1] == 0 and soc_final_list[k] < soc_target_clamped - 1e-6:
+                    self.logger.warning(
+                        f"Battery {k}: soc_final={soc_final_list[k]} is below the departure "
+                        f"soc_target={soc_target_clamped}; pass soc_final equal to the "
+                        "target for a battery that leaves inside the horizon."
+                    )
                 self.logger.debug(
                     f"Battery {k}: intermediate SOC target enabled: SoC >= "
                     f"{soc_target_clamped} by timestep {k_target} (requested "
-                    f"soc_target={soc_target}, soc_target_timestep={soc_target_timestep})."
+                    f"soc_target={target_list[k]}, soc_target_timestep={timestep_list[k]})."
                 )
-        else:
-            for k in range(self.n_batt):
-                self.param_soc_target_floor[k].value = np.zeros(self.num_timesteps)
 
         # Capacity / demand charge runtime inputs: the already-incurred
         # incumbent peak (issue #623 Phase 2), the tariff demand-window mask
@@ -5395,6 +7730,9 @@ class Optimization:
         min_power_of_deferrable_loads = pad_list(
             min_power_of_deferrable_loads, num_deferrable_loads
         )
+        # The per-call values the constraints are built with (read by
+        # _warn_capped_level_below_min_power).
+        self._min_power_of_deferrable_loads = list(min_power_of_deferrable_loads)
         def_total_hours = pad_list(def_total_hours, num_deferrable_loads)
         def_start_timestep = pad_list(def_start_timestep, num_deferrable_loads)
         def_end_timestep = pad_list(def_end_timestep, num_deferrable_loads)
@@ -5415,11 +7753,30 @@ class Optimization:
         # Price the terminal-SoC miss well above the dearest import slot so the target is
         # never traded away for energy cost; the 0.001 converts the Wh slacks to kWh. The
         # floor keeps the penalty meaningful when every tariff is zero or negative.
+        # Under self-consumption grid import costs SELF_CONSUMPTION_BIGM times the tariff,
+        # so the miss is scaled by the same factor to stay above the import it would save.
+        penalty_scale = SELF_CONSUMPTION_BIGM if self.costfun == "self-consumption" else 1.0
         self.param_soc_final_penalty.value = (
             0.001
             * SOC_FINAL_DEVIATION_PENALTY_FACTOR
+            * penalty_scale
             * max(float(np.max(np.maximum(np.asarray(unit_load_cost, dtype=float), 0.0))), 1e-3)
         )
+        # If soc_final_reward_factor is defined, missing the final SOC
+        # with more energy is rewarded by the purchase cost of the
+        # excess final energy multiplied by the reward factor. If not
+        # defined, the same penalty applies.
+        reward_factor = self.optim_conf.get("battery_soc_final_reward_factor", 0.0)
+        if reward_factor > 0.0:
+            self.param_soc_final_reward.value = (
+                0.001 * reward_factor * float(np.asarray(unit_load_cost, dtype=float)[-1])
+            )
+        else:
+            self.param_soc_final_reward.value = (
+                -0.001
+                * SOC_FINAL_DEVIATION_PENALTY_FACTOR
+                * max(float(np.max(np.maximum(np.asarray(unit_load_cost, dtype=float), 0.0))), 1e-3)
+            )
         self.param_prod_price.value = unit_prod_price
 
         # Per-load cost forecast overrides. Default each load's per-timestep cost
@@ -5494,10 +7851,49 @@ class Optimization:
                 self.param_soc_high_gap[k].value = high_gap_wh
                 self.param_soc_low_required[k].value = 1.0 if low_gap_wh > 0 else 0.0
                 self.param_soc_high_required[k].value = 1.0 if high_gap_wh > 0 else 0.0
+                # A partly available battery (EV) can only recover into its SOC
+                # band while connected, and a discharge budget caps how far it
+                # can come down. When the gap exceeds what the window or the
+                # budget allows, leave it outside the band instead of going
+                # infeasible.
+                if avail_list is not None and (
+                    np.any(avail_list[k] < 1) or energy_max_list[k] is not None
+                ):
+                    chg_reach = float(np.sum(self.param_batt_charge_ceiling[k].value))
+                    dis_reach = float(np.sum(self.param_batt_discharge_ceiling[k].value))
+                    dis_reach = min(
+                        dis_reach * self.time_step,
+                        float(self.param_batt_discharge_energy_max[k].value),
+                    )
+                    if low_gap_wh > chg_reach * self.time_step + 1e-6:
+                        self.logger.warning(
+                            f"Battery {k}: soc_init={soc_init_list[k]} is below soc_min and "
+                            "cannot recover inside its availability window; the minimum "
+                            "SOC is not enforced for it in this run."
+                        )
+                        self.param_soc_low_required[k].value = 0.0
+                    if high_gap_wh > dis_reach + 1e-6:
+                        self.logger.warning(
+                            f"Battery {k}: soc_init={soc_init_list[k]} is above soc_max and "
+                            "cannot recover inside its availability window or discharge "
+                            "budget; the maximum SOC is not enforced for it in this run."
+                        )
+                        self.param_soc_high_required[k].value = 0.0
 
         # Update Window Mask Parameters for Deferrable Loads
         # This allows warm-starting even when time windows change
         n = len(p_pv)
+        # Per-load availability (def_availability), validated before any
+        # parameter is written; applied after the mask-widening steps below.
+        def_avail_list = None
+        if def_availability is not None:
+            def_avail_list = self._normalize_availability(
+                def_availability,
+                n,
+                num_deferrable_loads,
+                "def_availability",
+                "number_of_deferrable_loads",
+            )
         # Track which loads have a configured-but-empty window so we can
         # also deactivate their binary vars and energy constraints below.
         # An empty window means the user's [start, end] is entirely outside
@@ -5711,6 +8107,11 @@ class Optimization:
             #      to honour the tail of an in-progress min-on window (issue #952).
             # When both apply to the same k, take the ELEMENTWISE MAX (OR) of the two
             # masks -- the stricter force wins, and neither overwrites the other.
+            # Shared-tank members are exempt from the single-constant pin (A): they are
+            # temperature-driven, and pinning a capped source ON while the tank starts
+            # above its max_supply_temperature would contradict the cap gate
+            # (p[0] >= min_power vs p[0] == 0) and force the relaxed-LP fallback,
+            # silently dropping single_constant for every load.
             if k < len(self.param_running_lb):
                 current_state = (
                     self.param_def_current_state[k].value > 0.5
@@ -5726,6 +8127,7 @@ class Optimization:
                     and constraint_active
                     and required_timesteps > 0
                     and k not in window_empty_loads
+                    and k not in shared_tank_membership
                 ):
                     # Re-derive the configured window end so we respect def_end_timestep.
                     if def_total_timestep and def_total_timestep[k] > 0:
@@ -5943,14 +8345,13 @@ class Optimization:
         # Thermal loads (thermal_config, thermal_battery, and shared-tank sources) are
         # always active since they're driven by temperature constraints, not operating
         # timesteps. Shared-tank members already skip the energy/operating constraints
-        # above (is_thermal_battery), so they must not be deactivated here either —
-        # otherwise a member with operating_hours == 0 (the natural setting for a
-        # temperature-driven source) is pinned to 0 W, the tank cannot hold its
-        # min_temperatures band, and the problem goes infeasible. Sequence loads
-        # (list-valued nominal power) are likewise always active: their runtime is the
-        # length of the sequence and operating_hours is meaningless for them, so a value
-        # of 0 must not deactivate the load (issue #887). The energy constraint already
-        # exempts sequence loads, so this keeps param_load_active consistent with it.
+        # above (is_thermal_battery), so they must not be deactivated here either.
+        # Sequence loads (list-valued nominal power) are likewise always active: their
+        # runtime is the length of the sequence and operating_hours is meaningless for
+        # them, so a value of 0 must not deactivate the load (issue #887). The energy
+        # constraint already exempts sequence loads, so this keeps param_load_active
+        # consistent with it. (shared_tank_membership computed above, before the
+        # energy-parameter loop.)
         nominal_powers = self.optim_conf["nominal_power_of_deferrable_loads"]
         for k in range(min(num_deferrable_loads, len(self.param_load_active))):
             is_thermal = k in self.param_thermal or k in shared_tank_membership
@@ -6003,6 +8404,13 @@ class Optimization:
                         f"Deferrable load {k}: deactivated (no operating timesteps, not thermal)"
                     )
 
+        # Per-load availability. Applied LAST, after every mechanism above that
+        # widens a window mask or forces a load on (single-constant pin, min-on
+        # remainder, current-power pin, shared-tank window reset), so none of
+        # them can re-open a step in which the load must not run.
+        if def_avail_list is not None:
+            self._apply_def_availability(def_avail_list)
+
         # Stress configs are needed by the retry path even when self.prob is
         # cached from a previous call (see #770). Start from the configs built
         # with the cached problem so a cached-retry rebuild keeps the stress
@@ -6050,7 +8458,10 @@ class Optimization:
                     self.plant_conf.get("inverter_ac_input_max", 0),
                 )
                 inv_stress_conf = self._setup_stress_cost(
-                    "inverter_stress_cost", P_nom_inverter_max, "inv"
+                    "inverter_stress_cost",
+                    "inverter_stress_segments",
+                    P_nom_inverter_max,
+                    "inv",
                 )
                 if inv_stress_conf["active"]:
                     self.vars["inv_stress_cost"] = inv_stress_conf["vars"]
@@ -6176,11 +8587,10 @@ class Optimization:
                     f"lp_solver_mip_rel_gap={mip_gap} exceeds 1.0 (100%), clamping to 1.0"
                 )
                 mip_gap = 1.0
-            if mip_gap > 0:
-                solver_opts["mip_rel_gap"] = float(mip_gap)
-                self.logger.debug(f"MIP gap tolerance set to {mip_gap:.1%}")
-            else:
-                self.logger.debug("MIP gap tolerance disabled (exact optimal)")
+            # Always pass the option: omitting it lets HiGHS use its own
+            # non-zero default, even when exact optimality was requested.
+            solver_opts["mip_rel_gap"] = float(mip_gap)
+            self.logger.debug(f"MIP gap tolerance set to {mip_gap:.1%}")
 
         # Stage-timer breadcrumb: end of build phase, start of solve phase.
         _solve_start_perf = time.perf_counter() if stage_times is not None else 0.0
@@ -6194,21 +8604,48 @@ class Optimization:
             self.logger.warning(
                 f"Solver {selected_solver} failed: {e}. Checking status for fallback..."
             )
+            # cvxpy leaves status and value from the PREVIOUS solve in place when
+            # solve() raises, so a reused problem would republish the old plan as
+            # Optimal. Mark the attempt as failed so the rescue path runs.
+            self.prob._status = None
 
+        # DP COP refinement. Self-triggering - corrects and re-solves only the
+        # heat-pump tanks whose COP the static solve got wrong; a no-op when every
+        # tank is already self-consistent or when cop_solver=static.
+        refined = None
+        try:
+            refined = self._refine_cop_with_dp(selected_solver, solver_opts)
+        except Exception as exc:
+            self.logger.warning("DP COP refinement skipped (%s)", exc)
         # The problem whose status/value the extraction below reads. Stays
-        # self.prob on a clean solve; points at the relaxed problem after a
-        # retry WITHOUT replacing self.prob, so the cached problem survives
+        # self.prob on a clean solve; points at the accepted DP re-solve when the
+        # refinement produced one, or at the relaxed problem after a retry - in
+        # every case WITHOUT replacing self.prob, so the cached problem survives
         # intact for the next run (issue #1048: caching prob_relaxed made the
-        # stress-free, binary-relaxed rescue permanent).
-        solved_prob = self.prob
+        # stress-free, binary-relaxed rescue permanent, and caching the refined
+        # problem would bake one run's DP temperature bounds into every later run
+        # the same way). prob2 shares the static solve's variables, so the refined
+        # values are visible either way; only the objective/status live on prob2.
+        solved_prob = refined if refined is not None else self.prob
+        # Transfer variables of the problem whose values are published; the
+        # relaxed rescue builds its own and the restore below points
+        # self.transfer_vars back at the cached problem's.
+        solved_transfer_vars = getattr(self, "transfer_vars", {})
 
-        # Check for failure or "bad" status
-        # Note: "user_limit" often means timeout. "infeasible" means configuration conflict.
-        fail_statuses = ["infeasible", "unbounded", "user_limit", None]
-        if self.prob.status in fail_statuses or self.prob.value is None:
+        # Check for failure or "bad" status. A 'user_limit' (time-limited) solve that
+        # still carries a feasible incumbent is kept, not discarded for the
+        # binary-relaxed LP fallback - see _needs_relaxed_retry.
+        # An accepted DP re-solve already passed the same acceptance policy, so it
+        # never needs the rescue; only the static solve is a retry candidate.
+        feasible_incumbent = self.prob.status == "user_limit" and self._has_feasible_incumbent(
+            self.prob
+        )
+        if refined is None and self._needs_relaxed_retry(
+            self.prob.status, self.prob.value, feasible_incumbent
+        ):
             self.logger.warning(
                 f"Optimization failed with status: '{self.prob.status}'. "
-                "Retrying with relaxed constraints (Continuous LP)..."
+                "Retrying with the on/off constraints relaxed..."
             )
 
             # Backup Configuration
@@ -6226,7 +8663,15 @@ class Optimization:
             # state must keep pointing at the cached problem's objects, or later
             # cache-hit runs would read variables the solver no longer touches
             # (issue #1048).
-            hybrid_var_keys = ("p_dc_ac", "p_ac_dc", "is_dc_sourcing")
+            hybrid_var_keys = (
+                "p_dc_ac",
+                "p_ac_dc",
+                "is_dc_sourcing",
+                "inv_curve_dc_ac_u",
+                "inv_curve_dc_ac_b",
+                "inv_curve_ac_dc_u",
+                "inv_curve_ac_dc_b",
+            )
             original_hybrid_vars = {
                 key: self.vars[key] for key in hybrid_var_keys if key in self.vars
             }
@@ -6235,95 +8680,134 @@ class Optimization:
                 for k, params in self.param_thermal.items()
                 if "q_input_var" in params
             }
+            original_transfer_vars = getattr(self, "transfer_vars", {})
+            original_dp_tank_entries = self._dp_tank_entries
+            original_semi_cont_on_level = self._semi_cont_on_level
 
-            # Relax Configuration: Disable Binary Logic
-            n_def = self.optim_conf["number_of_deferrable_loads"]
-            self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * n_def
-            self.optim_conf["set_deferrable_load_single_constant"] = [False] * n_def
-
-            # Re-build Constraints (Clean Slate)
-            constraints_relaxed = self.constraints[:]  # Start with base bound constraints
-
-            # Re-apply main constraints
-            self._add_main_power_balance_constraints(constraints_relaxed)
-            # (Note: We reuse previous stress configs as they don't change with relaxation.
-            # On a cached-problem retry they come from self._*_stress_conf, the configs
-            # the cached problem was built with, see issue #1048.)
-            # Guard on feature flags, matching the build block's own gating: these
-            # builders also add the non-stress battery/inverter constraints, so they
-            # must run whenever the feature is on, stress cost or not.
-            if self.plant_conf.get("inverter_is_hybrid", False):
-                self._add_hybrid_inverter_constraints(constraints_relaxed, inv_stress_conf)
-            if self.optim_conf.get("set_use_battery", False):
-                self._add_battery_constraints(constraints_relaxed, batt_stress_conf)
-
-            if self.plant_conf["compute_curtailment"]:
-                constraints_relaxed.append(self.vars["p_pv_curtailment"] <= self.param_pv_forecast)
-            if self.costfun == "self-consumption" and "SC" in self.vars:
-                constraints_relaxed.append(self.vars["SC"] <= self.param_pv_forecast)
-                constraints_relaxed.append(
-                    self.vars["SC"] <= self.param_load_forecast + self.vars["p_def_sum"]
-                )
-
-            # Re-call deferrable load constraints (Skipping binary logic due to
-            # config change). The rebuilt thermal artifacts go into the LOCALS
-            # used by this run's extraction; the instance attributes keep the
-            # build-time artifacts paired with the cached problem (issue #1048).
-            predicted_temps, heating_demands, penalty_terms_total, q_inputs = (
-                self._add_deferrable_load_constraints(
-                    constraints_relaxed,
-                    data_opt,
-                    def_total_hours,
-                    def_total_timestep,
-                    def_start_timestep,
-                    def_end_timestep,
-                    def_init_temp,
-                    min_power_of_deferrable_loads,
-                    p_load,
-                )
-            )
-
-            # Deferrable Load Group Constraints (shared power budget only in relaxed mode)
-            self._add_deferrable_group_constraints(constraints_relaxed, relaxed=True)
-
-            # Re-build Objective
-            objective_expr = self._build_objective_function(batt_stress_conf, inv_stress_conf)
-            if not isinstance(penalty_terms_total, int) or penalty_terms_total != 0:
-                objective_expr.args[0] += penalty_terms_total
-
-            # Solve Relaxed Problem
-            prob_relaxed = cp.Problem(objective_expr, constraints_relaxed)
+            # The rebuild switches the configuration to the relaxed form and
+            # repoints instance state at the relaxed build; restore both even
+            # when building or solving the relaxed problem raises.
             try:
-                self.logger.info("Solving relaxed problem (LP)...")
-                prob_relaxed.solve(solver=selected_solver, **solver_opts)
+                # Relax Configuration: Disable Binary Logic
+                n_def = self.optim_conf["number_of_deferrable_loads"]
+                self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * n_def
+                self.optim_conf["set_deferrable_load_single_constant"] = [False] * n_def
 
-                if prob_relaxed.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-                    self.logger.info("Relaxed optimization successful!")
-                    # Mark status so user knows it was relaxed
-                    prob_relaxed._status = "Optimal (Relaxed)"
-                else:
-                    self.logger.error(
-                        f"Relaxed optimization also failed with status: {prob_relaxed.status}"
+                # Re-build Constraints (Clean Slate)
+                constraints_relaxed = self.constraints[:]  # Start with base bound constraints
+
+                # Re-apply main constraints
+                self._add_main_power_balance_constraints(constraints_relaxed)
+                # (Note: We reuse previous stress configs as they don't change with relaxation.
+                # On a cached-problem retry they come from self._*_stress_conf, the configs
+                # the cached problem was built with, see issue #1048.)
+                # Guard on feature flags, matching the build block's own gating: these
+                # builders also add the non-stress battery/inverter constraints, so they
+                # must run whenever the feature is on, stress cost or not.
+                if self.plant_conf.get("inverter_is_hybrid", False):
+                    self._add_hybrid_inverter_constraints(constraints_relaxed, inv_stress_conf)
+                if self.optim_conf.get("set_use_battery", False):
+                    self._add_battery_constraints(constraints_relaxed, batt_stress_conf)
+
+                if self.plant_conf["compute_curtailment"]:
+                    constraints_relaxed.append(
+                        self.vars["p_pv_curtailment"] <= self.param_pv_forecast
                     )
-                # Use the relaxed result for this run only. self.prob keeps
-                # pointing at the clean cached problem: the relaxed solve is a
-                # one-shot rescue, never a permanent replacement (issue #1048).
-                solved_prob = prob_relaxed
-            except Exception as e:
-                self.logger.error(f"Relaxed optimization crashed: {e}")
+                if self.costfun == "self-consumption" and "SC" in self.vars:
+                    constraints_relaxed.append(self.vars["SC"] <= self.param_pv_forecast)
+                    constraints_relaxed.append(
+                        self.vars["SC"] <= self.param_load_forecast + self.vars["p_def_sum"]
+                    )
 
-            # 5. Restore Configuration
-            self.optim_conf["treat_deferrable_load_as_semi_cont"] = original_semi_cont
-            self.optim_conf["set_deferrable_load_single_constant"] = original_single_const
+                # Re-call deferrable load constraints (Skipping binary logic due to
+                # config change). The rebuilt thermal artifacts go into the LOCALS
+                # used by this run's extraction; the instance attributes keep the
+                # build-time artifacts paired with the cached problem (issue #1048).
+                self._relaxed_rebuild = True
+                predicted_temps, heating_demands, penalty_terms_total, q_inputs = (
+                    self._add_deferrable_load_constraints(
+                        constraints_relaxed,
+                        data_opt,
+                        def_total_hours,
+                        def_total_timestep,
+                        def_start_timestep,
+                        def_end_timestep,
+                        def_init_temp,
+                        min_power_of_deferrable_loads,
+                        p_load,
+                    )
+                )
 
-            # Restore the instance-held references the rebuild replaced, so the
-            # next run reads the cached problem's own objects (issue #1048).
-            self.vars.update(original_hybrid_vars)
-            for k, params in self.param_thermal.items():
-                if k in original_q_input_vars:
-                    params["q_input_var"] = original_q_input_vars[k]
-                else:
-                    params.pop("q_input_var", None)
+                # Deferrable Load Group Constraints (shared power budget only in relaxed mode)
+                self._add_deferrable_group_constraints(constraints_relaxed, relaxed=True)
+
+                # Re-build Objective
+                objective_expr = self._build_objective_function(batt_stress_conf, inv_stress_conf)
+                if not isinstance(penalty_terms_total, int) or penalty_terms_total != 0:
+                    objective_expr.args[0] += penalty_terms_total
+
+                # Solve Relaxed Problem
+                prob_relaxed = cp.Problem(objective_expr, constraints_relaxed)
+                try:
+                    self.logger.info("Solving relaxed problem...")
+                    prob_relaxed.solve(solver=selected_solver, **solver_opts)
+
+                    relaxed_ok = prob_relaxed.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]
+                    if prob_relaxed.status == "user_limit" and self._has_feasible_incumbent(
+                        prob_relaxed
+                    ):
+                        # The relaxed problem keeps the mutual-exclusion binaries, so it
+                        # is a MILP too and can itself hit the time limit; a feasible
+                        # incumbent is still a usable relaxed plan.
+                        self.logger.info(
+                            "Relaxed optimization hit the time limit; using its incumbent"
+                        )
+                        relaxed_ok = True
+                    if relaxed_ok:
+                        self.logger.info("Relaxed optimization successful!")
+                        # Mark status so user knows it was relaxed
+                        prob_relaxed._status = "Optimal (Relaxed)"
+                    else:
+                        self.logger.error(
+                            f"Relaxed optimization also failed with status: {prob_relaxed.status}"
+                        )
+                    # Use the relaxed result for this run only. self.prob keeps
+                    # pointing at the clean cached problem: the relaxed solve is a
+                    # one-shot rescue, never a permanent replacement (issue #1048).
+                    solved_prob = prob_relaxed
+                    solved_transfer_vars = self.transfer_vars
+                except Exception as e:
+                    self.logger.error(f"Relaxed optimization crashed: {e}")
+
+            finally:
+                # 5. Restore Configuration
+                self._relaxed_rebuild = False
+                self.optim_conf["treat_deferrable_load_as_semi_cont"] = original_semi_cont
+                self.optim_conf["set_deferrable_load_single_constant"] = original_single_const
+
+                # Restore the instance-held references the rebuild replaced, so the
+                # next run reads the cached problem's own objects (issue #1048).
+                self.vars.update(original_hybrid_vars)
+                self.transfer_vars = original_transfer_vars
+                self._dp_tank_entries = original_dp_tank_entries
+                self._semi_cont_on_level = original_semi_cont_on_level
+                for k, params in self.param_thermal.items():
+                    if k in original_q_input_vars:
+                        params["q_input_var"] = original_q_input_vars[k]
+                    else:
+                        params.pop("q_input_var", None)
+        elif solved_prob.status == "user_limit":
+            extra = getattr(getattr(solved_prob, "solver_stats", None), "extra_stats", None)
+            gap = getattr(extra, "mip_gap", None)
+            self.logger.info(
+                "Accepting time-limited solution (objective %.4g, MIP gap %s) - feasible "
+                "incumbent, skipping the relaxed LP fallback.",
+                solved_prob.value,
+                f"{gap:.2%}" if isinstance(gap, int | float) and np.isfinite(gap) else "unknown",
+            )
+            # Mark it so the downstream status gate keeps this binary-respecting
+            # incumbent instead of discarding it.
+            solved_prob._status = "Optimal (Incumbent)"
 
         # Stage-timer breadcrumb: end of solve phase, start of extract phase.
         _extract_start_perf = time.perf_counter() if stage_times is not None else 0.0
@@ -6339,6 +8823,7 @@ class Optimization:
             cp.OPTIMAL,
             cp.OPTIMAL_INACCURATE,
             "Optimal (Relaxed)",
+            "Optimal (Incumbent)",
         ]:
             self.logger.warning("Cost function cannot be evaluated or Infeasible/Unbounded")
 
@@ -6377,6 +8862,7 @@ class Optimization:
             heating_demands,
             debug,
             q_inputs=q_inputs,
+            transfer_vars=solved_transfer_vars,
         )
         if stage_times is not None:
             stage_times["optim_solve.extract"] = time.perf_counter() - _extract_start_perf
@@ -6399,65 +8885,63 @@ class Optimization:
         :rtype: pandas.DataFrame
 
         """
-        self.logger.info("Perform optimization for perfect forecast scenario")
-        self.days_list_tz = days_list.tz_convert(self.time_zone).round(self.freq)[
-            :-1
-        ]  # Converted to tz and without the current day (today)
-        self.opt_res = pd.DataFrame()
-
-        # List to collect results for faster one-time concatenation
-        results_list = []
-
-        for day in self.days_list_tz:
-            self.logger.info(
-                "Solving for day: " + str(day.day) + "-" + str(day.month) + "-" + str(day.year)
-            )
-            # Prepare data
-            if day.tzinfo is None:
-                day = day.replace(tzinfo=self.time_zone)  # Assign timezone if naive
-            else:
-                day = day.astimezone(self.time_zone)
-            day_start = day
-            day_end = day + self.time_delta - self.freq
-            if day_start.tzinfo != day_end.tzinfo:
-                self.logger.warning(
-                    f"Skipping day {day} as days have different timezone, probably because of DST."
-                )
-                continue  # Skip this day and move to the next iteration
-            else:
-                day_start = day_start.astimezone(self.time_zone).isoformat()
-                day_end = day_end.astimezone(self.time_zone).isoformat()
-                # Generate the date range for the current day
-                day_range = pd.date_range(start=day_start, end=day_end, freq=self.freq)
-            # Check if all timestamps in the range exist in the DataFrame index
-            if not day_range.isin(df_input_data.index).all():
-                self.logger.warning(
-                    f"Skipping day {day} as some timestamps are missing in the data."
-                )
-                continue  # Skip this day and move to the next iteration
-
-            # If all timestamps exist, proceed with the data preparation
-            data_tp = df_input_data.copy().loc[day_range]
-            p_pv = data_tp[self.var_pv].values
-            p_load = data_tp[self.var_load_new].values
-            unit_load_cost = data_tp[self.var_load_cost].values  # currency/kWh
-            unit_prod_price = data_tp[self.var_prod_price].values  # currency/kWh
-
-            # Call optimization function
-            # The new CVXPY implementation will re-use the problem structure automatically
-            opt_tp = self.perform_optimization(
-                data_tp, p_pv, p_load, unit_load_cost, unit_prod_price
-            )
-
-            results_list.append(opt_tp)
-
-        # Concatenate all results at once (Much faster than appending inside the loop)
-        if results_list:
-            self.opt_res = pd.concat(results_list, axis=0)
-        else:
+        with self._solve_lock:
+            self.logger.info("Perform optimization for perfect forecast scenario")
+            # Each window is ``time_delta`` of elapsed time from a UTC midnight of days_list, not a
+            # local calendar day, so a DST change inside it is just 23 or 25 local hours. A window is
+            # selected by UTC instant and needs no rounding (rounding an aware local timestamp raises
+            # in a repeated hour), so any history grid works, UTC or local-midnight anchored; a window
+            # that does not hold all its steps, exactly one freq apart, is skipped.
+            self.days_list_tz = days_list[:-1].tz_convert(self.time_zone)  # Without today
             self.opt_res = pd.DataFrame()
 
-        return self.opt_res
+            # List to collect results for faster one-time concatenation
+            results_list = []
+
+            for day in self.days_list_tz:
+                # Shared thermal tanks bake their forecast-dependent physics (COP,
+                # thermal losses, min/max and start temperatures) in as constants when
+                # the problem is built, and there is no refresh path for them. Re-using
+                # the problem here would re-solve every day against the FIRST day's
+                # weather, so force a rebuild - same cache bypass command_line.py
+                # already applies for issue #970.
+                if self.optim_conf.get("shared_thermal_tanks"):
+                    self.prob = None
+                self.logger.info(
+                    "Solving for day: " + str(day.day) + "-" + str(day.month) + "-" + str(day.year)
+                )
+                day_start = day.tz_convert("UTC")
+                data_tp = df_input_data.loc[
+                    (df_input_data.index >= day_start)
+                    & (df_input_data.index < day_start + self.time_delta)
+                ].sort_index()
+                steps = data_tp.index.to_series().diff().iloc[1:]
+                if len(data_tp) != int(self.time_delta / self.freq) or (steps != self.freq).any():
+                    self.logger.warning(
+                        f"Skipping day {day} as its timestamps are missing, duplicated or irregular."
+                    )
+                    continue  # Skip this day and move to the next iteration
+
+                p_pv = data_tp[self.var_pv].values
+                p_load = data_tp[self.var_load_new].values
+                unit_load_cost = data_tp[self.var_load_cost].values  # currency/kWh
+                unit_prod_price = data_tp[self.var_prod_price].values  # currency/kWh
+
+                # Call optimization function
+                # The new CVXPY implementation will re-use the problem structure automatically
+                opt_tp = self.perform_optimization(
+                    data_tp, p_pv, p_load, unit_load_cost, unit_prod_price
+                )
+
+                results_list.append(opt_tp)
+
+            # Concatenate all results at once (Much faster than appending inside the loop)
+            if results_list:
+                self.opt_res = pd.concat(results_list, axis=0)
+            else:
+                self.opt_res = pd.DataFrame()
+
+            return self.opt_res
 
     def perform_dayahead_forecast_optim(
         self,
@@ -6467,6 +8951,7 @@ class Optimization:
         soc_init: float | list | None = None,
         soc_final: float | list | None = None,
         stage_times: dict[str, float] | None = None,
+        current_period_peak: float | list | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform a day-ahead optimization task using real forecast data. \
@@ -6499,6 +8984,15 @@ class Optimization:
         :param stage_times: Optional dict to record nested sub-stage timings
             (``optim_solve.build`` / ``optim_solve.solve`` / ``optim_solve.extract``).
         :type stage_times: dict, optional
+        :param current_period_peak: Optional peak grid import (in Watts) already \
+            incurred in the current billing period. When the capacity tariff \
+            (``capacity_cost_per_kw`` > 0) is active, the planned import peak is \
+            floored at this value, so importing up to the already-paid peak is free \
+            (only NEW peaks above it are priced). Mirrors the MPC path; without it \
+            the dayahead solver minimises the absolute peak and ignores the floor. \
+            With several capacity components (a list ``capacity_cost_per_kw``), \
+            one value per component.
+        :type current_period_peak: float | list, optional
         :return: opt_res: A DataFrame containing the optimization results
         :rtype: pandas.DataFrame
 
@@ -6521,6 +9015,7 @@ class Optimization:
             unit_prod_price,
             soc_init=soc_init,
             soc_final=soc_final,
+            current_period_peak=current_period_peak,
             stage_times=stage_times,
         )
         return self.opt_res
@@ -6533,8 +9028,8 @@ class Optimization:
         prediction_horizon: int,
         soc_init: float | list | None = None,
         soc_final: float | list | None = None,
-        soc_target: float | None = None,
-        soc_target_timestep: int | None = None,
+        soc_target: float | list | None = None,
+        soc_target_timestep: int | list | None = None,
         current_period_peak: float | None = None,
         capacity_charge_window: list | None = None,
         capacity_charge_consideration: list | None = None,
@@ -6544,6 +9039,9 @@ class Optimization:
         def_start_timestep: list | None = None,
         def_end_timestep: list | None = None,
         stage_times: dict[str, float] | None = None,
+        battery_availability: float | list | None = None,
+        battery_discharge_energy_max: float | list | None = None,
+        def_availability: float | list | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform a naive approach to a Model Predictive Control (MPC). \
@@ -6577,13 +9075,15 @@ class Optimization:
         :param soc_target: An optional intermediate minimum battery SOC (fraction in [0, 1]) that \
             must be reached by ``soc_target_timestep``, after which the battery is free to \
             discharge again. When ``None`` (the default) no intermediate target is imposed and \
-            behaviour is unchanged. See issue #553.
-        :type soc_target: float
+            behaviour is unchanged. See issue #553. A list gives one target per battery \
+            (``None`` = no target for that battery).
+        :type soc_target: float | list
         :param soc_target_timestep: The 0-based horizon timestep by which ``soc_target`` must be \
             met. The index refers to the SoC *after* that timestep's flow. Defaults to the last \
             timestep when ``soc_target`` is given but this is ``None``. Ignored when \
-            ``soc_target`` is ``None``.
-        :type soc_target_timestep: int
+            ``soc_target`` is ``None``. Per battery as a list; a ``None`` entry puts \
+            that battery's target at its last available timestep.
+        :type soc_target_timestep: int | list
         :param current_period_peak: Optional peak grid import (in Watts) already \
             incurred during the current billing period. When the capacity charge \
             (``capacity_cost_per_kw`` > 0) is active, the planned import peak is \
@@ -6672,6 +9172,17 @@ class Optimization:
         :type def_start_timestep: list
         :param def_end_timestep: The timestep before which each deferrable load should operate.
         :type def_end_timestep: list
+        :param battery_availability: Optional per-battery availability, a fraction in \
+            [0, 1] per timestep that scales the battery's power limits (0 = not \
+            connected, SOC frozen). See ``_normalize_battery_availability``.
+        :type battery_availability: float | list, optional
+        :param battery_discharge_energy_max: Optional per-battery cap (Wh, battery \
+            side) on the energy the battery may deliver over the horizon.
+        :type battery_discharge_energy_max: float | list, optional
+        :param def_availability: Optional per-deferrable-load availability, a \
+            fraction in [0, 1] per timestep that scales the load's power ceiling \
+            (0 = the load must not run). See ``_apply_def_availability``.
+        :type def_availability: float | list, optional
         :return: opt_res: A DataFrame containing the optimization results
         :rtype: pandas.DataFrame
 
@@ -6722,6 +9233,9 @@ class Optimization:
             def_start_timestep=def_start_timestep,
             def_end_timestep=def_end_timestep,
             stage_times=stage_times,
+            battery_availability=battery_availability,
+            battery_discharge_energy_max=battery_discharge_energy_max,
+            def_availability=def_availability,
         )
         return self.opt_res
 
@@ -6757,6 +9271,9 @@ class Optimization:
         start_validated = 0
         end_validated = 0
         warning = None
+        # An end of 0 or less means no end limit, so a start inside the window still applies
+        if 1 <= start < window and end <= 0:
+            end = window
         # Verify that start <= end
         if start <= end or start <= 0 or end <= 0:
             # start and end should be within the optimization timewindow [0, window]
