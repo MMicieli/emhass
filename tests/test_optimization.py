@@ -10088,6 +10088,74 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                         "-> fractional hours not honoured",
                     )
 
+    def test_issue_1105_semi_continuous_fractional_hours_keeps_strict_binary(self):
+        """#1105 RED-on-master: fractional hours must not relax an on/off load.
+
+        A semi-continuous, 3 kW deferrable must use a whole number of
+        full-power steps. For 30-minute steps, a 1.25 h requirement cannot
+        be met using exact energy (3.75 kWh) AND binary power. The intended
+        contract, subject to maintainer approval, is ceil(1.25/0.5) = 3
+        full steps (4.5 kWh) with status Optimal, not Optimal (Relaxed).
+
+        The test uses real EMHASS naive-MPC optimisation and checks physical
+        power values as well as the status; merely returning a feasible
+        relaxed result must not pass.
+        """
+        nominal = self.optim_conf["nominal_power_of_deferrable_loads"][0]
+        timestep_h = self.retrieve_hass_conf["optimization_time_step"].seconds / 3600
+        self.optim_conf.update(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+                "set_deferrable_load_single_constant": [False, False],
+            }
+        )
+        self.opt = self.create_optimization()
+        df = self.prepare_forecast_data()
+        res = self.opt.perform_naive_mpc_optim(
+            df, self.p_pv_forecast, self.p_load_forecast, 10
+        )
+        self.assertEqual(
+            self.opt.optim_status,
+            "Optimal",
+            "A semi-continuous load must not silently degrade to a relaxed solve",
+        )
+        scheduled = res["P_deferrable0"].to_numpy()
+        self.assertTrue(
+            np.all(np.isclose(scheduled, 0.0, atol=1e-2) | np.isclose(scheduled, nominal, atol=1e-2)),
+            "Every semi-continuous step must be OFF or exactly nominal power",
+        )
+        expected_steps = int(np.ceil(1.25 / timestep_h))
+        self.assertAlmostEqual(
+            scheduled.sum() * timestep_h,
+            nominal * expected_steps * timestep_h,
+            delta=1e-2,
+        )
+
+    def test_issue_1105_continuous_fractional_hours_remain_exact(self):
+        """#1105 counterfactual: continuous loads must retain #373 exact energy."""
+        nominal = self.optim_conf["nominal_power_of_deferrable_loads"][0]
+        timestep_h = self.retrieve_hass_conf["optimization_time_step"].seconds / 3600
+        self.optim_conf.update(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 0],
+                "treat_deferrable_load_as_semi_cont": [False, True],
+                "set_deferrable_load_single_constant": [False, False],
+            }
+        )
+        self.opt = self.create_optimization()
+        df = self.prepare_forecast_data()
+        res = self.opt.perform_naive_mpc_optim(
+            df, self.p_pv_forecast, self.p_load_forecast, 10
+        )
+        self.assertEqual(self.opt.optim_status, "Optimal")
+        self.assertAlmostEqual(
+            res["P_deferrable0"].sum() * timestep_h,
+            nominal * 1.25,
+            delta=1e-2,
+            msg="Continuous loads must not be rounded to full timesteps",
+        )
+
     def test_deferrable_load_group_shared_power(self):
         """Test that shared power budget constraint limits combined power of grouped loads."""
         self.optim_conf.update(
