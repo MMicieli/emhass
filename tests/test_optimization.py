@@ -10122,7 +10122,10 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
         scheduled = res["P_deferrable0"].to_numpy()
         self.assertTrue(
-            np.all(np.isclose(scheduled, 0.0, atol=1e-2) | np.isclose(scheduled, nominal, atol=1e-2)),
+            np.all(
+                np.isclose(scheduled, 0.0, atol=1e-2)
+                | np.isclose(scheduled, nominal, atol=1e-2)
+            ),
             "Every semi-continuous step must be OFF or exactly nominal power",
         )
         expected_steps = int(np.ceil(1.25 / timestep_h))
