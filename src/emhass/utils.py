@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import copy
 import csv
 import itertools
@@ -9,6 +10,7 @@ import math
 import os
 import pathlib
 import shutil
+import stat
 import time
 import uuid
 from collections.abc import Sequence
@@ -2277,6 +2279,260 @@ def _validate_and_align_external_pv_pair(
     return aligned_p50, aligned_p10, None
 
 
+# Runtime PV forecasts per inverter (#1150). One inverter takes one flat list (or one
+# timestamped mapping). Above one inverter the payload is a list with one entry per
+# inverter, an empty one for an inverter with no PV plant. Every check compares lengths
+# and walks the payload or the plant index list; nothing is built from the inverter count.
+
+# Longest diagnostic returned for a per-inverter payload.
+_PV_PER_INVERTER_MESSAGE_LIMIT = 400
+
+
+def _bounded_fault(message: str) -> str:
+    """Cap a diagnostic that quotes payload text, so a huge value cannot make it huge."""
+    if len(message) <= _PV_PER_INVERTER_MESSAGE_LIMIT:
+        return message
+    return message[: _PV_PER_INVERTER_MESSAGE_LIMIT - 3] + "..."
+
+
+def describe_nested_pv_payload_at_one_inverter(forecast_key: str, forecast_input) -> str | None:
+    """Describe a nested PV forecast payload sent for a plant with one inverter (#1150).
+
+    With ``number_of_inverters`` at 1 the forecast is one flat list, or one timestamped
+    mapping. A list that holds a list or a mapping is the per-inverter shape. It is only
+    read with more than one inverter, so with one inverter it is refused instead of being
+    planned with another forecast method.
+
+    :param forecast_key: Name used in the diagnostic, e.g. ``pv_power_forecast``.
+    :param forecast_input: The runtime value, after a stringified list was parsed.
+    :return: A bounded diagnostic, or None when the payload is not a nested list.
+    """
+    if not isinstance(forecast_input, list):
+        return None
+    if not any(isinstance(element, list | dict) for element in forecast_input):
+        return None
+    return (
+        f"{forecast_key}: send one flat list of numbers (or one timestamped mapping). It holds "
+        "lists or mappings, one per inverter, but number_of_inverters is 1. A list per "
+        "inverter is only accepted with more than one inverter, which is not supported yet."
+    )
+
+
+def pv_carrying_inverters(plant_conf: dict) -> list[int]:
+    """The inverters that carry a PV plant, in ascending order (#1150).
+
+    These are the distinct values of ``pv_plant_inverter_index``, so an index that lists an
+    inverter more than once (two pvlib plants on one inverter, ``[0, 0, 1]``) gives
+    ``[0, 1]``. Only meaningful above one inverter: with one inverter the index is not read
+    and the result is empty.
+
+    :param plant_conf: The plant_conf dict
+    :return: Sorted distinct inverter numbers
+    :raises InverterConfigError: If the index is not a list of inverter numbers in range.
+        The message names the position and never echoes the value, so it stays short.
+    """
+    num_inverters = validate_num_inverters(plant_conf)
+    if num_inverters <= 1:
+        return []
+    index = plant_conf.get("pv_plant_inverter_index")
+    if not isinstance(index, list):
+        raise InverterConfigError(
+            "pv_plant_inverter_index must be a list with one inverter number per PV plant "
+            f"when number_of_inverters is above 1, got {type(index).__name__}"
+        )
+    found: set[int] = set()
+    for position, value in enumerate(index):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float | np.integer)
+            or (isinstance(value, float) and not value.is_integer())
+        ):
+            raise InverterConfigError(
+                f"pv_plant_inverter_index[{position}] must be a whole inverter number, "
+                f"got a {type(value).__name__}"
+            )
+        number = int(value)
+        if not 0 <= number < num_inverters:
+            raise InverterConfigError(
+                f"pv_plant_inverter_index[{position}] is not an inverter number from 0 to "
+                f"{num_inverters - 1}"
+            )
+        found.add(number)
+    return sorted(found)
+
+
+def _per_inverter_shape_fault(
+    forecast_key: str, payload, n_inverters: int, pv_inverters: Sequence[int]
+) -> str | None:
+    """The first way a per-inverter PV payload does not fit the configured topology.
+
+    The outer length is compared before anything else is read. Each entry is a list or a
+    mapping; it is empty for an inverter with no PV plant and not empty for one with a PV
+    plant; the non-empty entries are all lists or all mappings.
+    """
+    if not isinstance(payload, list):
+        return (
+            f"{forecast_key} must be a list with one entry per inverter when "
+            f"number_of_inverters is {n_inverters}, got {type(payload).__name__}: a flat "
+            "list or a single mapping is not accepted"
+        )
+    if len(payload) != n_inverters:
+        return (
+            f"{forecast_key} has {len(payload)} entries but number_of_inverters is "
+            f"{n_inverters}: send one list (or one timestamped mapping) per inverter, "
+            "empty for an inverter with no PV plant"
+        )
+    pv_set = set(pv_inverters)
+    kind = None
+    for inverter, entry in enumerate(payload):
+        if isinstance(entry, list):
+            entry_kind = "list"
+        elif isinstance(entry, dict):
+            entry_kind = "mapping"
+        else:
+            return (
+                f"{forecast_key}[{inverter}] is a {type(entry).__name__}: with "
+                f"number_of_inverters at {n_inverters} every entry must be a list or a "
+                "timestamped mapping (a flat list of numbers is not accepted)"
+            )
+        if inverter in pv_set and not entry:
+            return f"{forecast_key}[{inverter}] is empty but inverter {inverter} has a PV plant"
+        if inverter not in pv_set and entry:
+            return (
+                f"{forecast_key}[{inverter}] has {len(entry)} values but inverter {inverter} "
+                "has no PV plant: send an empty list for it"
+            )
+        if entry:
+            kind = kind or entry_kind
+            if kind != entry_kind:
+                return f"{forecast_key} mixes lists and timestamped mappings across inverters"
+    return None
+
+
+def _align_one_inverter_pv_series(
+    label: str,
+    entry,
+    forecast_dates: list[str],
+    optimization_time_step: int,
+    time_zone,
+) -> tuple[list | None, str | None]:
+    """Check one inverter's list or mapping and return it on the forecast grid."""
+    horizon = len(forecast_dates)
+    if isinstance(entry, dict):
+        invalid = describe_invalid_forecast_value(label, entry.items())
+        if invalid is not None:
+            return None, invalid
+        try:
+            values = _align_runtime_forecast_mapping(
+                entry, forecast_dates, optimization_time_step, time_zone
+            )
+        except (TypeError, ValueError) as exc:
+            return None, f"{label} has an invalid timestamp: {exc}"
+        invalid = describe_invalid_forecast_value(label, enumerate(values))
+        if invalid is not None:
+            return None, f"{invalid} after timestamp alignment"
+        return values, None
+    if len(entry) < horizon:
+        return None, f"{label} has {len(entry)} values for {horizon} required steps"
+    invalid = describe_invalid_forecast_value(label, enumerate(entry))
+    if invalid is not None:
+        return None, invalid
+    return entry[:horizon], None
+
+
+def validate_and_align_per_inverter_pv_forecast(
+    payload,
+    n_inverters: int,
+    pv_inverters: Sequence[int],
+    forecast_dates: list[str],
+    optimization_time_step: int,
+    time_zone,
+    forecast_key: str = "pv_power_forecast",
+) -> tuple[list[list] | None, str | None]:
+    """Validate and align a runtime PV forecast with one entry per inverter (#1150).
+
+    The payload is a list of exactly ``n_inverters`` entries, each a list of values or a
+    timestamped mapping (not a mix). An inverter with no PV plant gets an empty entry; an
+    inverter in ``pv_inverters`` gets a non-empty one with at least one value per forecast
+    step. Every value goes through the finite-number check of the flat path.
+
+    :param payload: The runtime value
+    :param n_inverters: ``number_of_inverters``, only compared with the payload length
+    :param pv_inverters: The PV-carrying inverters, see :func:`pv_carrying_inverters`
+    :param forecast_dates: The forecast grid
+    :param optimization_time_step: The step in minutes
+    :param time_zone: The time zone of the grid
+    :param forecast_key: Name used in the diagnostics
+    :return: ``(aligned, None)`` with one list per inverter (empty for an inverter with no
+        PV plant), or ``(None, fault)`` with a bounded diagnostic
+    """
+    fault = _per_inverter_shape_fault(forecast_key, payload, n_inverters, pv_inverters)
+    if fault is not None:
+        return None, fault
+    pv_set = set(pv_inverters)
+    aligned: list[list] = []
+    for inverter, entry in enumerate(payload):
+        if inverter not in pv_set:
+            aligned.append([])
+            continue
+        values, fault = _align_one_inverter_pv_series(
+            f"{forecast_key}[{inverter}]",
+            entry,
+            forecast_dates,
+            optimization_time_step,
+            time_zone,
+        )
+        if fault is not None:
+            return None, _bounded_fault(fault)
+        aligned.append(values)
+    return aligned, None
+
+
+def validate_and_align_per_inverter_pv_pair(
+    p50_payload,
+    p10_payload,
+    n_inverters: int,
+    pv_inverters: Sequence[int],
+    forecast_dates: list[str],
+    optimization_time_step: int,
+    time_zone,
+) -> tuple[list[list] | None, list[list] | None, str | None]:
+    """Validate and align a per-inverter PV P50/P10 pair (#1150).
+
+    Both payloads have the shape of :func:`validate_and_align_per_inverter_pv_forecast`
+    with the same empty and non-empty entries, and each inverter's P50 and P10 are checked
+    as a pair by :func:`_validate_and_align_external_pv_pair`.
+
+    :return: ``(p50, p10, None)`` with one list per inverter, or ``(None, None, fault)`` with a
+        bounded diagnostic
+    """
+    if p50_payload is None:
+        return None, None, "pv_power_forecast_p10 requires pv_power_forecast"
+    for key, payload in (
+        ("pv_power_forecast", p50_payload),
+        ("pv_power_forecast_p10", p10_payload),
+    ):
+        fault = _per_inverter_shape_fault(key, payload, n_inverters, pv_inverters)
+        if fault is not None:
+            return None, None, fault
+    pv_set = set(pv_inverters)
+    aligned_p50: list[list] = []
+    aligned_p10: list[list] = []
+    for inverter, (p50_entry, p10_entry) in enumerate(zip(p50_payload, p10_payload)):
+        if inverter not in pv_set:
+            aligned_p50.append([])
+            aligned_p10.append([])
+            continue
+        p50_values, p10_values, fault = _validate_and_align_external_pv_pair(
+            p50_entry, p10_entry, forecast_dates, optimization_time_step, time_zone
+        )
+        if fault is not None:
+            return None, None, _bounded_fault(f"inverter {inverter}: {fault}")
+        aligned_p50.append(p50_values)
+        aligned_p10.append(p10_values)
+    return aligned_p50, aligned_p10, None
+
+
 _LOAD_PUBLISH_ID_KEYS = (
     "custom_deferrable_forecast_id",
     "custom_deferrable_state_id",
@@ -2546,7 +2802,7 @@ async def treat_runtimeparams(
         # loop above may have overwritten them with a raw runtime value (#610).
         # N=1 is a no-op (see check_batt_params); this only does real work once
         # number_of_batteries > 1.
-        num_batteries = validate_num_batteries(params["plant_conf"])
+        num_batteries = require_valid_battery_count(params["plant_conf"], logger)
         for batt_param_name, batt_default in BATT_ARRAY_PARAMS_PLANT_CONF.items():
             _warn_if_runtime_scalar_masks_batt_list(
                 num_batteries,
@@ -2758,7 +3014,7 @@ async def treat_runtimeparams(
                 params["optim_conf"]["delta_forecast_daily"] = pd.Timedelta(days=delta_forecast)
                 forecast_dates = extended_forecast_dates
             reject_configured_soc_fractions(params["plant_conf"], params["optim_conf"], logger)
-            num_batteries = validate_num_batteries(params["plant_conf"])
+            num_batteries = require_valid_battery_count(params["plant_conf"], logger)
             if num_batteries == 1:
                 # Unchanged from before #610: soc_init/soc_final stay plain
                 # floats, not [x] lists, so downstream consumers written for
@@ -3072,6 +3328,17 @@ async def treat_runtimeparams(
             "outdoor_temperature_forecast_method",
         ]
         paired_external_pv = "pv_power_forecast_p10" in runtimeparams
+        # A PV forecast per inverter is only read with more than one inverter. With one
+        # inverter a nested payload is refused below instead of falling back to the
+        # configured method.
+        n_inverters = validate_num_inverters(params["plant_conf"])
+        pv_inverters: list[int] = []
+        pv_inverters_fault = None
+        if n_inverters > 1:
+            try:
+                pv_inverters = pv_carrying_inverters(params["plant_conf"])
+            except ValueError as exc:
+                pv_inverters_fault = str(exc)
         # Internal provenance marker used only to distinguish an omitted
         # outdoor-temperature runtime forecast from one supplied and rejected
         # by the #1135 numerical-validity contract.
@@ -3098,6 +3365,32 @@ async def treat_runtimeparams(
                     if isinstance(parsed_forecast, list):
                         forecast_input = parsed_forecast
                         runtimeparams[forecast_key] = parsed_forecast
+
+                if forecast_key == "pv_power_forecast" and n_inverters > 1:
+                    nested_pv, invalid = (
+                        (None, pv_inverters_fault)
+                        if pv_inverters_fault is not None
+                        else validate_and_align_per_inverter_pv_forecast(
+                            forecast_input,
+                            n_inverters,
+                            pv_inverters,
+                            forecast_dates,
+                            optimization_time_step,
+                            time_zone,
+                        )
+                    )
+                    if invalid is None:
+                        params["passed_data"][forecast_key] = nested_pv
+                    else:
+                        logger.error("ERROR: %s", invalid)
+                        params["passed_data"][forecast_key] = None
+                    params["optim_conf"][forecast_methods[method]] = "list"
+                    continue
+                if forecast_key == "pv_power_forecast":
+                    # One inverter takes one flat list or one mapping.
+                    invalid = describe_nested_pv_payload_at_one_inverter(
+                        forecast_key, forecast_input
+                    )
 
                 if isinstance(forecast_input, dict):
                     # Check the supplied values before pandas aggregation can
@@ -3149,13 +3442,28 @@ async def treat_runtimeparams(
         # Forecast._get_weather_list() fails the action instead of falling back.
         if paired_external_pv:
             params["optim_conf"]["weather_forecast_method"] = "list"
-            p50_values, p10_values, pair_error = _validate_and_align_external_pv_pair(
-                runtimeparams.get("pv_power_forecast"),
-                runtimeparams.get("pv_power_forecast_p10"),
-                forecast_dates,
-                optimization_time_step,
-                time_zone,
-            )
+            if n_inverters > 1:
+                p50_values, p10_values, pair_error = (
+                    (None, None, pv_inverters_fault)
+                    if pv_inverters_fault is not None
+                    else validate_and_align_per_inverter_pv_pair(
+                        runtimeparams.get("pv_power_forecast"),
+                        runtimeparams.get("pv_power_forecast_p10"),
+                        n_inverters,
+                        pv_inverters,
+                        forecast_dates,
+                        optimization_time_step,
+                        time_zone,
+                    )
+                )
+            else:
+                p50_values, p10_values, pair_error = _validate_and_align_external_pv_pair(
+                    runtimeparams.get("pv_power_forecast"),
+                    runtimeparams.get("pv_power_forecast_p10"),
+                    forecast_dates,
+                    optimization_time_step,
+                    time_zone,
+                )
             if pair_error is not None:
                 logger.error("ERROR: external PV P10 companion rejected: %s", pair_error)
                 params["passed_data"]["pv_power_forecast"] = None
@@ -3562,6 +3870,9 @@ async def treat_runtimeparams(
     # did not already do so.
     if not inverters_checked:
         require_usable_inverter_config(plant_conf, logger)
+    # The same for the battery count: the CLI merges --params into plant_conf, and
+    # without --runtimeparams the runtime block above, which checks it, does not run.
+    require_valid_battery_count(plant_conf, logger)
 
     # Shared tanks from the configuration file get the same check as runtime
     # ones (above), so a bad entry is reported and ignored instead of failing
@@ -5282,14 +5593,21 @@ def _coerce_batt_element(
     return value
 
 
+# Every per-battery setting is expanded to one entry per battery, so the count has to
+# be bounded: an unbounded one lets a single request allocate memory in proportion to
+# the number it sends. 100 is far above any real plant.
+MAX_BATTERIES = 100
+
+
 def validate_num_batteries(plant_conf: dict) -> int:
     """
     Read and validate plant_conf["number_of_batteries"] (#610).
 
-    Accepts a positive integer (an integral float or numeric string is coerced);
-    zero, negative, fractional, boolean or non-numeric values raise ValueError
-    here, at config time, rather than surfacing as an empty per-battery list
-    deep inside the optimization build.
+    Accepts a positive integer up to MAX_BATTERIES (an integral float or numeric
+    string is coerced); zero, negative, fractional, boolean, non-numeric or
+    larger values raise BatteryConfigError (a ValueError) here, at config time,
+    rather than surfacing as an empty or oversized per-battery list deep inside
+    the optimization build.
 
     :param plant_conf: the plant configuration dict
     :type plant_conf: dict
@@ -5297,16 +5615,63 @@ def validate_num_batteries(plant_conf: dict) -> int:
     :rtype: int
     """
     raw = plant_conf.get("number_of_batteries", 1)
-    invalid = ValueError(f"number_of_batteries must be a positive integer, got {raw!r}")
+    if isinstance(raw, int) and raw.bit_length() > 128:
+        # repr of an int past sys.get_int_max_str_digits() raises ValueError.
+        shown = f"an integer of {raw.bit_length()} bits"
+    else:
+        shown = repr(raw)
+        if len(shown) > 40:
+            shown = shown[:37] + "..."
+    invalid = BatteryConfigError(f"number_of_batteries must be a positive integer, got {shown}")
     if isinstance(raw, bool) or not isinstance(raw, int | float | str):
         raise invalid
-    try:
-        value = float(raw)
-    except (ValueError, OverflowError):  # OverflowError: an int too large for a float
-        raise invalid from None
-    if not value.is_integer() or value < 1:
+    if isinstance(raw, int):
+        value = raw  # compared as is: an int can be too large for a float
+    else:
+        try:
+            value = float(raw)
+        except ValueError:
+            raise invalid from None
+        if value == math.inf:  # a count too large for a float, such as "1e309"
+            raise BatteryConfigError(
+                f"number_of_batteries must be at most {MAX_BATTERIES}, got {shown}"
+            )
+        if not value.is_integer():  # also false for -inf and nan
+            raise invalid
+    if value < 1:
         raise invalid
+    if value > MAX_BATTERIES:
+        raise BatteryConfigError(
+            f"number_of_batteries must be at most {MAX_BATTERIES}, got {shown}"
+        )
     return int(value)
+
+
+def require_valid_battery_count(plant_conf: dict, logger: logging.Logger) -> int:
+    """validate_num_batteries for a run: the fault is logged at error level before the
+    BatteryConfigError is raised, which is what lets the web server return the action
+    log with its 400, as for SocFractionError and InverterConfigError."""
+    try:
+        return validate_num_batteries(plant_conf)
+    except BatteryConfigError as err:
+        logger.error("%s", err)
+        raise
+
+
+def battery_count_faults(config: dict) -> list[str]:
+    """The fault with number_of_batteries in a configuration about to be saved, if any.
+
+    A null value is not a fault: the web UI saves an emptied number input as null and
+    build_params drops it, so the default of 1 applies. build_params drops only a real
+    null, so the string "null" is checked like any other value.
+    """
+    if config.get("number_of_batteries") is None:
+        return []
+    try:
+        validate_num_batteries(config)
+    except BatteryConfigError as err:
+        return [str(err)]
+    return []
 
 
 def check_batt_params(
@@ -5366,15 +5731,52 @@ def check_batt_params(
     return parameter[parameter_name]
 
 
+REPLACE_FILE_RETRIES = 20
+
+
+def _copy_owner_and_mode(path: str, tmp: str) -> None:
+    """Give the new file the owner and permissions of the one it replaces, as writing
+    into the old file would have kept them. Best effort: where the process or the
+    filesystem will not take one of them (not root, a user namespace, FUSE), the new
+    file keeps what it was created with. Not on Windows, where the only mode bit is
+    read-only, and a read-only new file could not be moved into place."""
+    if os.name == "nt":
+        return
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    try:
+        os.chown(tmp, st.st_uid, st.st_gid)
+    except OSError:
+        pass
+    try:
+        os.chmod(tmp, stat.S_IMODE(st.st_mode) & 0o777)
+    except OSError:
+        pass
+
+
 async def replace_file(path, content: str | bytes) -> None:
     """Write ``content`` to ``path`` through a temporary file and os.replace, so a
     reader running at the same time sees the old file or the new one, never a
     partly written one."""
+    # Replace what a symlink points to, not the link itself.
+    path = os.path.realpath(path)
     tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     try:
         async with aiofiles.open(tmp, "wb" if isinstance(content, bytes) else "w") as f:
             await f.write(content)
-        os.replace(tmp, path)
+        _copy_owner_and_mode(path, tmp)
+        # On Windows a file that another handle has open cannot be replaced until it is
+        # closed. Readers hold it for milliseconds, so retry briefly there.
+        for attempt in range(REPLACE_FILE_RETRIES + 1):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == REPLACE_FILE_RETRIES:
+                    raise
+                await asyncio.sleep(0.05)
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -5497,6 +5899,10 @@ def dry_run_request_problem(runtimeparams: dict, dry_run: bool) -> str | None:
 
 class SocFractionError(ValueError):
     """A state of charge was given above 1, where a fraction in [0, 1] is required (#935)."""
+
+
+class BatteryConfigError(ValueError):
+    """number_of_batteries is not a whole number from 1 to MAX_BATTERIES (#610)."""
 
 
 class InverterConfigError(ValueError):
