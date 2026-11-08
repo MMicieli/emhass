@@ -10112,9 +10112,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
         self.opt = self.create_optimization()
         df = self.prepare_forecast_data()
-        res = self.opt.perform_naive_mpc_optim(
-            df, self.p_pv_forecast, self.p_load_forecast, 10
-        )
+        res = self.opt.perform_naive_mpc_optim(df, self.p_pv_forecast, self.p_load_forecast, 10)
         self.assertEqual(
             self.opt.optim_status,
             "Optimal",
@@ -10123,8 +10121,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         scheduled = res["P_deferrable0"].to_numpy()
         self.assertTrue(
             np.all(
-                np.isclose(scheduled, 0.0, atol=1e-2)
-                | np.isclose(scheduled, nominal, atol=1e-2)
+                np.isclose(scheduled, 0.0, atol=1e-2) | np.isclose(scheduled, nominal, atol=1e-2)
             ),
             "Every semi-continuous step must be OFF or exactly nominal power",
         )
@@ -10148,9 +10145,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
         self.opt = self.create_optimization()
         df = self.prepare_forecast_data()
-        res = self.opt.perform_naive_mpc_optim(
-            df, self.p_pv_forecast, self.p_load_forecast, 10
-        )
+        res = self.opt.perform_naive_mpc_optim(df, self.p_pv_forecast, self.p_load_forecast, 10)
         self.assertEqual(self.opt.optim_status, "Optimal")
         self.assertAlmostEqual(
             res["P_deferrable0"].sum() * timestep_h,
