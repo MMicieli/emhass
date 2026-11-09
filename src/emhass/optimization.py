@@ -8796,13 +8796,16 @@ class Optimization:
                         self.param_def_current_power_active[k].value = 0.0
 
             # #1105: a fixed-power ON/OFF load can only deliver integer multiples
-            # of nominal_power * time_step. Reject an impossible *mandatory*
-            # requirement before the solver's global relaxed fallback can turn
-            # this physical ON/OFF constraint into a modulated-power schedule.
-            # Optional (max-cost) loads may simply be skipped, and temperature-
-            # driven / sequence loads have separate energy semantics.
+            # of nominal_power * time_step, so any other mandatory requirement makes
+            # the strict MILP infeasible and triggers the global relaxed fallback
+            # (status "Optimal (Relaxed)", exact energy, power no longer ON/OFF for
+            # ANY load). The fallback and the exact-energy contract (#373) are kept;
+            # this only names the cause. An optional (max-cost) load cannot be
+            # scheduled at all (a scheduled load must deliver the exact energy), so
+            # the solver always skips it with a plain "Optimal" status; that gets its
+            # own message. Thermal, shared-tank and sequence loads have their own
+            # semantics and are excluded.
             load_max_costs = self.optim_conf.get("deferrable_load_max_cost", [])
-            is_optional = k < len(load_max_costs) and load_max_costs[k] > 0
             if (
                 constraint_active
                 and k not in window_empty_loads
@@ -8811,19 +8814,34 @@ class Optimization:
                 and not isinstance(self.optim_conf["nominal_power_of_deferrable_loads"][k], list)
                 and k not in self.param_thermal
                 and k not in shared_tank_membership
-                and not is_optional
             ):
                 remaining_steps = target_energy / (nominal_power * self.time_step)
-                if not np.isclose(remaining_steps, round(remaining_steps), rtol=0, atol=1e-7):
-                    raise ValueError(
-                        f"Deferrable load {k}: exact remaining energy {target_energy:.6g} Wh "
-                        f"requires {remaining_steps:.6g} full-power steps at "
-                        f"{self.time_step * 60:.6g}-minute resolution. "
-                        "A semi-continuous ON/OFF load cannot deliver a fractional step. "
-                        "Choose a finer optimization_time_step that divides the requested "
-                        "operating hours, or configure continuous power only if the "
-                        "device physically supports modulation. No energy is rounded "
-                        "and no relaxed schedule is produced."
+                is_optional = k < len(load_max_costs) and load_max_costs[k] > 0
+                if is_optional and not np.isclose(
+                    remaining_steps, round(remaining_steps), rtol=0, atol=1e-7
+                ):
+                    self.logger.warning(
+                        f"Deferrable load {k}: the remaining {target_energy:.6g} Wh needs "
+                        f"{remaining_steps:.6g} full-power steps at "
+                        f"{self.time_step * 60:.6g}-minute resolution, which an optional "
+                        "on/off (semi-continuous) load cannot deliver, so it can never be "
+                        "scheduled and will be skipped. Use a whole number of steps "
+                        "(operating_timesteps_of_each_deferrable_load) or a finer "
+                        "optimization_time_step."
+                    )
+                elif not np.isclose(remaining_steps, round(remaining_steps), rtol=0, atol=1e-7):
+                    self.logger.warning(
+                        f"Deferrable load {k}: the remaining {target_energy:.6g} Wh needs "
+                        f"{remaining_steps:.6g} full-power steps at "
+                        f"{self.time_step * 60:.6g}-minute resolution, which an on/off "
+                        "(semi-continuous) load cannot deliver, so the strict on/off solve "
+                        "is infeasible. EMHASS will then retry with the on/off constraints "
+                        "relaxed for ALL loads; if that retry succeeds (status 'Optimal "
+                        "(Relaxed)') it meets the exact energy but is not an on/off "
+                        "schedule, and it is not guaranteed to succeed. For strict on/off "
+                        "operation use a whole number of steps "
+                        "(operating_timesteps_of_each_deferrable_load) or a finer "
+                        "optimization_time_step."
                     )
 
             # Set energy constraint parameters. Force-relax the constraint if
