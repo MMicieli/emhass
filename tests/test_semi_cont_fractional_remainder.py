@@ -482,6 +482,48 @@ class TestFractionalRemainder(unittest.TestCase):
                 shortfall = NOMINAL * new_hours - executed
                 self.assertAlmostEqual(shortfall, 0.5 * NOMINAL * DT, delta=1e-3)
 
+    def test_changed_requirement_is_exact_with_remaining_hours_accounting(self):
+        """The supported way to change the requirement after a remainder step ran: the
+        caller tracks the delivered energy and passes the REMAINING hours (new total -
+        delivered / nominal power) with the step counter left at 0. A fresh optimizer
+        per tick (a restart) holds no state, and the energy stays exact."""
+        for single in (False, True):
+            for new_hours in (1.75, 2.0, 2.6, 3.0):
+                with self.subTest(single=single, new_hours=new_hours):
+                    delivered, hours = 0.0, 1.25
+                    for i in range(9):
+                        if i == 3:  # the remainder step ran at i == 2
+                            hours = new_hours
+                        remaining = max(0.0, hours - delivered / NOMINAL)
+                        opt = make(set_deferrable_load_single_constant=[single])
+                        res = solve(opt, [0.0 if remaining < 1e-9 else remaining], prices=RISING)
+                        self.assertEqual(opt.optim_status, "Optimal")
+                        delivered += float(power(res)[0]) * DT
+                    self.assertAlmostEqual(delivered, NOMINAL * new_hours, delta=1e-3)
+
+    def test_label_driven_dispatch_deviates_by_at_most_one_percent_of_a_step(self):
+        """An automation that executes the state label (off = nothing, on = the whole
+        step at nominal power) differs from the plan by at most 1 % of one step's
+        energy, and a label-driven step counter never counts an ``off`` remainder."""
+        for fraction in (0.002, 0.01, 0.99, 0.998):
+            with self.subTest(fraction=fraction):
+                hours = (2 + fraction) * DT
+                opt = make()
+                res = solve(opt, [hours])
+                p = power(res)
+                labels = [_deferrable_power_to_state(v, NOMINAL) for v in p]
+                self.assertNotIn("variable", labels)
+                dispatched = sum(NOMINAL * DT for label in labels if label == "on")
+                self.assertLessEqual(abs(dispatched - NOMINAL * hours), 0.01 * NOMINAL * DT + 1e-6)
+                counted = sum(label != "off" for label in labels)
+                if fraction < 0.5:
+                    self.assertEqual(counted, 2)  # the off remainder is not counted
+                    opt = make(def_current_operating_timesteps=[counted])
+                    again = power(solve(opt, [hours]))
+                    self.assertGreater(again.max(), 1.0)  # replanned every tick
+                else:
+                    self.assertEqual(counted, 3)
+
     def test_random_fractions_keep_exact_energy_and_one_partial_step(self):
         rng = np.random.default_rng(11)
         for _ in range(12):
