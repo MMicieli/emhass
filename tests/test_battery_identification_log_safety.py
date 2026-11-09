@@ -61,9 +61,7 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("\nCRITICAL forged", result)
 
     def test_normal_summary_exact_log_contract(self):
-        command_line._log_battery_identification_summary(
-            self.logger, self.payload, self.plant_conf
-        )
+        command_line._log_battery_identification_summary(self.logger, self.payload, self.plant_conf)
         self.assertEqual(
             self.stream.getvalue(),
             "Battery identification: capacity 32.24 kWh (CI [30.0, 34.0]) "
@@ -86,9 +84,7 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
 
     def test_none_ci_keeps_existing_wording(self):
         self.payload["capacity_kwh"].update(ci_low=None, ci_high=None)
-        command_line._log_battery_identification_summary(
-            self.logger, self.payload, self.plant_conf
-        )
+        command_line._log_battery_identification_summary(self.logger, self.payload, self.plant_conf)
         self.assertIn("(CI [None, None])", self.stream.getvalue())
 
     def test_multi_battery_log_prefix_preserved(self):
@@ -97,9 +93,7 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
             "battery_nominal_energy_capacity": [32240, 32240],
             "battery_charge_efficiency": [0.9747, 0.9747],
         }
-        command_line._log_battery_identification_summary(
-            self.logger, self.payload, plant, k=0
-        )
+        command_line._log_battery_identification_summary(self.logger, self.payload, plant, k=0)
         command_line._log_battery_identification_recommendation(
             self.logger, self.payload, plant, k=1
         )
@@ -111,9 +105,7 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
     def test_both_sonar_sinks_escape_control_characters(self):
         self.payload["capacity_kwh"]["ci_low"] = "31\r\nERROR forged"
         self.payload["capacity_kwh"]["ci_high"] = "32\u2028WARNING forged\x7f"
-        command_line._log_battery_identification_summary(
-            self.logger, self.payload, self.plant_conf
-        )
+        command_line._log_battery_identification_summary(self.logger, self.payload, self.plant_conf)
         self.payload["eta_charge_symmetric"] = "0.97\nCRITICAL forged\x1b[31m\u2029"
         command_line._log_battery_identification_recommendation(
             self.logger, self.payload, self.plant_conf
@@ -125,9 +117,7 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
     def test_malformed_and_oversized_file_values_are_bounded(self):
         self.payload["capacity_kwh"]["ci_low"] = {"bad": "\nERROR forged"}
         self.payload["capacity_kwh"]["ci_high"] = "X" * 1000 + "\nERROR forged"
-        command_line._log_battery_identification_summary(
-            self.logger, self.payload, self.plant_conf
-        )
+        command_line._log_battery_identification_summary(self.logger, self.payload, self.plant_conf)
         self.assert_safe_lines(1)
         self.assertIn("<invalid>", self.stream.getvalue())
         self.assertIn("...[truncated]", self.stream.getvalue())
@@ -136,8 +126,12 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
     def test_malformed_cached_status_warning_is_safe(self):
         self.assertTrue(
             command_line._battery_fit_is_stale(
-                self.logger, {"status": "bad\r\nWARNING forged"},
-                "power", "soc", 24, 0,
+                self.logger,
+                {"status": "bad\r\nWARNING forged"},
+                "power",
+                "soc",
+                24,
+                0,
             )
         )
         self.assert_safe_lines(1)
@@ -155,19 +149,21 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
             },
         }
         self.assertFalse(
-            command_line._battery_fit_is_stale(
-                self.logger, cached, "power", "soc", 24, 0
-            )
+            command_line._battery_fit_is_stale(self.logger, cached, "power", "soc", 24, 0)
         )
         self.assert_safe_lines(1)
         self.assertIn(r"\n", self.stream.getvalue())
 
     async def assert_cache_hit_no_refit(self, cache, plant=None, sensors=None):
         plant = self.plant_conf if plant is None else plant
-        sensors = sensors if sensors is not None else {
-            "sensor_power_battery": "power",
-            "sensor_battery_state_of_charge": "soc",
-        }
+        sensors = (
+            sensors
+            if sensors is not None
+            else {
+                "sensor_power_battery": "power",
+                "sensor_battery_state_of_charge": "soc",
+            }
+        )
         original = copy.deepcopy(plant)
         with tempfile.TemporaryDirectory() as folder:
             filepath = pathlib.Path(folder) / "battery_identification.json"
@@ -192,18 +188,14 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
 
     async def test_n1_failed_cache_timestamp_iso_separator_is_safe(self):
         # datetime.fromisoformat accepts control characters as a one-character separator.
-        for separator, escaped in (
-            ("\n", r"\n"), ("\x1b", r"\u001b"), ("\u2028", r"\u2028")
-        ):
+        for separator, escaped in (("\n", r"\n"), ("\x1b", r"\u001b"), ("\u2028", r"\u2028")):
             with self.subTest(separator=repr(separator)):
                 self.stream.seek(0)
                 self.stream.truncate(0)
                 attempted = datetime.now(UTC).isoformat().replace("T", separator, 1)
                 datetime.fromisoformat(attempted)
                 await self.assert_cache_hit_no_refit(
-                    {"last_attempt": {
-                        "status": "insufficient_data", "attempted_at": attempted
-                    }}
+                    {"last_attempt": {"status": "insufficient_data", "attempted_at": attempted}}
                 )
                 self.assert_safe_lines(2)
                 self.assertIn(escaped, self.stream.getvalue())
