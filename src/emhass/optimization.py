@@ -8800,11 +8800,13 @@ class Optimization:
             # the strict MILP infeasible and triggers the global relaxed fallback
             # (status "Optimal (Relaxed)", exact energy, power no longer ON/OFF for
             # ANY load). The fallback and the exact-energy contract (#373) are kept;
-            # this only names the cause. An optional (max-cost) load cannot be
-            # scheduled at all (a scheduled load must deliver the exact energy), so
-            # the solver always skips it with a plain "Optimal" status; that gets its
-            # own message. Thermal, shared-tank and sequence loads have their own
-            # semantics and are excluded.
+            # this only names the cause. A plain optional (max-cost) load can only
+            # leave itself unscheduled, but that is not guaranteed: if another load
+            # makes the strict solve infeasible, the relaxed retry can run it below
+            # nominal power. An optional single-constant load is forced to schedule
+            # (its startup constraint is not relaxed by the max cost), so it takes
+            # the mandatory message. Thermal, shared-tank and sequence loads have
+            # their own semantics and are excluded.
             load_max_costs = self.optim_conf.get("deferrable_load_max_cost", [])
             if (
                 constraint_active
@@ -8816,33 +8818,39 @@ class Optimization:
                 and k not in shared_tank_membership
             ):
                 remaining_steps = target_energy / (nominal_power * self.time_step)
-                is_optional = k < len(load_max_costs) and load_max_costs[k] > 0
-                if is_optional and not np.isclose(
-                    remaining_steps, round(remaining_steps), rtol=0, atol=1e-7
-                ):
-                    self.logger.warning(
-                        f"Deferrable load {k}: the remaining {target_energy:.6g} Wh needs "
-                        f"{remaining_steps:.6g} full-power steps at "
-                        f"{self.time_step * 60:.6g}-minute resolution, which an optional "
-                        "on/off (semi-continuous) load cannot deliver, so it can never be "
-                        "scheduled and will be skipped. Use a whole number of steps "
-                        "(operating_timesteps_of_each_deferrable_load) or a finer "
-                        "optimization_time_step."
+                if not np.isclose(remaining_steps, round(remaining_steps), rtol=0, atol=1e-7):
+                    is_optional = (
+                        k < len(load_max_costs)
+                        and load_max_costs[k] > 0
+                        and not self.optim_conf["set_deferrable_load_single_constant"][k]
                     )
-                elif not np.isclose(remaining_steps, round(remaining_steps), rtol=0, atol=1e-7):
-                    self.logger.warning(
+                    need = (
                         f"Deferrable load {k}: the remaining {target_energy:.6g} Wh needs "
                         f"{remaining_steps:.6g} full-power steps at "
                         f"{self.time_step * 60:.6g}-minute resolution, which an on/off "
-                        "(semi-continuous) load cannot deliver, so the strict on/off solve "
-                        "is infeasible. EMHASS will then retry with the on/off constraints "
-                        "relaxed for ALL loads; if that retry succeeds (status 'Optimal "
-                        "(Relaxed)') it meets the exact energy but is not an on/off "
-                        "schedule, and it is not guaranteed to succeed. For strict on/off "
-                        "operation use a whole number of steps "
+                        "(semi-continuous) load cannot deliver. "
+                    )
+                    fix = (
+                        " For strict on/off operation use a whole number of steps "
                         "(operating_timesteps_of_each_deferrable_load) or a finer "
                         "optimization_time_step."
                     )
+                    if is_optional:
+                        self.logger.warning(
+                            need + "As an optional load it cannot be scheduled on/off, so the "
+                            "strict solve leaves it unscheduled. If another load makes the "
+                            "strict solve infeasible, EMHASS retries with the on/off "
+                            "constraints relaxed for ALL loads and this load may then run "
+                            "below its nominal power." + fix
+                        )
+                    else:
+                        self.logger.warning(
+                            need + "The strict on/off solve is infeasible, so EMHASS will retry "
+                            "with the on/off constraints relaxed for ALL loads; if that "
+                            "retry succeeds (status 'Optimal (Relaxed)') it meets the exact "
+                            "energy but is not an on/off schedule, and it is not guaranteed "
+                            "to succeed." + fix
+                        )
 
             # Set energy constraint parameters. Force-relax the constraint if
             # the load's configured window is entirely outside the horizon
