@@ -8795,6 +8795,37 @@ class Optimization:
                     if k < len(self.param_def_current_power_active):
                         self.param_def_current_power_active[k].value = 0.0
 
+            # #1105: a fixed-power ON/OFF load can only deliver integer multiples
+            # of nominal_power * time_step. Reject an impossible *mandatory*
+            # requirement before the solver's global relaxed fallback can turn
+            # this physical ON/OFF constraint into a modulated-power schedule.
+            # Optional (max-cost) loads may simply be skipped, and temperature-
+            # driven / sequence loads have separate energy semantics.
+            load_max_costs = self.optim_conf.get("deferrable_load_max_cost", [])
+            is_optional = k < len(load_max_costs) and load_max_costs[k] > 0
+            if (
+                constraint_active
+                and k not in window_empty_loads
+                and nominal_power > 0
+                and self.optim_conf["treat_deferrable_load_as_semi_cont"][k]
+                and not isinstance(self.optim_conf["nominal_power_of_deferrable_loads"][k], list)
+                and k not in self.param_thermal
+                and k not in shared_tank_membership
+                and not is_optional
+            ):
+                remaining_steps = target_energy / (nominal_power * self.time_step)
+                if not np.isclose(remaining_steps, round(remaining_steps), rtol=0, atol=1e-7):
+                    raise ValueError(
+                        f"Deferrable load {k}: exact remaining energy {target_energy:.6g} Wh "
+                        f"requires {remaining_steps:.6g} full-power steps at "
+                        f"{self.time_step * 60:.6g}-minute resolution. "
+                        "A semi-continuous ON/OFF load cannot deliver a fractional step. "
+                        "Choose a finer optimization_time_step that divides the requested "
+                        "operating hours, or configure continuous power only if the "
+                        "device physically supports modulation. No energy is rounded "
+                        "and no relaxed schedule is produced."
+                    )
+
             # Set energy constraint parameters. Force-relax the constraint if
             # the load's configured window is entirely outside the horizon
             # (window_empty_loads, populated above) — the load can never run,
