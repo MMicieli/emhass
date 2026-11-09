@@ -135,7 +135,8 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assert_safe_lines(1)
-        self.assertIn(r"\r\n", self.stream.getvalue())
+        # The existing !r status presentation escapes backslashes a second time.
+        self.assertIn(r"\\r\\n", self.stream.getvalue())
 
     def test_multi_battery_backoff_status_is_safe(self):
         cached = {
