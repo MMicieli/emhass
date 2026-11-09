@@ -10066,7 +10066,9 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                 # #1105: a non-aligned fractional requirement cannot be met
                 # with strict nominal-power ON/OFF timesteps. Verify #373's
                 # exact-energy contract on a genuinely modulating load instead.
-                aligned = np.isclose(fractional_hours / timestep_h, round(fractional_hours / timestep_h))
+                aligned = np.isclose(
+                    fractional_hours / timestep_h, round(fractional_hours / timestep_h)
+                )
                 self.optim_conf.update(
                     {
                         "operating_hours_of_each_deferrable_load": [fractional_hours, 0],
@@ -10104,12 +10106,12 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
         self.opt = self.create_optimization()
         df = self.prepare_forecast_data()
-        with self.assertRaisesRegex(ValueError, "cannot deliver a fractional step"):
+        with self.assertRaisesRegex(ValueError, "cannot deliver a fractional step") as exc:
             self.opt.perform_naive_mpc_optim(
                 df, self.p_pv_forecast, self.p_load_forecast, 10
             )
-        self.assertIn("30-minute resolution", str(context.exception))
-        self.assertIn("No energy is rounded", str(context.exception))
+        self.assertIn("30-minute resolution", str(exc.exception))
+        self.assertIn("No energy is rounded", str(exc.exception))
 
     def test_issue_1105_aligned_binary_hours_stay_strict(self):
         """1.5 h = three complete 30-minute steps, still binary and optimal."""
@@ -10128,10 +10130,12 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.opt.optim_status, "Optimal")
         self.assertAlmostEqual(res["P_deferrable0"].sum() * dt, nominal * 1.5, delta=1e-2)
-        self.assertTrue(np.all(
-            np.isclose(res["P_deferrable0"], 0, atol=1e-2)
-            | np.isclose(res["P_deferrable0"], nominal, atol=1e-2)
-        ))
+        self.assertTrue(
+            np.all(
+                np.isclose(res["P_deferrable0"], 0, atol=1e-2)
+                | np.isclose(res["P_deferrable0"], nominal, atol=1e-2)
+            )
+        )
 
     def test_issue_1105_completed_steps_do_not_make_fractional_remainder_feasible(self):
         """COTS decrements do not justify a fractional last ON timestep."""
@@ -10162,7 +10166,10 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         self.opt = self.create_optimization()
         df = self.prepare_forecast_data()
         res = self.opt.perform_naive_mpc_optim(
-            df, self.p_pv_forecast, self.p_load_forecast, 10,
+            df,
+            self.p_pv_forecast,
+            self.p_load_forecast,
+            10,
             def_total_timestep=[3, 0],
         )
         self.assertEqual(self.opt.optim_status, "Optimal")
