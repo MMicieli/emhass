@@ -1,0 +1,51 @@
+name: Battery identification security candidate QA
+
+on:
+  push:
+    branches:
+      - ci/security-battery-id-log-qa-20261109
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - run: uv sync --reinstall --extra test
+      - run: uvx ruff check --no-fix .
+      - run: uvx ruff format --check --diff .
+      - run: uv run pytest -q tests/test_battery_identification_log_safety.py
+
+  full-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: '3.12'
+          - os: ubuntu-latest
+            python: '3.14'
+          - os: windows-latest
+            python: '3.12'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --python "${{ matrix.python }}" --reinstall --extra test
+      - run: uv run --python "${{ matrix.python }}" pytest tests/
+
+  codeql:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@v3
