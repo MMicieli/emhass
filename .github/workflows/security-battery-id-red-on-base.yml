@@ -1,0 +1,28 @@
+name: Security RED-on-base reproduction
+on:
+  push:
+    branches:
+      - ci/security-battery-id-red-on-base-20261109
+jobs:
+  red-reproduction:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --python "3.12" --extra test
+      - name: Confirm security tests FAIL against unmodified upstream
+        shell: bash
+        run: |
+          set +e
+          uv run --python "3.12" pytest -q tests/test_battery_identification_log_safety.py > red.txt 2>&1
+          result=$?
+          cat red.txt
+          if [ "$result" -eq 0 ]; then
+            echo "Unexpected green-on-base: regression tests are insufficient"
+            exit 1
+          fi
+          if ! grep -q 'FAILED tests/test_battery_identification_log_safety.py' red.txt; then
+            echo "Failure was not a test assertion"
+            exit 1
+          fi
+          echo "Expected RED-on-base confirmed"
