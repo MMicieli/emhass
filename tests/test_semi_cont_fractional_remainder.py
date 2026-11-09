@@ -273,6 +273,7 @@ class TestFractionalRemainder(unittest.TestCase):
         for hours in (1.25, 1.5, 0.75, 1.25, 0.0, 1.0):
             with self.subTest(hours=hours):
                 res = solve(opt, [hours])
+                self.assertEqual(opt.optim_status, "Optimal")
                 self.assertAlmostEqual(energy_wh(res), NOMINAL * hours, delta=1e-3)
                 whole = abs(hours / DT - round(hours / DT)) < 1e-9
                 assert_strict_on_off(self, power(res), allowed_partial=0 if whole else 1)
@@ -290,17 +291,19 @@ class TestFractionalRemainder(unittest.TestCase):
                 self.assertAlmostEqual(energy_wh(res), expected, delta=1e-3)
 
     def test_optional_load_threshold_uses_the_remainder_last_plan_cost(self):
-        """Prices 0.05/0.06/0.07: full, full, remainder costs 0.2175. The threshold is
-        judged on the plan that is actually executed, and the load is never partial."""
-        prices = [0.05, 0.06, 0.07] + [0.30] * 9
-        for cap, expected in ((0.20, 0.0), (0.2174, 0.0), (0.2176, 3750.0), (0.25, 3750.0)):
+        """Prices 0.07/0.05/0.06: a free remainder would sit on the dearest step (cost
+        0.2175), the executed remainder-last plan costs 0.2250. The threshold is judged
+        on the plan that is executed, and the load is never partial."""
+        prices = [0.07, 0.05, 0.06] + [0.30] * 9
+        for cap, expected in ((0.2174, 0.0), (0.22, 0.0), (0.2249, 0.0), (0.2251, 3750.0)):
             with self.subTest(cap=cap):
                 opt = make(deferrable_load_max_cost=[cap])
                 res = solve(opt, [1.25], prices=prices)
                 self.assertEqual(opt.optim_status, "Optimal")
                 self.assertAlmostEqual(energy_wh(res), expected, delta=1e-3)
                 if expected:
-                    assert_strict_on_off(self, power(res), allowed_partial=1, level=0.5 * NOMINAL)
+                    p = power(res)
+                    np.testing.assert_allclose(p[:3], [NOMINAL, NOMINAL, 0.5 * NOMINAL], atol=1e-3)
 
     def test_window_that_fits_the_ceiling_steps_is_feasible(self):
         opt = make()
@@ -354,7 +357,10 @@ class TestFractionalRemainder(unittest.TestCase):
                 ],
             )
         )
-        res = solve(opt, [1.25, 1.25])
+        # Step 4 is strictly cheaper than the rest: sharing it would pay if the budget
+        # were checked at the step average (1.5 + 1.5 kW) instead of the ON level.
+        prices = [0.05] * 4 + [0.10] + [0.30] * (N - 5)
+        res = solve(opt, [1.25, 1.25], prices=prices)
         self.assertEqual(opt.optim_status, "Optimal")
         both_on = (power(res, 0) > 1.0) & (power(res, 1) > 1.0)
         self.assertFalse(both_on.any(), "two loads share a 3.5 kW budget at 3 kW each")
@@ -437,6 +443,44 @@ class TestFractionalRemainder(unittest.TestCase):
         power ``variable``, so the remainder step is never published as ``on``."""
         self.assertEqual(_deferrable_power_to_state(0.5 * NOMINAL, NOMINAL), "variable")
         self.assertEqual(_deferrable_power_to_state(NOMINAL, NOMINAL), "on")
+
+    def test_remainder_near_the_state_thresholds(self):
+        """The command-state sensor keeps its generic bands: a remainder at or below
+        1 % of the nominal power reads ``off`` and one at or above 99 % reads ``on``;
+        in between it reads ``variable``. The plan itself stays exact and strict. The
+        label can differ from the plan by at most 1 % of one step's energy."""
+        expected = {0.005: "off", 0.01: "off", 0.011: "variable", 0.989: "variable", 0.99: "on"}
+        for fraction, label in expected.items():
+            with self.subTest(fraction=fraction):
+                hours = (2 + fraction) * DT
+                opt = make()
+                res = solve(opt, [hours])
+                self.assertEqual(opt.optim_status, "Optimal")
+                self.assertAlmostEqual(energy_wh(res), NOMINAL * hours, delta=1e-3)
+                partial = [v for v in power(res) if v > 1e-6 and abs(v - NOMINAL) > 1.0]
+                if fraction >= 0.99:
+                    partial = [v for v in power(res) if v > 1e-6][-1:]
+                self.assertEqual(_deferrable_power_to_state(partial[0], NOMINAL), label)
+                if label != "variable":
+                    implied = NOMINAL if label == "on" else 0.0
+                    self.assertLessEqual(abs(partial[0] - implied), 0.01 * NOMINAL + 1e-6)
+
+    def test_raising_the_hours_after_the_remainder_ran_is_short_by_the_unused_part(self):
+        """Documented limitation of the completed-step counter: the remainder step is
+        counted as one whole step, so raising the requirement afterwards leaves the
+        unused part of that step ((1 - r) * nominal * step) undelivered."""
+        for new_hours in (1.75, 2.0, 3.0):
+            with self.subTest(new_hours=new_hours):
+                executed, done = 0.0, 0
+                for i in range(6):
+                    hours = 1.25 if i < 3 else new_hours
+                    opt = make(def_current_operating_timesteps=[done])
+                    res = solve(opt, [hours], prices=RISING)
+                    first = float(power(res)[0])
+                    executed += first * DT
+                    done += 1 if first > 1.0 else 0
+                shortfall = NOMINAL * new_hours - executed
+                self.assertAlmostEqual(shortfall, 0.5 * NOMINAL * DT, delta=1e-3)
 
     def test_random_fractions_keep_exact_energy_and_one_partial_step(self):
         rng = np.random.default_rng(11)

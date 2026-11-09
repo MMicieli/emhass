@@ -1828,8 +1828,9 @@ class Optimization:
 
             # The power PIN additionally needs a free t=0 power variable, so semi_cont
             # is excluded from the pin (its power == nominal*bin); for an affected
-            # semi_cont load the t=0 force-on alone injects nominal, which is correct
-            # for an on/off device.
+            # semi_cont load the t=0 force-on alone injects nominal (or the remainder
+            # step's average power when under one step of energy remains), which is
+            # correct for an on/off device.
             pin_active = affected and not is_semi_cont
             if k < len(self.param_def_current_power_active):
                 self.param_def_current_power_active[k].value = 1.0 if pin_active else 0.0
