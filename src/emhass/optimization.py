@@ -8800,13 +8800,15 @@ class Optimization:
             # the strict MILP infeasible and triggers the global relaxed fallback
             # (status "Optimal (Relaxed)", exact energy, power no longer ON/OFF for
             # ANY load). The fallback and the exact-energy contract (#373) are kept;
-            # this only names the cause. A plain optional (max-cost) load can only
-            # leave itself unscheduled, but that is not guaranteed: if another load
-            # makes the strict solve infeasible, the relaxed retry can run it below
-            # nominal power. An optional single-constant load is forced to schedule
-            # (its startup constraint is not relaxed by the max cost), so it takes
-            # the mandatory message. Thermal, shared-tank and sequence loads have
-            # their own semantics and are excluded.
+            # this only names the cause. A plain optional (max-cost) load is
+            # normally left unscheduled by the strict solve, but that is not
+            # guaranteed: a forced-on state (def_current_power, a minimum on-time
+            # remainder) or infeasibility elsewhere makes the strict solve
+            # infeasible, and the relaxed retry (not guaranteed to succeed) can
+            # then run it below nominal power. An optional single-constant load is
+            # forced to schedule (its startup constraint is not relaxed by the max
+            # cost), so it takes the mandatory message. Thermal, shared-tank and
+            # sequence loads have their own semantics and are excluded.
             load_max_costs = self.optim_conf.get("deferrable_load_max_cost", [])
             if (
                 constraint_active
@@ -8838,10 +8840,12 @@ class Optimization:
                     if is_optional:
                         self.logger.warning(
                             need + "As an optional load it cannot be scheduled on/off, so the "
-                            "strict solve leaves it unscheduled. If another load makes the "
-                            "strict solve infeasible, EMHASS retries with the on/off "
-                            "constraints relaxed for ALL loads and this load may then run "
-                            "below its nominal power." + fix
+                            "strict solve normally leaves it unscheduled. If it is forced on "
+                            "(for example by def_current_power or a minimum on-time "
+                            "remainder) or another load makes the strict solve infeasible, "
+                            "EMHASS retries with the on/off constraints relaxed for ALL "
+                            "loads; if that retry succeeds (not guaranteed) this load may "
+                            "then run below its nominal power." + fix
                         )
                     else:
                         self.logger.warning(

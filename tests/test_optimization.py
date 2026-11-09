@@ -10159,7 +10159,9 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(msgs), 1)
         self.assertIn("optional load", msgs[0])
-        self.assertIn("If another load makes the strict solve infeasible", msgs[0])
+        self.assertIn("strict solve normally leaves it unscheduled", msgs[0])
+        self.assertIn("def_current_power", msgs[0])
+        self.assertIn("not guaranteed", msgs[0])
         self.assertNotIn("will be skipped", msgs[0])
         self.assertEqual(self.opt.optim_status, "Optimal")
         self.assertEqual(float(res["P_deferrable0"].sum()), 0.0)
@@ -10196,6 +10198,24 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(msgs), 2)
         self.assertIn("may then run below its nominal power", msgs[0])
         self.assertIn("Deferrable load 1", msgs[1])
+        self.assertEqual(self.opt.optim_status, "Optimal (Relaxed)")
+        p0 = res["P_deferrable0"].to_numpy()
+        self.assertGreater(float(p0.sum()), 0.0)
+        self.assertTrue(np.any((p0 > 1e-2) & (p0 < nominal - 1e-2)))
+
+    def test_issue_1105_optional_load_forced_on_by_current_power_runs_relaxed(self):
+        """Counterexample: an optional load can force the relaxed retry by itself."""
+        nominal = self.optim_conf["nominal_power_of_deferrable_loads"][0]
+        res, msgs = self._run_1105(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+                "deferrable_load_max_cost": [1000.0, 0.0],
+                "def_current_power": [nominal, 0],
+            }
+        )
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("forced on", msgs[0])
         self.assertEqual(self.opt.optim_status, "Optimal (Relaxed)")
         p0 = res["P_deferrable0"].to_numpy()
         self.assertGreater(float(p0.sum()), 0.0)
