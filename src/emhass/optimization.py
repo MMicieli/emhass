@@ -6891,9 +6891,14 @@ class Optimization:
         The remainder step is the last operating step of the load: no full step
         follows it. A rolling-MPC caller counts completed *steps*
         (``def_current_operating_timesteps``), so a remainder executed early would be
-        counted as a whole step and under-deliver energy. Last, it is also always at
-        the end of its run, so the interval average ``r * nominal`` is one contiguous
-        pulse of ``r`` of the step directly after the preceding ON step (or alone).
+        counted as a whole step and under-deliver energy. The price is a possibly
+        dearer plan: a free remainder would take the dearest of the chosen steps.
+
+        ``r * nominal`` is the INTERVAL AVERAGE; the model does not place the ON time
+        inside the step. An executor that can only switch ON/OFF realises it as ``r``
+        of the step at the full level. Full steps of an ordinary load need not be
+        contiguous (only single-constant, minimum on-time and startup rules shape
+        them); the remainder step merely follows all of them.
         """
         n = self.num_timesteps
         remainder = bin2 - bin1

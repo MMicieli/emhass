@@ -175,17 +175,30 @@ class TestFractionalRemainder(unittest.TestCase):
         res = solve(opt, [1.25])
         self.assertAlmostEqual(energy_wh(res), 0.0, delta=1e-3)
 
-    def test_rolling_replan_delivers_exact_energy(self):
-        """Replan after every executed step with the step counter, as a rolling MPC
-        does: the sum of what is executed is exactly the requested energy."""
-        executed, done = 0.0, 0
-        for _ in range(6):
+    def _rolling_execution(self, prices, hours=1.25, steps=6):
+        """Replan after every executed step on a sliding price window, feeding back the
+        completed-step counter exactly as a rolling MPC does."""
+        executed, done, first_steps = 0.0, 0, []
+        for s in range(steps):
             opt = make(def_current_operating_timesteps=[done])
-            res = solve(opt, [1.25], prices=RISING)
+            res = solve(opt, [hours], prices=prices[s : s + N])
+            self.assertEqual(opt.optim_status, "Optimal")
             first = float(power(res)[0])
+            first_steps.append(round(first))
             executed += first * DT
             done += 1 if first > 1.0 else 0
-        self.assertAlmostEqual(executed, NOMINAL * 1.25, delta=1e-3)
+        return executed, first_steps
+
+    def test_rolling_replan_delivers_exact_energy(self):
+        """Prices where a free remainder would be placed FIRST (0.07 is the dearest of
+        the three cheap steps): the executed total must still be exactly the request.
+        Without the remainder-last rule the first executed step is the half step, the
+        counter treats it as a whole step and only 3.0 of 3.75 kWh is delivered."""
+        for prices in ([0.07, 0.05, 0.06] + [0.30] * 20, [0.05 + 0.01 * t for t in range(30)]):
+            with self.subTest(prices=prices[:4]):
+                executed, first_steps = self._rolling_execution(prices)
+                self.assertAlmostEqual(executed, NOMINAL * 1.25, delta=1e-3, msg=first_steps)
+                self.assertEqual(first_steps, [3000, 3000, 1500, 0, 0, 0])
 
     def test_single_constant_load_is_one_contiguous_run(self):
         prices = [0.3, 0.05] * 6
@@ -264,17 +277,30 @@ class TestFractionalRemainder(unittest.TestCase):
                 whole = abs(hours / DT - round(hours / DT)) < 1e-9
                 assert_strict_on_off(self, power(res), allowed_partial=0 if whole else 1)
 
-    def test_optional_load_with_max_cost_is_scheduled_when_cheap(self):
-        """With a cost cap the fractional requirement used to be infeasible, so the
-        optional load was silently left off even when it was cheap enough."""
-        opt = make(deferrable_load_max_cost=[100.0])
-        res = solve(opt, [1.25])
-        self.assertEqual(opt.optim_status, "Optimal")
-        self.assertAlmostEqual(energy_wh(res), NOMINAL * 1.25, delta=1e-3)
+    def test_optional_load_with_max_cost_stays_all_or_nothing(self):
+        """The cost cap is an all-or-nothing threshold on the cost of the whole plan.
+        Cheapest plan: 3.75 kWh at 0.05 = 0.1875. A cap just below it leaves the load
+        off, just above it schedules the full energy; nothing in between, and never a
+        part of the energy."""
+        for cap, expected in ((0.0001, 0.0), (0.1874, 0.0), (0.1876, 3750.0), (100.0, 3750.0)):
+            with self.subTest(cap=cap):
+                opt = make(deferrable_load_max_cost=[cap])
+                res = solve(opt, [1.25])
+                self.assertEqual(opt.optim_status, "Optimal")
+                self.assertAlmostEqual(energy_wh(res), expected, delta=1e-3)
 
-        opt = make(deferrable_load_max_cost=[0.0001])
-        res = solve(opt, [1.25])
-        self.assertAlmostEqual(energy_wh(res), 0.0, delta=1e-3)
+    def test_optional_load_threshold_uses_the_remainder_last_plan_cost(self):
+        """Prices 0.05/0.06/0.07: full, full, remainder costs 0.2175. The threshold is
+        judged on the plan that is actually executed, and the load is never partial."""
+        prices = [0.05, 0.06, 0.07] + [0.30] * 9
+        for cap, expected in ((0.20, 0.0), (0.2174, 0.0), (0.2176, 3750.0), (0.25, 3750.0)):
+            with self.subTest(cap=cap):
+                opt = make(deferrable_load_max_cost=[cap])
+                res = solve(opt, [1.25], prices=prices)
+                self.assertEqual(opt.optim_status, "Optimal")
+                self.assertAlmostEqual(energy_wh(res), expected, delta=1e-3)
+                if expected:
+                    assert_strict_on_off(self, power(res), allowed_partial=1, level=0.5 * NOMINAL)
 
     def test_window_that_fits_the_ceiling_steps_is_feasible(self):
         opt = make()
@@ -284,12 +310,25 @@ class TestFractionalRemainder(unittest.TestCase):
         self.assertTrue((p[:2] == 0).all() and (p[5:] == 0).all())
         self.assertAlmostEqual(energy_wh(res), NOMINAL * 1.25, delta=1e-3)
 
-    def test_window_shorter_than_the_energy_is_still_infeasible(self):
-        """A window of 2 steps cannot hold 2.5 steps of energy at nominal power even
-        in the relaxed fallback: unchanged behaviour, no crash."""
+    def test_window_shorter_than_the_energy_is_infeasible(self):
+        """A 2-step window cannot hold 2.5 steps of energy at nominal power. As for a
+        whole-step requirement that does not fit (1.5 h), the solve reports
+        ``Infeasible`` and returns no plan: unchanged behaviour, no crash."""
+        for hours in (1.25, 1.5):
+            with self.subTest(hours=hours):
+                opt = make()
+                res = solve(opt, [hours], start=[2], end=[4])
+                self.assertEqual(opt.optim_status, "Infeasible")
+                self.assertNotIn("P_deferrable0", res.columns)
+
+    def test_window_holding_one_step_and_a_remainder_is_feasible(self):
+        """0.75 h = 1.5 steps fits a 2-step window as a full step plus the remainder."""
         opt = make()
-        solve(opt, [1.25], start=[2], end=[4])
-        self.assertNotIn(opt.optim_status, ("Optimal", "Optimal (Relaxed)"))
+        res = solve(opt, [0.75], start=[2], end=[4])
+        self.assertEqual(opt.optim_status, "Optimal")
+        p = power(res)
+        self.assertTrue((p[:2] == 0).all() and (p[4:] == 0).all())
+        np.testing.assert_allclose(p[2:4], [NOMINAL, 0.5 * NOMINAL], atol=1e-3)
 
     def test_shared_power_budget_uses_the_on_level(self):
         """A remainder step still switches the load to its full power, so a group
