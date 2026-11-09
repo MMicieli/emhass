@@ -10063,18 +10063,23 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         # reports each regime independently so a failure pinpoints which one broke.
         for fractional_hours in (2.5, 1.25):
             with self.subTest(fractional_hours=fractional_hours):
+                # #1105: a non-aligned fractional requirement cannot be met
+                # with strict nominal-power ON/OFF timesteps. Verify #373's
+                # exact-energy contract on a genuinely modulating load instead.
+                aligned = np.isclose(fractional_hours / timestep_h, round(fractional_hours / timestep_h))
                 self.optim_conf.update(
-                    {"operating_hours_of_each_deferrable_load": [fractional_hours, 0]}
+                    {
+                        "operating_hours_of_each_deferrable_load": [fractional_hours, 0],
+                        "treat_deferrable_load_as_semi_cont": [bool(aligned), True],
+                    }
                 )
                 self.opt = self.create_optimization()
                 self.df_input_data_dayahead = self.prepare_forecast_data()
                 opt_res = self.opt.perform_dayahead_forecast_optim(
                     self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
                 )
-                # A sub-timestep fraction (1.25 h at a 30-min step) makes the strict MILP
-                # infeasible, so EMHASS falls back to the relaxed LP ("Optimal (Relaxed)").
-                # The target-energy equality is enforced on both solve paths, so the energy
-                # assertion below still holds; VALID_OPTIMAL_STATUSES accepts both statuses.
+                # Aligned ON/OFF and non-aligned continuous loads can both
+                # satisfy the exact-energy requirement without LP relaxation.
                 self.assertIn(self.opt.optim_status, VALID_OPTIMAL_STATUSES)
                 # Exact fractional energy = nominal_power * fractional_hours.
                 self.assert_energy_constraint(opt_res["P_deferrable0"], fractional_hours)
@@ -10087,6 +10092,99 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                         f"Energy {actual_energy:.1f} Wh matches integer {integer_hours} h "
                         "-> fractional hours not honoured",
                     )
+
+    def test_issue_1105_nonrepresentable_binary_hours_fail_before_relaxation(self):
+        """No silent rounding or physically non-binary global rescue (#1105)."""
+        self.optim_conf.update(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+                "set_deferrable_load_single_constant": [False, False],
+            }
+        )
+        self.opt = self.create_optimization()
+        df = self.prepare_forecast_data()
+        with self.assertRaisesRegex(ValueError, "cannot deliver a fractional step"):
+            self.opt.perform_naive_mpc_optim(
+                df, self.p_pv_forecast, self.p_load_forecast, 10
+            )
+        self.assertIn("30-minute resolution", str(context.exception))
+        self.assertIn("No energy is rounded", str(context.exception))
+
+    def test_issue_1105_aligned_binary_hours_stay_strict(self):
+        """1.5 h = three complete 30-minute steps, still binary and optimal."""
+        nominal = self.optim_conf["nominal_power_of_deferrable_loads"][0]
+        dt = self.retrieve_hass_conf["optimization_time_step"].total_seconds() / 3600
+        self.optim_conf.update(
+            {
+                "operating_hours_of_each_deferrable_load": [1.5, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+            }
+        )
+        self.opt = self.create_optimization()
+        df = self.prepare_forecast_data()
+        res = self.opt.perform_naive_mpc_optim(
+            df, self.p_pv_forecast, self.p_load_forecast, 10
+        )
+        self.assertEqual(self.opt.optim_status, "Optimal")
+        self.assertAlmostEqual(res["P_deferrable0"].sum() * dt, nominal * 1.5, delta=1e-2)
+        self.assertTrue(np.all(
+            np.isclose(res["P_deferrable0"], 0, atol=1e-2)
+            | np.isclose(res["P_deferrable0"], nominal, atol=1e-2)
+        ))
+
+    def test_issue_1105_completed_steps_do_not_make_fractional_remainder_feasible(self):
+        """COTS decrements do not justify a fractional last ON timestep."""
+        self.optim_conf.update(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+                "def_current_operating_timesteps": [1, 0],
+            }
+        )
+        self.opt = self.create_optimization()
+        df = self.prepare_forecast_data()
+        with self.assertRaisesRegex(ValueError, "fractional step"):
+            self.opt.perform_naive_mpc_optim(
+                df, self.p_pv_forecast, self.p_load_forecast, 10
+            )
+
+    def test_issue_1105_explicit_timestep_input_remains_valid(self):
+        """An explicit three-step request overrides incompatible hour input."""
+        nominal = self.optim_conf["nominal_power_of_deferrable_loads"][0]
+        dt = self.retrieve_hass_conf["optimization_time_step"].total_seconds() / 3600
+        self.optim_conf.update(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+            }
+        )
+        self.opt = self.create_optimization()
+        df = self.prepare_forecast_data()
+        res = self.opt.perform_naive_mpc_optim(
+            df, self.p_pv_forecast, self.p_load_forecast, 10,
+            def_total_timestep=[3, 0],
+        )
+        self.assertEqual(self.opt.optim_status, "Optimal")
+        self.assertAlmostEqual(res["P_deferrable0"].sum() * dt, nominal * 3 * dt, delta=1e-2)
+
+    def test_issue_1105_continuous_power_keeps_exact_fractional_energy(self):
+        """Only genuinely modulating loads can deliver non-grid-aligned energy."""
+        nominal = self.optim_conf["nominal_power_of_deferrable_loads"][0]
+        dt = self.retrieve_hass_conf["optimization_time_step"].total_seconds() / 3600
+        self.optim_conf.update(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 0],
+                "treat_deferrable_load_as_semi_cont": [False, True],
+            }
+        )
+        self.opt = self.create_optimization()
+        df = self.prepare_forecast_data()
+        res = self.opt.perform_naive_mpc_optim(
+            df, self.p_pv_forecast, self.p_load_forecast, 10
+        )
+        self.assertEqual(self.opt.optim_status, "Optimal")
+        self.assertAlmostEqual(res["P_deferrable0"].sum() * dt, nominal * 1.25, delta=1e-2)
 
     def test_deferrable_load_group_shared_power(self):
         """Test that shared power budget constraint limits combined power of grouped loads."""
