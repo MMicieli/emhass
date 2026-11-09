@@ -10088,6 +10088,168 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                         "-> fractional hours not honoured",
                     )
 
+    def _run_1105(self, upd, **kw):
+        """Run a naive-MPC solve for the #1105 cases; return (result, warnings)."""
+        self.optim_conf.update(upd)
+        self.opt = self.create_optimization()
+        df = self.prepare_forecast_data()
+        with self.assertLogs(self.opt.logger, level="WARNING") as cm:
+            self.opt.logger.warning("sentinel")  # assertLogs needs >= 1 record
+            res = self.opt.perform_naive_mpc_optim(
+                df, self.p_pv_forecast, self.p_load_forecast, 10, **kw
+            )
+        return res, [r for r in cm.output if "full-power steps" in r]
+
+    def test_issue_1105_unrepresentable_binary_energy_is_diagnosed_not_rounded(self):
+        """1.25 h = 2.5 steps: exact energy kept (#373), cause named, nothing rounded."""
+        nominal = self.optim_conf["nominal_power_of_deferrable_loads"][0]
+        dt = self.retrieve_hass_conf["optimization_time_step"].total_seconds() / 3600
+        res, msgs = self._run_1105(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+            }
+        )
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("Deferrable load 0", msgs[0])
+        self.assertIn("2.5 full-power steps", msgs[0])
+        self.assertIn("ALL loads", msgs[0])
+        self.assertIn("not guaranteed", msgs[0])
+        self.assertEqual(self.opt.optim_status, "Optimal (Relaxed)")
+        self.assertAlmostEqual(res["P_deferrable0"].sum() * dt, nominal * 1.25, delta=1e-2)
+
+    def test_issue_1105_aligned_binary_hours_stay_strict_and_silent(self):
+        """1.5 h = three complete 30-minute steps: strict ON/OFF, no diagnostic."""
+        nominal = self.optim_conf["nominal_power_of_deferrable_loads"][0]
+        res, msgs = self._run_1105(
+            {
+                "operating_hours_of_each_deferrable_load": [1.5, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+            }
+        )
+        self.assertEqual(msgs, [])
+        self.assertEqual(self.opt.optim_status, "Optimal")
+        self.assertTrue(
+            np.all(
+                np.isclose(res["P_deferrable0"], 0, atol=1e-2)
+                | np.isclose(res["P_deferrable0"], nominal, atol=1e-2)
+            )
+        )
+
+    def test_issue_1105_completed_steps_keep_remainder_diagnostic(self):
+        """COTS decrements remove whole steps only; the fractional remainder persists."""
+        _, msgs = self._run_1105(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+                "def_current_operating_timesteps": [1, 0],
+            }
+        )
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("1.5 full-power steps", msgs[0])
+
+    def test_issue_1105_optional_load_is_left_unscheduled_with_conditional_wording(self):
+        """A plain optional on/off load is left off; the warning must not promise that."""
+        res, msgs = self._run_1105(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+                "deferrable_load_max_cost": [1000.0, 0.0],
+            }
+        )
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("optional load", msgs[0])
+        self.assertIn("strict solve normally leaves it unscheduled", msgs[0])
+        self.assertIn("def_current_power", msgs[0])
+        self.assertIn("not guaranteed", msgs[0])
+        self.assertNotIn("will be skipped", msgs[0])
+        self.assertEqual(self.opt.optim_status, "Optimal")
+        self.assertEqual(float(res["P_deferrable0"].sum()), 0.0)
+
+    def test_issue_1105_optional_single_constant_load_takes_mandatory_message(self):
+        """Counterexample: optional + single-constant is forced to schedule, then relaxed."""
+        res, msgs = self._run_1105(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+                "set_deferrable_load_single_constant": [True, False],
+                "deferrable_load_max_cost": [1000.0, 0.0],
+            }
+        )
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("relaxed for ALL loads", msgs[0])
+        self.assertNotIn("optional load", msgs[0])
+        self.assertEqual(self.opt.optim_status, "Optimal (Relaxed)")
+        # The load really does run (below nominal power): it was not skipped.
+        self.assertGreater(float(res["P_deferrable0"].sum()), 0.0)
+
+    def test_issue_1105_optional_load_runs_below_nominal_when_another_load_forces_relaxation(
+        self,
+    ):
+        """Counterexample: another infeasible load makes an optional load modulate."""
+        nominal = self.optim_conf["nominal_power_of_deferrable_loads"][0]
+        res, msgs = self._run_1105(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 1.25],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+                "deferrable_load_max_cost": [1000.0, 0.0],
+            }
+        )
+        self.assertEqual(len(msgs), 2)
+        self.assertIn("may then run below its nominal power", msgs[0])
+        self.assertIn("Deferrable load 1", msgs[1])
+        self.assertEqual(self.opt.optim_status, "Optimal (Relaxed)")
+        p0 = res["P_deferrable0"].to_numpy()
+        self.assertGreater(float(p0.sum()), 0.0)
+        self.assertTrue(np.any((p0 > 1e-2) & (p0 < nominal - 1e-2)))
+
+    def test_issue_1105_optional_load_forced_on_by_current_power_runs_relaxed(self):
+        """Counterexample: an optional load can force the relaxed retry by itself."""
+        nominal = self.optim_conf["nominal_power_of_deferrable_loads"][0]
+        res, msgs = self._run_1105(
+            {
+                "operating_hours_of_each_deferrable_load": [1.25, 0],
+                "treat_deferrable_load_as_semi_cont": [True, True],
+                "deferrable_load_max_cost": [1000.0, 0.0],
+                "def_current_power": [nominal, 0],
+            }
+        )
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("forced on", msgs[0])
+        self.assertEqual(self.opt.optim_status, "Optimal (Relaxed)")
+        p0 = res["P_deferrable0"].to_numpy()
+        self.assertGreater(float(p0.sum()), 0.0)
+        self.assertTrue(np.any((p0 > 1e-2) & (p0 < nominal - 1e-2)))
+
+    def test_issue_1105_sequence_load_is_excluded(self):
+        """A sequence (list-valued power) load ignores operating hours: no diagnostic."""
+        _, msgs = self._run_1105(
+            {
+                "set_use_battery": False,
+                "number_of_deferrable_loads": 1,
+                "nominal_power_of_deferrable_loads": [[1000, 1000]],
+                "operating_hours_of_each_deferrable_load": [1.25],
+                "treat_deferrable_load_as_semi_cont": [True],
+            }
+        )
+        self.assertEqual(msgs, [])
+
+    def test_issue_1105_no_diagnostic_for_other_energy_semantics(self):
+        """Explicit timesteps, continuous and empty-window loads are not unrepresentable."""
+        base = {
+            "operating_hours_of_each_deferrable_load": [1.25, 0],
+            "treat_deferrable_load_as_semi_cont": [True, True],
+        }
+        cases = {
+            "timestep_input": (base, {"def_total_timestep": [3, 0]}),
+            "continuous": ({**base, "treat_deferrable_load_as_semi_cont": [False, True]}, {}),
+            "empty_window": (base, {"def_start_timestep": [500, 0], "def_end_timestep": [600, 0]}),
+        }
+        for name, (upd, kw) in cases.items():
+            with self.subTest(case=name):
+                _, msgs = self._run_1105(upd, **kw)
+                self.assertEqual(msgs, [])
+
     def test_deferrable_load_group_shared_power(self):
         """Test that shared power budget constraint limits combined power of grouped loads."""
         self.optim_conf.update(
