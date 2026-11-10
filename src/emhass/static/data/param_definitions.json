@@ -400,9 +400,11 @@
     },
     "inverter_stress_segments": {
       "friendly_name": "Hybrid Inverter Stress Segments",
-      "Description": "The number of linear segments used to approximate the stress cost curve. Higher values increase accuracy but may slightly increase computation time.",
+      "Description": "The number of linear segments used to approximate the stress cost curve. Higher values increase accuracy but may slightly increase computation time. A whole number from 1 to 100.",
       "input": "int",
       "default_value": 10,
+      "minimum": 1,
+      "maximum": 100,
       "unit": "count"
     },
     "compute_curtailment": {
@@ -414,7 +416,7 @@
     },
     "number_of_inverters": {
       "friendly_name": "Number of inverters",
-      "Description": "Number of physical inverters in the plant (default 1). More than one inverter is not supported yet: a value above 1 is refused with an error. The per-inverter settings are described in docs/config.md.",
+      "Description": "Number of physical inverters in the plant (default 1). With more than one inverter, the per-inverter settings and how the optimizer models them are described in docs/config.md.",
       "input": "int",
       "default_value": 1,
       "unit": "count"
@@ -689,7 +691,7 @@
     },
     "operating_hours_of_each_deferrable_load": {
       "friendly_name": "Deferrable load operating hours",
-      "Description": "The total number of hours that each deferrable load should operate. Fractional values are accepted (e.g. 4.5) and the energy delivered is nominal_power * hours; a value that is not a whole number of timesteps runs at least one step below the nominal power and, for semi-continuous loads, is solved as 'Optimal (Relaxed)' (integer constraints not enforced). For whole timesteps at the nominal power naive-mpc-optim accepts operating_timesteps_of_each_deferrable_load at runtime, one entry per load (it makes EMHASS ignore the hours of all loads).",
+      "Description": "The total number of hours that each deferrable load should operate. Fractional values are accepted (e.g. 4.5) and the energy delivered is nominal_power * hours; a value that is not a whole number of timesteps is delivered, for semi-continuous loads, as whole steps at the nominal power plus one last remainder step whose average power over the step is the leftover fraction of the nominal power (the load itself is not modulated), and the solve stays a regular 'Optimal' one. For whole timesteps at the nominal power naive-mpc-optim accepts operating_timesteps_of_each_deferrable_load at runtime, one entry per load (it makes EMHASS ignore the hours of all loads).",
       "input": "array.float",
       "default_value": 0,
       "unit": "h"
@@ -911,9 +913,11 @@
     },
     "battery_stress_segments": {
       "friendly_name": "Battery Stress Segments",
-      "Description": "The number of linear segments used to approximate the stress cost curve. Higher values increase accuracy but may slightly increase computation time.",
+      "Description": "The number of linear segments used to approximate the stress cost curve. Higher values increase accuracy but may slightly increase computation time. A whole number from 1 to 100.",
       "input": "int",
       "default_value": 10,
+      "minimum": 1,
+      "maximum": 100,
       "unit": "count"
     },
     "battery_soc_deficit_threshold": {
