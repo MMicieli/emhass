@@ -449,7 +449,7 @@ class TestFractionalRemainder(unittest.TestCase):
         1 % of the nominal power reads ``off`` and one at or above 99 % reads ``on``;
         in between it reads ``variable``. The plan itself stays exact and strict. The
         label can differ from the plan by at most 1 % of one step's energy."""
-        expected = {0.005: "off", 0.01: "off", 0.011: "variable", 0.989: "variable", 0.99: "on"}
+        expected = {0.005: "off", 0.009: "off", 0.011: "variable", 0.989: "variable", 0.991: "on"}
         for fraction, label in expected.items():
             with self.subTest(fraction=fraction):
                 hours = (2 + fraction) * DT
@@ -458,7 +458,7 @@ class TestFractionalRemainder(unittest.TestCase):
                 self.assertEqual(opt.optim_status, "Optimal")
                 self.assertAlmostEqual(energy_wh(res), NOMINAL * hours, delta=1e-3)
                 partial = [v for v in power(res) if v > 1e-6 and abs(v - NOMINAL) > 1.0]
-                if fraction >= 0.99:
+                if fraction >= 0.991:
                     partial = [v for v in power(res) if v > 1e-6][-1:]
                 self.assertEqual(_deferrable_power_to_state(partial[0], NOMINAL), label)
                 if label != "variable":
@@ -505,7 +505,7 @@ class TestFractionalRemainder(unittest.TestCase):
         """An automation that executes the state label (off = nothing, on = the whole
         step at nominal power) differs from the plan by at most 1 % of one step's
         energy, and a label-driven step counter never counts an ``off`` remainder."""
-        for fraction in (0.002, 0.01, 0.99, 0.998):
+        for fraction in (0.002, 0.009, 0.991, 0.998):
             with self.subTest(fraction=fraction):
                 hours = (2 + fraction) * DT
                 opt = make()

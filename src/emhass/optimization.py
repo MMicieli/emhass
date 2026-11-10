@@ -9092,7 +9092,7 @@ class Optimization:
                 # def_current_power, force bin2[k][0] = 1 so the load stays ON at
                 # t=0. Only index 0 matters here; for pinned loads the power-pin
                 # constraint already implies bin2[0]=1, so this is what keeps an affected
-                # semi_cont load ON (at nominal). Excludes single_const / sequence /
+                # semi_cont load ON (at nominal, or at the remainder step's average power). Excludes single_const / sequence /
                 # thermal via _def_current_power_affected (set in the update method).
                 # Widen window_mask[0] too so a load whose window starts after t=0 is
                 # not immediately blocked by the mask (mirrors the single-const / min-on
