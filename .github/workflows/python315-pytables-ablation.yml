@@ -1,0 +1,209 @@
+# FORK-ONLY RESEARCH: no upstream or production changes.
+# The upstream source is checked out read-only at the same SHA as the
+# successful Python 3.15 baseline run 43024356728.
+name: Fork-only PyTables dependency ablation
+
+on:
+  push:
+    branches:
+      - research/python315-pytables-ablation-20261112
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_NO_PROGRESS: "1"
+  QUALIFICATION_SOURCE_SHA: 26385683ad7feb017597d2e306af2a6f6d8e99e7
+
+jobs:
+  ablation:
+    name: PyTables ablation / ${{ matrix.label }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: py315-linux-amd64, python: "3.15.2" }
+          - { label: py314-linux-amd64, python: "3.14.2" }
+    env:
+      PY_VERSION: ${{ matrix.python }}
+    steps:
+      - name: Check out pinned upstream source (read only)
+        uses: actions/checkout@v4
+        with:
+          repository: davidusb-geek/emhass
+          ref: ${{ env.QUALIFICATION_SOURCE_SHA }}
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+      - name: Install source-build prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libhdf5-dev pkg-config libopenblas-dev liblapack-dev \
+            libblosc-dev liblz4-dev libbz2-dev libzstd-dev
+      - name: Install research Python
+        run: uv python install "$PY_VERSION"
+      - name: Resolve exact starting environment before dependency removal
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Pinned upstream source: $QUALIFICATION_SOURCE_SHA" | tee experiment-summary.txt
+          echo "Python: $PY_VERSION" | tee -a experiment-summary.txt
+          uv --version | tee -a experiment-summary.txt
+          uv sync --python "$PY_VERSION" --reinstall --upgrade --extra test > baseline-sync.log 2>&1
+          uv pip list --python .venv/bin/python --format json > baseline-packages.json
+          cp uv.lock baseline-uv.lock
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          packages = {p["name"].lower(): p["version"] for p in json.loads(Path("baseline-packages.json").read_text())}
+          for name in ("tables", "numexpr", "h5py", "pandas", "numpy", "highspy", "cvxpy", "skforecast"):
+              print("BEFORE_PACKAGE|{}|{}".format(name, packages.get(name, "ABSENT")), flush=True)
+          PY
+      - name: Delete only the PyTables direct requirement in disposable source checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          f = Path("pyproject.toml")
+          original = f.read_text()
+          needle = '    "tables>=3.10.0",\n'
+          assert original.count(needle) == 1, "Expected single, exact direct requirement"
+          f.write_text(original.replace(needle, "", 1))
+          Path("dependency-manifest-change.txt").write_text(
+              "Removed ONLY direct project requirement: tables>=3.10.0\n"
+              "Upstream source pinned: 26385683ad7feb017597d2e306af2a6f6d8e99e7\n"
+              "Original project manifest preserved in upstream; this runner is disposable.\n"
+          )
+          PY
+          git diff -- pyproject.toml > pyproject-ablation.diff
+          cat pyproject-ablation.diff
+      - name: Resolve package graph using existing baseline lock versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --python "$PY_VERSION" --extra test > ablation-sync.log 2>&1
+          uv pip check --python .venv/bin/python > uv-pip-check.txt 2>&1
+          uv pip list --python .venv/bin/python --format json > ablation-packages.json
+          cp uv.lock ablation-uv.lock
+          uv tree --python "$PY_VERSION" > ablation-tree.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          before = {p["name"].lower().replace("_", "-"): p["version"] for p in json.loads(Path("baseline-packages.json").read_text())}
+          after = {p["name"].lower().replace("_", "-"): p["version"] for p in json.loads(Path("ablation-packages.json").read_text())}
+          change_lines = []
+          for name in sorted(before.keys() | after.keys()):
+              if before.get(name) != after.get(name):
+                  change_lines.append("PACKAGE_DELTA|{}|{}|{}".format(name, before.get(name, "ABSENT"), after.get(name, "ABSENT")))
+          Path("package-delta.txt").write_text("\n".join(change_lines) + "\n")
+          print("\n".join(change_lines), flush=True)
+          for name in ("tables", "numexpr", "h5py", "pandas", "numpy", "highspy", "cvxpy", "skforecast"):
+              print("AFTER_PACKAGE|{}|{}".format(name, after.get(name, "ABSENT")), flush=True)
+          Path("ablation-result.json").write_text(json.dumps({
+              "baseline_count": len(before),
+              "after_count": len(after),
+              "tables_present": "tables" in after,
+              "numexpr_present": "numexpr" in after,
+              "other_package_changes": [
+                  n for n in sorted(before.keys() | after.keys())
+                  if before.get(n) != after.get(n) and n not in {"tables", "numexpr"}
+              ],
+              "pinned_source": "26385683ad7feb017597d2e306af2a6f6d8e99e7",
+          }, indent=2))
+          PY
+          cat ablation-result.json
+      - name: Run full regression suite after removing PyTables
+        shell: bash
+        run: |
+          set +e
+          uv run --no-sync --python "$PY_VERSION" pytest -q > ablation-pytest.log 2>&1
+          rc=$?
+          echo "$rc" > ablation-pytest-rc.txt
+          echo "Regression exit code: $rc" >> experiment-summary.txt
+          tail -n 90 ablation-pytest.log
+          exit 0
+      - name: Record deterministic battery schedule and objective
+        shell: bash
+        run: |
+          set +e
+          uv run --no-sync --python "$PY_VERSION" python - <<'PY' > objective-snapshot.log 2>&1
+          import json
+          from pathlib import Path
+          from tests.test_multi_battery_optimization import TestMultiBatteryN1RegressionPin, make_pin_scenario
+          test_case = TestMultiBatteryN1RegressionPin()
+          opt = test_case._build_pin_optimization()
+          _, p_pv, p_load, df_input = make_pin_scenario()
+          result = opt.perform_dayahead_forecast_optim(df_input, p_pv, p_load, soc_init=0.4, soc_final=0.5)
+          snapshot = {
+              "status": opt.optim_status,
+              "objective": float(opt.prob.value),
+              "P_batt": [float(v) for v in result["P_batt"]],
+              "SOC_opt": [float(v) for v in result["SOC_opt"]],
+              "referenced_test": "tests/test_multi_battery_optimization.py::TestMultiBatteryN1RegressionPin",
+          }
+          Path("objective-snapshot.json").write_text(json.dumps(snapshot, indent=2))
+          print(json.dumps(snapshot, indent=2))
+          PY
+          rc=$?
+          echo "$rc" > objective-snapshot-rc.txt
+          tail -n 60 objective-snapshot.log
+          exit 0
+      - name: Extract regression summary and notable warnings
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import collections
+          import json
+          import re
+          from pathlib import Path
+          log = Path("ablation-pytest.log")
+          text = log.read_text(errors="replace") if log.exists() else ""
+          summary = re.findall(r"(?m)^.*\b\d+ passed\b.*$", text)
+          warnings = collections.Counter(re.findall(r"\b([A-Za-z]+Warning):", text))
+          result = {
+              "regression_summary": summary[-1] if summary else "NO PYTEST SUMMARY",
+              "warning_types_in_printed_summary": warnings.most_common(20),
+              "unawaited_coroutine_mentions": text.count("was never awaited"),
+              "pytest_exit_code": Path("ablation-pytest-rc.txt").read_text().strip() if Path("ablation-pytest-rc.txt").exists() else "MISSING",
+              "objective_snapshot_exit_code": Path("objective-snapshot-rc.txt").read_text().strip() if Path("objective-snapshot-rc.txt").exists() else "MISSING",
+          }
+          Path("regression-summary.json").write_text(json.dumps(result, indent=2))
+          print("EXPERIMENT_SUMMARY_JSON=" + json.dumps(result), flush=True)
+          PY
+      - name: Upload comprehensive ablation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytables-ablation-${{ matrix.label }}
+          if-no-files-found: warn
+          path: |
+            experiment-summary.txt
+            baseline-sync.log
+            baseline-packages.json
+            baseline-uv.lock
+            dependency-manifest-change.txt
+            pyproject-ablation.diff
+            ablation-sync.log
+            ablation-tree.txt
+            uv-pip-check.txt
+            ablation-packages.json
+            ablation-uv.lock
+            ablation-result.json
+            package-delta.txt
+            ablation-pytest.log
+            ablation-pytest-rc.txt
+            objective-snapshot.json
+            objective-snapshot.log
+            objective-snapshot-rc.txt
+            regression-summary.json
+      - name: Enforce regression and deterministic snapshot result
+        shell: bash
+        run: |
+          test "$(cat ablation-pytest-rc.txt)" -eq 0
+          test "$(cat objective-snapshot-rc.txt)" -eq 0
