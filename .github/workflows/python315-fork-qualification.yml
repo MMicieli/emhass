@@ -82,6 +82,12 @@ jobs:
           persist-credentials: false
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
+      - name: Install native build prerequisites for source-only numerical packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libhdf5-dev pkg-config libopenblas-dev liblapack-dev \
+            libblosc-dev liblz4-dev libbz2-dev libzstd-dev
       - name: Install isolated Python 3.15.2
         run: uv python install 3.15.2
       - name: Resolve/install full test environment and run full regression suite
@@ -127,3 +133,89 @@ jobs:
         run: |
           test "$(cat sync-exit-code.txt)" -eq 0
           test "$(cat pytest-exit-code.txt)" -eq 0
+
+  package-attribution-linux:
+    name: Per-package Python 3.15 wheel attribution / Linux AMD64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout pinned source without a push credential
+        uses: actions/checkout@v4
+        with:
+          repository: davidusb-geek/emhass
+          ref: ${{ env.QUALIFICATION_SOURCE_SHA }}
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+      - name: Resolve each declared package and high-risk transitive package individually
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv
+          import datetime
+          import pathlib
+          import re
+          import subprocess
+          import tempfile
+          import tomllib
+
+          metadata = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          sources = [("runtime", x) for x in metadata["project"]["dependencies"]]
+          for extra, values in metadata["project"]["optional-dependencies"].items():
+              sources.extend((extra, x) for x in values)
+          for group, values in metadata.get("dependency-groups", {}).items():
+              sources.extend(("group-" + group, x) for x in values if x != "emhass")
+
+          transitive = [
+              "clarabel", "osqp", "scs", "sparsediffpy", "scikit-learn",
+              "numexpr", "blosc2", "yarl", "multidict", "hatchling",
+              "pip", "setuptools", "wheel", "cython", "cffi",
+          ]
+          sources.extend(("transitive-or-build", x) for x in transitive)
+          seen = set()
+          rows = []
+          for group, req in sources:
+              if req.casefold() in seen:
+                  continue
+              seen.add(req.casefold())
+              with tempfile.NamedTemporaryFile(mode="w", suffix=".txt") as fp:
+                  fp.write(req + "\n")
+                  fp.flush()
+                  cmd = [
+                      "uv", "pip", "compile", fp.name, "--python-version", "3.15",
+                      "--only-binary", ":all:", "--quiet",
+                  ]
+                  try:
+                      result = subprocess.run(cmd, capture_output=True, text=True, timeout=55)
+                      raw = (result.stderr + "\n" + result.stdout)
+                      status = "BINARY_RESOLVED" if result.returncode == 0 else "BINARY_BLOCKED"
+                      reason_lines = [
+                          x.strip() for x in raw.splitlines()
+                          if "cause:" in x or "error:" in x or "no usable wheels" in x
+                      ]
+                      reason = " | ".join(reason_lines)[:500]
+                  except subprocess.TimeoutExpired:
+                      status, reason = "TIMEOUT", "55-second per-dependency timeout"
+                  rows.append({
+                      "group": group, "requirement": req, "status": status,
+                      "reason": reason, "checked_utc": datetime.datetime.now(
+                          datetime.timezone.utc).isoformat(),
+                  })
+                  print("PROBE_RESULT|" + group + "|" + req + "|" + status +
+                        "|" + reason, flush=True)
+
+          with open("python315-per-package-linux-amd64.csv", "w", newline="") as fd:
+              writer = csv.DictWriter(fd, fieldnames=list(rows[0]))
+              writer.writeheader()
+              writer.writerows(rows)
+          print("PROBE_COUNT=" + str(len(rows)), flush=True)
+          print("PROBE_BLOCKED=" + str(sum(
+              r["status"] != "BINARY_RESOLVED" for r in rows)), flush=True)
+          PY
+      - name: Upload per-package attribution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python315-per-package-linux-amd64
+          path: python315-per-package-linux-amd64.csv
+          if-no-files-found: warn
