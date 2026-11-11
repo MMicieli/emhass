@@ -1,0 +1,116 @@
+# Fork-only research workflow. This must not be copied upstream or deployed.
+# Tests real HA add-on Dockerfile on a candidate fork branch, with and without
+# changing the interpreter version inside a disposable GitHub Actions checkout.
+name: Fork-only PyTables-free add-on Docker smoke
+
+on:
+  push:
+    branches:
+      - research/pytables-pruning-candidate-20261112
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  addon-container-smoke:
+    name: Add-on Docker smoke / ${{ matrix.label }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: py312-amd64, python: "3.12", targetarch: "amd64" }
+          - { label: py315-amd64, python: "3.15.2", targetarch: "amd64" }
+    env:
+      PY_VERSION: ${{ matrix.python }}
+      TARGETARCH: ${{ matrix.targetarch }}
+    steps:
+      - name: Check out fork-only dependency-removal candidate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Pin Python only in disposable Docker build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$PY_VERSION" > .python-version
+          echo "FORK_ONLY_DOCKER_SMOKE|$PY_VERSION|$TARGETARCH"
+          git diff -- .python-version
+          grep -n 'tables>=' pyproject.toml && exit 1 || true
+          grep -n 'pytables >=' conda/meta.yaml && exit 1 || true
+          test -f Dockerfile
+      - name: Build add-on using repository Dockerfile
+        shell: bash
+        run: |
+          set +e
+          IMAGE="emhass-ablation:$PY_VERSION"
+          docker build --progress=plain \
+            --build-arg TARGETARCH="$TARGETARCH" \
+            --build-arg os_version=debian \
+            --build-arg build_version="research-$PY_VERSION" \
+            -t "$IMAGE" . > docker-build.log 2>&1
+          rc=$?
+          echo "$rc" > docker-build-rc.txt
+          echo "DOCKER_BUILD_RC=$rc"
+          tail -n 80 docker-build.log
+          exit 0
+      - name: Import runtime stack and confirm NumExpr and PyTables absent
+        shell: bash
+        run: |
+          set +e
+          IMAGE="emhass-ablation:$PY_VERSION"
+          if test "$(cat docker-build-rc.txt)" -ne 0; then
+            echo "SKIPPED: docker build failed" > docker-smoke.log
+            echo "99" > docker-smoke-rc.txt
+            exit 0
+          fi
+          docker run --rm --entrypoint /app/.venv/bin/python "$IMAGE" -c '
+          import sys
+          import importlib.util
+          import numpy
+          import pandas
+          import cvxpy
+          import highspy
+          import h5py
+          import emhass
+          from emhass.optimization import Optimization
+          from emhass.machine_learning_forecaster import MLForecaster
+          from emhass import web_server
+          assert sys.version.startswith("'"$PY_VERSION"'"), sys.version
+          assert importlib.util.find_spec("tables") is None, "PyTables still installed"
+          assert importlib.util.find_spec("numexpr") is None, "NumExpr still installed"
+          print("SMOKE_PASSED|", sys.version.split()[0], "numpy", numpy.__version__,
+                "pandas", pandas.__version__, "cvxpy", cvxpy.__version__)
+          ' > docker-smoke.log 2>&1
+          rc=$?
+          echo "$rc" > docker-smoke-rc.txt
+          cat docker-smoke.log
+          if test "$rc" -eq 0; then
+            docker run --rm --entrypoint /usr/local/bin/uv "$IMAGE" \
+              pip check --python /app/.venv/bin/python > docker-uv-pip-check.log 2>&1
+            echo "$?" > docker-pip-check-rc.txt
+            cat docker-uv-pip-check.log
+          fi
+          docker image inspect "$IMAGE" --format 'IMAGE_BYTES|{{.Size}}' || true
+          exit 0
+      - name: Upload add-on deployment evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytables-free-addon-${{ matrix.label }}
+          if-no-files-found: warn
+          path: |
+            docker-build.log
+            docker-build-rc.txt
+            docker-smoke.log
+            docker-smoke-rc.txt
+            docker-uv-pip-check.log
+            docker-pip-check-rc.txt
+      - name: Enforce build, import and dependency integrity
+        shell: bash
+        run: |
+          test "$(cat docker-build-rc.txt)" -eq 0
+          test "$(cat docker-smoke-rc.txt)" -eq 0
+          test "$(cat docker-pip-check-rc.txt)" -eq 0
