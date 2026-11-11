@@ -65,6 +65,7 @@ RUN apt-get update \
         patchelf \
         cmake \
         ninja-build \
+        pkg-config \
         libopenblas-dev \
         libatlas-base-dev \
         libhdf5-dev \
@@ -78,6 +79,7 @@ RUN apt-get update \
         patchelf \
         cmake \
         ninja-build \
+        pkg-config \
         libopenblas-dev \
         libatlas-base-dev \
         libhdf5-dev \
