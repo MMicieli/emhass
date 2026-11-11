@@ -1,0 +1,129 @@
+# Fork-only research. This file must not be copied to upstream or production.
+# The checked-out upstream source is READ ONLY and pinned for reproducibility.
+name: Fork-only EMHASS Python 3.15 qualification
+
+on:
+  push:
+    branches:
+      - research/python315-qualification-20261111
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_NO_PROGRESS: "1"
+  QUALIFICATION_SOURCE_SHA: 26385683ad7feb017597d2e306af2a6f6d8e99e7
+
+jobs:
+  dependency-wheels:
+    name: Wheel resolution / ${{ matrix.label }
+    runs-on: ${{ matrix.os }
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: linux-amd64, os: ubuntu-24.04 }
+          - { label: linux-arm64, os: ubuntu-24.04-arm }
+          - { label: windows-amd64, os: windows-latest }
+          - { label: macos-runner, os: macos-latest }
+    steps:
+      - name: Checkout pinned source without a push credential
+        uses: actions/checkout@v4
+        with:
+          repository: davidusb-geek/emhass
+          ref: ${{ env.QUALIFICATION_SOURCE_SHA }
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+      - name: Binary-only resolve of production and test dependencies
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "Source SHA: $QUALIFICATION_SOURCE_SHA"
+            echo "Runner OS: $RUNNER_OS"
+            echo "Architecture: $(uname -m)"
+            uv --version
+          } > environment.txt
+          uv pip compile pyproject.toml --python-version 3.15 --extra test --only-binary :all: --output-file python315-wheel-requirements.txt > python315-wheel-resolve.log 2>&1
+          rc=$?
+          echo "$rc" > wheel-resolve-exit-code.txt
+          echo "Binary-only resolution exit code: $rc" >> environment.txt
+          cat environment.txt
+          tail -n 90 python315-wheel-resolve.log
+          exit 0
+      - name: Upload wheel and resolver evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python315-wheels-${{ matrix.label }
+          path: |
+            environment.txt
+            python315-wheel-requirements.txt
+            python315-wheel-resolve.log
+            wheel-resolve-exit-code.txt
+          if-no-files-found: warn
+      - name: Mark unresolved wheel requirements
+        shell: bash
+        run: test "$(cat wheel-resolve-exit-code.txt)" -eq 0
+
+  linux-full-regression:
+    name: Python 3.15.2 full suite / Linux AMD64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - name: Checkout pinned source without a push credential
+        uses: actions/checkout@v4
+        with:
+          repository: davidusb-geek/emhass
+          ref: ${{ env.QUALIFICATION_SOURCE_SHA }
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+      - name: Install isolated Python 3.15.2
+        run: uv python install 3.15.2
+      - name: Resolve/install full test environment and run full regression suite
+        shell: bash
+        run: |
+          set +e
+          echo "Source SHA: $QUALIFICATION_SOURCE_SHA" > qualification-environment.txt
+          uv --version >> qualification-environment.txt
+          uv python list --only-installed >> qualification-environment.txt
+          uv sync --python 3.15.2 --reinstall --upgrade --extra test > python315-sync.log 2>&1
+          sync_rc=$?
+          echo "$sync_rc" > sync-exit-code.txt
+          echo "Environment sync exit code: $sync_rc" >> qualification-environment.txt
+          if [ "$sync_rc" -eq 0 ]; then
+            uv run --python 3.15.2 python --version >> qualification-environment.txt 2>&1
+            uv pip list --python .venv/bin/python --format json > python315-resolved-packages.json 2> python315-package-list.log
+            uv run --python 3.15.2 pytest -q > python315-pytest.log 2>&1
+            echo "$?" > pytest-exit-code.txt
+          else
+            echo "NOT RUN: sync failed" > python315-pytest.log
+            echo "99" > pytest-exit-code.txt
+          fi
+          cat qualification-environment.txt
+          tail -n 90 python315-sync.log
+          tail -n 90 python315-pytest.log
+          exit 0
+      - name: Upload install, package and regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python315-linux-full-regression
+          path: |
+            qualification-environment.txt
+            python315-sync.log
+            python315-package-list.log
+            python315-resolved-packages.json
+            python315-pytest.log
+            sync-exit-code.txt
+            pytest-exit-code.txt
+          if-no-files-found: warn
+      - name: Mark qualification failure when sync or tests fail
+        shell: bash
+        run: |
+          test "$(cat sync-exit-code.txt)" -eq 0
+          test "$(cat pytest-exit-code.txt)" -eq 0
