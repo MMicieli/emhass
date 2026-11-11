@@ -65,6 +65,7 @@ RUN apt-get update \
         patchelf \
         cmake \
         ninja-build \
+        make \
         pkg-config \
         git \
         libopenblas-dev \
@@ -80,6 +81,7 @@ RUN apt-get update \
         patchelf \
         cmake \
         ninja-build \
+        make \
         pkg-config \
         git \
         libopenblas-dev \
