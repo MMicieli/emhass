@@ -1,12 +1,12 @@
 # Fork-only research workflow. This must not be copied upstream or deployed.
 # Tests real HA add-on Dockerfile on a candidate fork branch, with and without
 # changing the interpreter version inside a disposable GitHub Actions checkout.
-name: Fork-only PyTables-free add-on Docker smoke
+name: Fork-only Python 3.15 add-on native build qualification
 
 on:
   push:
     branches:
-      - research/pytables-pruning-candidate-20261112
+      - research/python315-addon-build-prereqs-20261112
   workflow_dispatch:
 
 permissions:
@@ -21,7 +21,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { label: py312-amd64, python: "3.12", targetarch: "amd64" }
           - { label: py315-amd64, python: "3.15.2", targetarch: "amd64" }
     env:
       PY_VERSION: ${{ matrix.python }}
