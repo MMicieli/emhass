@@ -7,4 +7,3 @@ reviews:
   poem: false # Disables the playful poems for a strictly technical tone
   auto_review:
     enabled: true # Automatically reviews all new PRs and pushed commits
-    drafts: true # Review pre-upstream staging PRs while they remain drafts
