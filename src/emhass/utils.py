@@ -2314,8 +2314,44 @@ def describe_nested_pv_payload_at_one_inverter(forecast_key: str, forecast_input
     return (
         f"{forecast_key}: send one flat list of numbers (or one timestamped mapping). It holds "
         "lists or mappings, one per inverter, but number_of_inverters is 1. A list per "
-        "inverter is only accepted with more than one inverter, which is not supported yet."
+        "inverter is only accepted when number_of_inverters is above 1."
     )
+
+
+def inverter_curtailment_flags(plant_conf: dict) -> list[bool]:
+    """The curtailment switch of each inverter, read after validation (#1150).
+
+    A scalar or a missing value gives a one-element list holding its truthiness, which is
+    what the single ``compute_curtailment`` flag has always meant. A list gives one flag
+    per entry, coerced as the validation does (a bool, null as false, "true" or "false" in
+    any case). An entry that cannot be coerced counts as false instead of raising, since
+    this is read after the configuration was checked.
+
+    :param plant_conf: The plant_conf dict
+    :return: One flag per inverter for a list, otherwise a single flag
+    """
+    value = plant_conf.get("compute_curtailment", False)
+    if not isinstance(value, list):
+        return [bool(value)]
+    flags: list[bool] = []
+    for element in value:
+        try:
+            flags.append(_coerce_inverter_flag(element, "compute_curtailment"))
+        except InverterConfigError:
+            flags.append(False)
+    return flags
+
+
+def any_inverter_curtails(plant_conf: dict) -> bool:
+    """Whether any inverter has curtailment switched on (#1150).
+
+    For a scalar or missing ``compute_curtailment`` this is its plain truthiness, as
+    before. A list is not tested for truthiness, since ``[False, False]`` is truthy.
+
+    :param plant_conf: The plant_conf dict
+    :return: True when at least one inverter curtails
+    """
+    return any(inverter_curtailment_flags(plant_conf))
 
 
 def pv_carrying_inverters(plant_conf: dict) -> list[int]:
@@ -2744,6 +2780,15 @@ async def treat_runtimeparams(
                 ):
                     batt_distinct_config_lists[batt_param_name] = list(configured)
 
+        # The same for the per-inverter broadcast params (#1150).
+        inverter_distinct_config_lists: dict[str, list] = {}
+        for inverter_param_name in INVERTER_BROADCAST_PARAMS:
+            configured = params["plant_conf"].get(inverter_param_name)
+            if isinstance(configured, list) and any(
+                element != configured[0] for element in configured[1:]
+            ):
+                inverter_distinct_config_lists[inverter_param_name] = list(configured)
+
         # The configured shared tanks, before the association loop below copies a
         # runtime list over them unchecked: a runtime list that the shared-tank
         # validation further down rejects falls back to these.
@@ -2831,8 +2876,21 @@ async def treat_runtimeparams(
             num_batteries, params["plant_conf"], "battery_charge_power_derating", logger
         )
         # Per-inverter parameters (#1150): the same re-normalisation after the runtime
-        # merge, then the refusal of more than one inverter once every specific fault
-        # has been reported. Before the curve check, which reads the normalised caps.
+        # merge, then every specific fault is reported together. Before the curve
+        # check, which reads the normalised caps.
+        try:
+            runtime_num_inverters = validate_num_inverters(params["plant_conf"])
+        except InverterConfigError:
+            runtime_num_inverters = 0  # require_usable_inverter_config reports the count
+        if runtime_num_inverters > 1:
+            for inverter_param_name in INVERTER_BROADCAST_PARAMS:
+                _warn_if_runtime_scalar_masks_inverter_list(
+                    runtime_num_inverters,
+                    params["plant_conf"],
+                    inverter_param_name,
+                    inverter_distinct_config_lists,
+                    logger,
+                )
         require_usable_inverter_config(params["plant_conf"], logger)
         inverters_checked = True
         # Strict: a curve in the request must be valid and usable (no recovery).
@@ -5178,8 +5236,7 @@ async def build_params(
     )
     # Per-inverter parameters (#1150). Never raises here: an unusable value is logged and
     # left for treat_runtimeparams to refuse, so /get-config and startup stay up and the
-    # configuration can be corrected. Every fault comes before the refusal of more
-    # than one inverter.
+    # configuration can be corrected.
     inverter_problems = _inverter_config_problems(params["plant_conf"], logger)
     for inverter_problem in inverter_problems:
         logger.error("%s", inverter_problem)
@@ -5906,7 +5963,10 @@ class BatteryConfigError(ValueError):
 
 
 class InverterConfigError(ValueError):
-    """An inverter setting is unusable, or asks for more than one inverter before that is supported (#1150).
+    """An inverter setting is unusable: the count or a per-inverter parameter is invalid (#1150).
+
+    The optimizer also raises it above one inverter for a plan the settings rule out
+    (perfect-optim, or a PV forecast without the per-inverter split they need).
 
     ``problems`` lists every fault behind the error: just the error itself for a single
     fault, the individual faults for one that joins several (see _join_inverter_faults).
@@ -6011,6 +6071,54 @@ def _warn_if_runtime_scalar_masks_batt_list(
     )
 
 
+# How many entries of a masked per-inverter list the runtime warning shows.
+_MAX_MASKED_LIST_SHOWN = 10
+
+
+def _warn_if_runtime_scalar_masks_inverter_list(
+    num_inverters: int,
+    plant_conf: dict,
+    parameter_name: str,
+    distinct_config_lists: dict[str, list],
+    logger: logging.Logger,
+) -> None:
+    """
+    Warn when a runtime scalar masks a configured per-inverter list (#1150).
+
+    The same rule as for batteries (#1032): a runtime scalar broadcasts to every
+    inverter and flattens a configured list whose entries differ. The values are
+    unchanged; this only makes the override visible. Uniform lists stay silent, and so
+    does a single inverter. The configured list is shown truncated, so the message
+    stays short however long the list is.
+
+    :param num_inverters: the validated plant_conf["number_of_inverters"]
+    :type num_inverters: int
+    :param plant_conf: the plant_conf dict AFTER the runtime association loop
+    :type plant_conf: dict
+    :param parameter_name: name of the per-inverter broadcast parameter
+    :type parameter_name: str
+    :param distinct_config_lists: parameter name -> configured list, captured BEFORE
+        the association loop, only for lists with distinct entries
+    :type distinct_config_lists: dict[str, list]
+    :param logger: The logger object
+    :type logger: logging.Logger
+    """
+    if num_inverters <= 1 or parameter_name not in distinct_config_lists:
+        return
+    current = plant_conf.get(parameter_name)
+    if current is None or isinstance(current, list):
+        return
+    configured = distinct_config_lists[parameter_name]
+    shown = repr(configured[:_MAX_MASKED_LIST_SHOWN])
+    if len(configured) > _MAX_MASKED_LIST_SHOWN:
+        shown += f" and {len(configured) - _MAX_MASKED_LIST_SHOWN} more entries"
+    logger.warning(
+        f"{parameter_name}: runtime scalar {current!r} overrides the configured "
+        f"per-inverter list {shown} and will broadcast to all {num_inverters} "
+        f"inverters; pass a list of {num_inverters} entries to keep per-inverter values"
+    )
+
+
 # Per-inverter parameters (#1150). The broadcast ones follow the battery rule: a scalar
 # is the same value for every inverter, an exact-length list is per inverter, and a
 # list of the wrong length is a hard error. The caps are never broadcast, since one
@@ -6060,23 +6168,6 @@ def validate_num_inverters(conf: dict) -> int:
     if not value.is_integer() or value < 1:
         raise invalid
     return int(value)
-
-
-def reject_multiple_inverters(conf: dict) -> None:
-    """Raise InverterConfigError when number_of_inverters is above 1 (#1150).
-
-    The per-inverter optimizer does not exist yet, so a second inverter would be
-    silently modelled as the first one's twin. The count and every per-inverter
-    setting are validated before this runs, so every fault is reported ahead
-    of this refusal.
-    """
-    num_inverters = validate_num_inverters(conf)
-    if num_inverters > 1:
-        raise InverterConfigError(
-            f"number_of_inverters={num_inverters}: more than one inverter is not supported "
-            "in this version yet. Set number_of_inverters to 1 (the per-inverter optimizer "
-            "is still to come)."
-        )
 
 
 def _inverter_label(name: str, index: int | None) -> str:
@@ -6223,7 +6314,7 @@ def check_inverter_params(conf: dict, logger: logging.Logger) -> None:
     once (its first bad element), and when there are several they come in one
     InverterConfigError whose message joins them with ". " and whose ``problems``
     attribute lists them. A configuration with any fault is left exactly as it was.
-    Nothing is refused for being above one inverter here; see reject_multiple_inverters.
+    Nothing is refused for being above one inverter: a count above 1 is validated like any other.
 
     One inverter (the default, and a missing ``number_of_inverters``) is a true
     no-op for every existing configuration: a scalar is left exactly as written. The
@@ -6237,7 +6328,8 @@ def check_inverter_params(conf: dict, logger: logging.Logger) -> None:
     - ``inverter_efficiency_dc_ac``, ``inverter_efficiency_ac_dc``,
       ``inverter_stress_cost`` and ``compute_curtailment`` take a scalar (broadcast to
       every inverter) or a list of exactly ``number_of_inverters`` entries; a missing
-      key broadcasts the default.
+      key broadcasts the default. Both efficiencies must be above 0 and at most 1, as a
+      scalar or in every entry (the first bad entry is named).
     - ``inverter_ac_output_max`` and ``inverter_ac_input_max`` must be a list of
       exactly ``number_of_inverters`` finite entries of at least 0. A scalar is
       refused, since it is either the 5000 W default or a one-inverter site total.
@@ -6429,6 +6521,30 @@ def _inverter_coverage_fault(
     return InverterConfigError("; ".join(sentences))
 
 
+_INVERTER_EFFICIENCY_PARAMS: tuple[str, ...] = (
+    "inverter_efficiency_dc_ac",
+    "inverter_efficiency_ac_dc",
+)
+
+
+def _efficiency_range_fault(name: str, update: list | _Broadcast) -> InverterConfigError | None:
+    """The fault for an efficiency outside ``0 < eff <= 1`` above one inverter (#1150).
+
+    Names the first bad slot only, so the message stays short for any inverter count.
+    """
+    if isinstance(update, _Broadcast):
+        values: list = [update.value]
+    else:
+        values = update
+    for position, value in enumerate(values):
+        if not 0 < value <= 1:
+            index = None if isinstance(update, _Broadcast) else position
+            return InverterConfigError(
+                f"{_inverter_label(name, index)}={value} must be above 0 and at most 1"
+            )
+    return None
+
+
 def _normalise_multiple_inverters(
     conf: dict,
     num_inverters: int,
@@ -6438,9 +6554,16 @@ def _normalise_multiple_inverters(
 ) -> None:
     for name, default in INVERTER_BROADCAST_PARAMS.items():
         try:
-            updates[name] = _broadcast_param_update(conf, name, default, num_inverters)
+            update = _broadcast_param_update(conf, name, default, num_inverters)
         except InverterConfigError as err:
             faults.append(err)
+            continue
+        if name in _INVERTER_EFFICIENCY_PARAMS:
+            range_fault = _efficiency_range_fault(name, update)
+            if range_fault:
+                faults.append(range_fault)
+                continue
+        updates[name] = update
     for name in INVERTER_CAP_PARAMS:
         try:
             updates[name] = _cap_param_update(conf, name, num_inverters)
@@ -6469,17 +6592,16 @@ def _normalise_multiple_inverters(
 # configuration page and startup stay up; treat_runtimeparams raises through
 # require_usable_inverter_config, which logs first; /set-config collects the messages on
 # a copy with inverter_config_faults. All three share _inverter_config_problems, which
-# runs validate_num_inverters, check_inverter_params and reject_multiple_inverters.
+# runs validate_num_inverters and check_inverter_params.
 def _inverter_config_problems(conf: dict, logger: logging.Logger) -> list[InverterConfigError]:
     """Everything wrong with the inverter settings of a configuration (#1150), in order.
 
     An unusable count is the only problem reported for it. Otherwise every fault from
-    check_inverter_params comes first, one per unusable parameter, and above one
-    inverter the refusal from reject_multiple_inverters follows them, so the user learns
-    that more than one inverter is not supported yet without first fixing every fault.
+    check_inverter_params is reported, one per unusable parameter. A count above 1 is
+    not a fault in itself.
     """
     try:
-        num_inverters = validate_num_inverters(conf)
+        validate_num_inverters(conf)
     except InverterConfigError as err:
         return [err]
     problems: list[InverterConfigError] = []
@@ -6487,27 +6609,21 @@ def _inverter_config_problems(conf: dict, logger: logging.Logger) -> list[Invert
         check_inverter_params(conf, logger)
     except InverterConfigError as err:
         problems.extend(err.problems)
-    if num_inverters > 1:
-        try:
-            reject_multiple_inverters(conf)
-        except InverterConfigError as err:
-            problems.append(err)
     return problems
 
 
 def require_usable_inverter_config(conf: dict, logger: logging.Logger) -> None:
-    """Validate the inverter parameters and refuse more than one inverter (#1150).
+    """Validate the inverter parameters, raising when one is unusable (#1150).
 
-    Every problem is logged at error level here before the error is raised, the specific
-    faults first and then the refusal of more than one inverter, which is what lets the
-    web server return the action log with its 400, as for SocFractionError. When there
-    are several, the raised error carries all of them, joined with ". ".
+    Every problem is logged at error level here before the error is raised, which is what
+    lets the web server return the action log with its 400, as for SocFractionError. When
+    there are several, the raised error carries all of them, joined with ". ".
 
     :param conf: the plant_conf dict
     :type conf: dict
     :param logger: The logger object
     :type logger: logging.Logger
-    :raises InverterConfigError: when a setting is unusable or number_of_inverters is above 1
+    :raises InverterConfigError: when the count or a per-inverter setting is unusable
     """
     problems = _inverter_config_problems(conf, logger)
     for problem in problems:
@@ -6534,8 +6650,7 @@ def inverter_config_faults(config: dict) -> list[str]:
     Used by ``/set-config`` before anything is written. Runs the same checks as
     require_usable_inverter_config on a copy, so the request is left alone and logs
     nothing. The list holds every fault, one per unusable parameter (its first bad
-    entry), in check order. Above one inverter the refusal comes last, so the user
-    learns that more than one inverter is not supported yet from the first answer.
+    entry), in check order. A count above 1 is accepted when the settings are usable.
 
     :param config: the submitted flat configuration
     :type config: dict
