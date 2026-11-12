@@ -125,9 +125,9 @@ const soc_fresh = Number.isFinite(soc) && (now - (flow.get("ev_soc_ts") || 0)) <
 let ev_steps = 0;
 if (connected && soc_fresh) {
     const kwh = Math.max(0, (target_soc - soc) / 100 * capacity_kwh);
-    // Whole steps, rounded up (the round() removes float noise). A whole number of steps is solved as a
-    // normal mixed-integer problem with every step at the nominal power; a fractional hour count is
-    // solved as "Optimal (Relaxed)" with one partial-power step.
+    // Round the required energy up to a whole number of full-power charging steps (round() removes
+    // floating-point noise). The payload sends integer operating timesteps, not fractional hours,
+    // so this example does not schedule a fractional remainder step.
     ev_steps = Math.ceil(Math.round(kwh / (charger_kw * step_min / 60) * 1e6) / 1e6);
     if (ev_steps > end_step) {                                 // would be Infeasible or unlimited: plan what fits and say so
         node.warn(`EV needs ${ev_steps} steps but ${end_step > 0 ? "only " + end_step : "none"} remain before departure; the target will be missed`);
@@ -136,7 +136,7 @@ if (connected && soc_fresh) {
 }
 if (ev_steps === 0) end_step = horizon;            // 0 would mean "no end limit", not "no EV"
 
-const charging = flow.get("ev_charging") === true && ev_steps > 0;   // a pin on an EV with no requirement makes the solve fall back to Optimal (Relaxed)
+const charging = flow.get("ev_charging") === true && ev_steps > 0;   // omit the pin when the EV has no planned steps (EMHASS ignores it for a load with no requirement)
 const charge_w = Number(flow.get("ev_charge_power_w")) || 0;
 const soc_raw = flow.get("battery_soc_percent");
 const soc_batt = typeof soc_raw === "number" ? soc_raw : NaN;   // null or "" must not become 0 %
