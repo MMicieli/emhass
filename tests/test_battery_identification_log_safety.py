@@ -229,13 +229,13 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
         await self.assert_cache_hit_no_refit(cache, plant, sensors)
         self.assert_safe_lines(4)
         summaries = [
-            line for line in self.stream.getvalue().splitlines()
+            line
+            for line in self.stream.getvalue().splitlines()
             if "identification: capacity" in line
         ]
         self.assertEqual(len(summaries), 2)
         self.assertIn("Battery 0 identification: capacity 32.24 kWh", summaries[0])
         self.assertIn("Battery 1 identification: capacity 21.37 kWh", summaries[1])
-
 
     async def test_post_scalar_sensor_log_escapes_state_without_changing_api_payload(self):
         # A damaged cached estimate can be a string when the suggest tier publishes it.
@@ -253,9 +253,7 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
         session.post.return_value.__aenter__.return_value = response
         payload = "32.2\nERROR forged\u2028"
         with patch.object(rh, "_get_session", AsyncMock(return_value=session)):
-            posted = await rh.post_scalar_sensor(
-                "sensor.battery_identified_capacity", payload, {}
-            )
+            posted = await rh.post_scalar_sensor("sensor.battery_identified_capacity", payload, {})
         self.assertTrue(posted)
         self.assertEqual(json.loads(session.post.call_args.kwargs["data"])["state"], payload)
         self.assert_safe_lines(1)
@@ -265,9 +263,9 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
         self.stream.seek(0)
         self.stream.truncate(0)
         with patch.object(rh, "_get_session", AsyncMock(return_value=session)):
-            self.assertTrue(await rh.post_scalar_sensor(
-                "sensor.battery_identified_capacity", 32.24, {}
-            ))
+            self.assertTrue(
+                await rh.post_scalar_sensor("sensor.battery_identified_capacity", 32.24, {})
+            )
         self.assertEqual(
             self.stream.getvalue(),
             "Successfully posted to sensor.battery_identified_capacity = 32.24\n",
