@@ -1,0 +1,130 @@
+# Fork-only, no upstream PR or production change.
+# Validate PyTables/NumExpr removal on EMHASS's currently declared Python
+# support matrix. Python 3.15 is intentionally excluded.
+name: Fork-only PyTables-free supported-runtime regression
+
+on:
+  push:
+    branches:
+      - research/pytables-supported-regression-20261112
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_NO_PROGRESS: "1"
+
+jobs:
+  regression:
+    name: PyTables-free full regression / py${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout candidate without write credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Configure uv
+        uses: astral-sh/setup-uv@v5
+      - name: Install supported Python
+        run: uv python install "${{ matrix.python }}"
+      - name: Assert only PyTables requirement is removed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -nE '["'"'"']tables[>= ]|pytables[ >=]' pyproject.toml conda/meta.yaml; then
+            echo 'Unexpected PyTables requirement'
+            exit 1
+          fi
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" > source-info.txt
+          echo "PYTHON_TARGET=${{ matrix.python }}" >> source-info.txt
+          uv --version >> source-info.txt
+      - name: Install complete test environment and record resolved versions
+        shell: bash
+        run: |
+          set +e
+          uv sync --python "${{ matrix.python }}" --extra test > install.log 2>&1
+          rc=$?
+          echo "$rc" > install-rc.txt
+          if test "$rc" -eq 0; then
+            uv pip list --python .venv/bin/python --format json > resolved-packages.json
+            cp uv.lock resolved-uv.lock
+            uv pip check --python .venv/bin/python > package-integrity.log 2>&1
+            echo "$?" > package-integrity-rc.txt
+            uv run --no-sync --python "${{ matrix.python }}" python - <<'PY'
+          import importlib.util, sys
+          assert importlib.util.find_spec('tables') is None
+          assert importlib.util.find_spec('numexpr') is None
+          print('UNUSED_DEPENDENCIES_ABSENT|' + sys.version.split()[0])
+          PY
+            echo "$?" > absence-rc.txt
+          else
+            echo 99 > package-integrity-rc.txt
+            echo 99 > absence-rc.txt
+          fi
+          tail -n 65 install.log
+          cat package-integrity.log 2>/dev/null || true
+          exit 0
+      - name: Run complete regression including solver and forecast coverage
+        shell: bash
+        run: |
+          if test "$(cat install-rc.txt)" -ne 0; then
+            echo "Install failed; full regression skipped" > regression.log
+            echo 99 > regression-rc.txt
+            exit 0
+          fi
+          set +e
+          uv run --no-sync --python "${{ matrix.python }}" pytest -q > regression.log 2>&1
+          echo "$?" > regression-rc.txt
+          tail -n 90 regression.log
+          exit 0
+      - name: Extract warnings and test summary
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import collections, json, re
+          from pathlib import Path
+          s = Path("regression.log").read_text(errors="replace") if Path("regression.log").exists() else ""
+          lines = s.splitlines()
+          summary = next((line for line in reversed(lines) if re.search(r"\b\d+ passed\b", line)), "NO_PASS_SUMMARY")
+          found = collections.Counter(re.findall(r"\b([A-Za-z]+Warning):", s))
+          result = {
+              "test_summary": summary,
+              "warning_classes_excerpt": found.most_common(20),
+              "unawaited_coroutine_mentions": s.count("was never awaited"),
+              "python_target": "${{ matrix.python }}",
+          }
+          Path("test-summary.json").write_text(json.dumps(result, indent=2))
+          print(json.dumps(result))
+          PY
+      - name: Save source, package and regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytables-free-regression-py${{ matrix.python }}
+          if-no-files-found: warn
+          path: |
+            source-info.txt
+            install.log
+            install-rc.txt
+            package-integrity.log
+            package-integrity-rc.txt
+            absence-rc.txt
+            resolved-packages.json
+            resolved-uv.lock
+            regression.log
+            regression-rc.txt
+            test-summary.json
+      - name: Enforce installation, dependency and regression gates
+        shell: bash
+        run: |
+          test "$(cat install-rc.txt)" -eq 0
+          test "$(cat package-integrity-rc.txt)" -eq 0
+          test "$(cat absence-rc.txt)" -eq 0
+          test "$(cat regression-rc.txt)" -eq 0
