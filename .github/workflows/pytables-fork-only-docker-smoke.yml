@@ -1,6 +1,6 @@
 # Fork-only research workflow. This must not be copied upstream or deployed.
-# Tests real HA add-on Dockerfile on a candidate fork branch, with and without
-# changing the interpreter version inside a disposable GitHub Actions checkout.
+# Validates only supported Python versions (3.12, 3.14) on amd64 and aarch64
+# using a disposable CI checkout and the actual HA add-on Dockerfile.
 name: Fork-only PyTables-free add-on Docker smoke
 
 on:
@@ -15,14 +15,16 @@ permissions:
 jobs:
   addon-container-smoke:
     name: Add-on Docker smoke / ${{ matrix.label }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 85
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { label: py312-amd64, python: "3.12", targetarch: "amd64" }
-          - { label: py315-amd64, python: "3.15.2", targetarch: "amd64" }
+          - { label: py312-amd64, python: "3.12", targetarch: "amd64", runner: "ubuntu-24.04" }
+          - { label: py314-amd64, python: "3.14", targetarch: "amd64", runner: "ubuntu-24.04" }
+          - { label: py312-aarch64, python: "3.12", targetarch: "aarch64", runner: "ubuntu-24.04-arm" }
+          - { label: py314-aarch64, python: "3.14", targetarch: "aarch64", runner: "ubuntu-24.04-arm" }
     env:
       PY_VERSION: ${{ matrix.python }}
       TARGETARCH: ${{ matrix.targetarch }}
