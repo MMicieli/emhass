@@ -11,7 +11,7 @@ import pathlib
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from emhass import command_line
 
@@ -213,6 +213,7 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
         entry1 = copy.deepcopy(self.payload)
         entry0["capacity_kwh"]["ci_low"] = "30\nERROR forged"
         entry0["sensors"] = {"power": "power0", "soc": "soc0"}
+        entry1["capacity_kwh"]["value"] = 21.37
         entry1["sensors"] = {"power": "power1", "soc": "soc1"}
         cache = {"schema_version": 2, "batteries": {"0": entry0, "1": entry1}}
         plant = {
@@ -227,7 +228,50 @@ class TestBatteryIdentificationLogSafety(unittest.IsolatedAsyncioTestCase):
         }
         await self.assert_cache_hit_no_refit(cache, plant, sensors)
         self.assert_safe_lines(4)
-        self.assertEqual(self.stream.getvalue().count("identification: capacity"), 2)
+        summaries = [
+            line for line in self.stream.getvalue().splitlines()
+            if "identification: capacity" in line
+        ]
+        self.assertEqual(len(summaries), 2)
+        self.assertIn("Battery 0 identification: capacity 32.24 kWh", summaries[0])
+        self.assertIn("Battery 1 identification: capacity 21.37 kWh", summaries[1])
+
+
+    async def test_post_scalar_sensor_log_escapes_state_without_changing_api_payload(self):
+        # A damaged cached estimate can be a string when the suggest tier publishes it.
+        # The scalar POST still transmits its original value, but must not forge log lines.
+        rh = object.__new__(command_line.RetrieveHass)
+        rh.hass_url = "http://localhost:8123/"
+        rh.long_lived_token = "unused"
+        rh.ssl_verify = False
+        rh.get_data_from_file = False
+        rh.logger = self.logger
+
+        session = MagicMock()
+        response = AsyncMock()
+        response.ok = True
+        session.post.return_value.__aenter__.return_value = response
+        payload = "32.2\nERROR forged\u2028"
+        with patch.object(rh, "_get_session", AsyncMock(return_value=session)):
+            posted = await rh.post_scalar_sensor(
+                "sensor.battery_identified_capacity", payload, {}
+            )
+        self.assertTrue(posted)
+        self.assertEqual(json.loads(session.post.call_args.kwargs["data"])["state"], payload)
+        self.assert_safe_lines(1)
+        self.assertIn(r"\nERROR forged\u2028", self.stream.getvalue())
+
+        # Normal numeric values retain the original exact logging format.
+        self.stream.seek(0)
+        self.stream.truncate(0)
+        with patch.object(rh, "_get_session", AsyncMock(return_value=session)):
+            self.assertTrue(await rh.post_scalar_sensor(
+                "sensor.battery_identified_capacity", 32.24, {}
+            ))
+        self.assertEqual(
+            self.stream.getvalue(),
+            "Successfully posted to sensor.battery_identified_capacity = 32.24\n",
+        )
 
 
 if __name__ == "__main__":
