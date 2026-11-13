@@ -26,7 +26,25 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v5
-      - name: Clean resolved environment from current fork master dependency manifests
+      - name: One-variable ablation in disposable runner (not committed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          paths = {
+              "pyproject.toml": '    "tables>=3.10.0",\n',
+              "conda/meta.yaml": "    - pytables >=3.10.0\n",
+          }
+          for path, line in paths.items():
+              f = Path(path)
+              content = f.read_text()
+              assert content.count(line) == 1, "Expected exactly one direct requirement in " + path
+              f.write_text(content.replace(line, "", 1))
+          PY
+          git diff -- pyproject.toml conda/meta.yaml > dependency-ablation.diff
+          cat dependency-ablation.diff
+      - name: Clean resolved environment after removal of the only direct PyTables requirements
         shell: bash
         run: |
           set -euo pipefail
@@ -57,6 +75,7 @@ jobs:
           path: |
             pvlib-audit-results.json
             source-info.txt
+            dependency-ablation.diff
             installed-packages.json
             resolved-uv.lock
             check.log
