@@ -3863,6 +3863,17 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(opt.prob, cached_problem, "runtime refresh must use the cached problem")
         self.assertEqual(opt.optim_status, "Optimal")
+        # Inspect the live Parameters as well as the achieved trajectory: with
+        # a zero-cost objective, an unconstrained plan might coincidentally
+        # satisfy the new floor, which must not mask a stale cached bound.
+        params = opt.param_thermal[1]
+        np.testing.assert_allclose(
+            np.asarray(params["outdoor_temp"].value, dtype=float),
+            15.0,
+            rtol=0.0,
+            atol=1e-8,
+        )
+        self.assertAlmostEqual(float(params["min_temps"].value[3]), 20.0, delta=1e-8)
         temp = np.asarray(opt.predicted_temps[1].value, dtype=float)
         # The first two lagged temperatures cannot be influenced by this plan's
         # heating; they are the independent passive-cooling reference trajectory.
