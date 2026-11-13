@@ -3816,6 +3816,72 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
         return opt, res
 
+    def _assert_stage2e_thermal_lag_balance(self, opt, result, outdoor):
+        """Independent thermal_config heat/loss oracle, including its two-step lag."""
+        temp = result["predicted_temp_heater1"].to_numpy(dtype=float)
+        power = result["P_deferrable1"].to_numpy(dtype=float)
+        dt = opt.time_step
+        # L=2, nominal=3000 W, heating_rate=10 C/h, cooling_constant=0.5 /h.
+        # For t < L only heat committed before the horizon could arrive; here
+        # prior_heat is absent, so the first L source terms must be zero.
+        arrived_heat = np.zeros(len(temp) - 1)
+        arrived_heat[2:] = power[: len(temp) - 3] * (10.0 * dt / 3000.0)
+        standing_loss = 0.5 * dt * (temp[:-1] - outdoor)
+        np.testing.assert_allclose(
+            np.diff(temp) + standing_loss,
+            arrived_heat,
+            rtol=0.0,
+            atol=1e-4,
+            err_msg="thermal_config temperature must conserve heat and standing losses",
+        )
+        self.assertAlmostEqual(temp[0], 20.0, delta=1e-4)
+        self.assertGreater(power[0], 0.0, "the comfort floor must require actual heating")
+        self.assertLessEqual(float(power.max()), 3000.0 + 1e-4)
+
+    def test_stage2e_thermal_lag_balance_detects_losses(self):
+        """A feasible comfort floor must coexist with the full delayed heat balance.
+
+        Unlike checking only Optimal or one target temperature, this rejects a
+        missing cooling term, wrong timestep scale, or an early/late power effect.
+        It does not pin the solver's particular choice among valid schedules.
+        """
+        min_temps = [0.0] * 48
+        min_temps[3] = 18.0
+        opt, result = self._solve_lag_window(min_temps, [30.0] * 48)
+        self.assertEqual(opt.optim_status, "Optimal")
+        self.assertGreaterEqual(result["predicted_temp_heater1"].iloc[3], 18.0 - 1e-4)
+        self._assert_stage2e_thermal_lag_balance(opt, result, outdoor=10.0)
+
+    def test_stage2e_thermal_cache_refreshes_weather_and_comfort(self):
+        """A cached re-solve must update both weather dynamics and the hard floor.
+
+        Changing only runtime weather/comfort values must reuse the CVXPY problem;
+        an Optimal status with stale outdoor temperature or stale comfort limits
+        is not acceptable.
+        """
+        opt, _ = self._solve_lag_window([0.0] * 48, [30.0] * 48)
+        cached_problem = opt.prob
+        min_temps = [0.0] * 48
+        min_temps[3] = 20.0
+        opt.optim_conf["def_load_config"][1]["thermal_config"]["min_temperatures"] = min_temps
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [15.0] * 48
+        result = opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            self.df_input_data_dayahead[opt.var_load_cost].values,
+            self.df_input_data_dayahead[opt.var_prod_price].values,
+        )
+        self.assertIs(opt.prob, cached_problem, "runtime refresh must use the cached problem")
+        self.assertEqual(opt.optim_status, "Optimal")
+        temp = result["predicted_temp_heater1"].to_numpy(dtype=float)
+        # The first two lagged temperatures cannot be influenced by this plan's
+        # heating; they are the independent passive-cooling reference trajectory.
+        self.assertAlmostEqual(temp[1], 18.75, delta=1e-4)
+        self.assertAlmostEqual(temp[2], 17.8125, delta=1e-4)
+        self.assertGreaterEqual(temp[3], 20.0 - 1e-4)
+        self._assert_stage2e_thermal_lag_balance(opt, result, outdoor=15.0)
+
     def test_thermal_inertia_bounds_inside_the_lag_window_are_not_enforced(self):
         """#1136: no decision reaches steps 1..L, so a bound the fixed path crosses
         there is logged, not enforced; it used to make the solve infeasible."""
