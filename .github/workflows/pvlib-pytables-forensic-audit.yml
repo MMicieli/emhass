@@ -1,0 +1,109 @@
+# Fork-only research, intentionally excluded from upstream/production.
+name: Fork-only pvlib PyTables forensic dependency audit
+
+on:
+  push:
+    branches:
+      - research/pvlib-pytables-audit-20261113
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  emhass-pip:
+    name: EMHASS clean pip graph / Python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    env:
+      AUDIT_LABEL: "emhass-pip-Python-${{ matrix.python }}"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - name: Clean resolved environment from current fork master dependency manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install "${{ matrix.python }}"
+          uv sync --python "${{ matrix.python }}" --extra test > install.log 2>&1
+          uv pip check --python .venv/bin/python > check.log 2>&1
+          uv pip list --python .venv/bin/python --format json > installed-packages.json
+          cp uv.lock resolved-uv.lock
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" > source-info.txt
+          cat check.log
+      - name: Assert installed pvlib metadata and exercise its HDF5 lookup without PyTables
+        shell: bash
+        run: |
+          uv run --no-sync --python "${{ matrix.python }}" python research/audit_pvlib_pytables.py
+      - name: Focused EMHASS PV and forecast regressions
+        shell: bash
+        run: |
+          uv run --no-sync --python "${{ matrix.python }}" pytest -q \
+            tests/test_forecast.py tests/test_external_pv_p10.py tests/test_per_plant_pv.py \
+            > forecast-regression.log 2>&1
+          tail -n 12 forecast-regression.log
+      - name: Store installed packages and reproducible audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pvlib-emhass-pip-py${{ matrix.python }}
+          if-no-files-found: warn
+          path: |
+            pvlib-audit-results.json
+            source-info.txt
+            installed-packages.json
+            resolved-uv.lock
+            check.log
+            install.log
+            forecast-regression.log
+
+  conda-pvlib:
+    name: Standalone conda-forge pvlib ${{ matrix.pvlib }} / Python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { python: "3.12", pvlib: "0.11.0", label: "oldest-supported" }
+          - { python: "3.12", pvlib: "0.16.1", label: "latest-release" }
+          - { python: "3.14", pvlib: "0.16.1", label: "latest-py314" }
+    env:
+      AUDIT_LABEL: "conda-forge-pvlib-${{ matrix.pvlib }}-Python-${{ matrix.python }}"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install isolated conda-forge pvlib environment, without EMHASS PyTables
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: pvlib-audit
+          init-shell: bash
+          condarc: |
+            channels:
+              - conda-forge
+            channel_priority: strict
+          create-args: >-
+            python=${{ matrix.python }}
+            pvlib=${{ matrix.pvlib }}
+      - name: Audit actual conda environment and HDF5 functionality
+        shell: bash
+        run: |
+          set -euo pipefail
+          micromamba list -n pvlib-audit --json > conda-installed-packages.json
+          micromamba run -n pvlib-audit python research/audit_pvlib_pytables.py
+      - name: Store conda solver proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pvlib-conda-${{ matrix.label }}
+          if-no-files-found: warn
+          path: |
+            pvlib-audit-results.json
+            conda-installed-packages.json
