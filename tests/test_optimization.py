@@ -3835,7 +3835,9 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             err_msg="thermal_config temperature must conserve heat and standing losses",
         )
         self.assertAlmostEqual(temp[0], 20.0, delta=1e-4)
-        self.assertGreater(power[0], 0.0, "the comfort floor must require actual heating")
+        self.assertGreater(
+            power[0], 0.0, "the comfort floor must require actual heating"
+        )
         self.assertLessEqual(float(power.max()), 3000.0 + 1e-4)
 
     def test_stage2e_thermal_lag_balance_detects_losses(self):
@@ -3863,7 +3865,8 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         cached_problem = opt.prob
         min_temps = [0.0] * 48
         min_temps[3] = 20.0
-        opt.optim_conf["def_load_config"][1]["thermal_config"]["min_temperatures"] = min_temps
+        thermal_conf = opt.optim_conf["def_load_config"][1]["thermal_config"]
+        thermal_conf["min_temperatures"] = min_temps
         self.df_input_data_dayahead["outdoor_temperature_forecast"] = [15.0] * 48
         result = opt.perform_optimization(
             self.df_input_data_dayahead,
@@ -3872,7 +3875,9 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             self.df_input_data_dayahead[opt.var_load_cost].values,
             self.df_input_data_dayahead[opt.var_prod_price].values,
         )
-        self.assertIs(opt.prob, cached_problem, "runtime refresh must use the cached problem")
+        self.assertIs(
+            opt.prob, cached_problem, "runtime refresh must use the cached problem"
+        )
         self.assertEqual(opt.optim_status, "Optimal")
         temp = result["predicted_temp_heater1"].to_numpy(dtype=float)
         # The first two lagged temperatures cannot be influenced by this plan's
