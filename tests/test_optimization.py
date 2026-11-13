@@ -3818,8 +3818,10 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
 
     def _assert_stage2e_thermal_lag_balance(self, opt, result, outdoor):
         """Independent thermal_config heat/loss oracle, including its two-step lag."""
-        temp = result["predicted_temp_heater1"].to_numpy(dtype=float)
-        power = result["P_deferrable1"].to_numpy(dtype=float)
+        # Published temperature is rounded to 0.01 C: test the exact CVXPY
+        # state and power instead of treating rounded telemetry as solver state.
+        temp = np.asarray(opt.predicted_temps[1].value, dtype=float)
+        power = np.asarray(opt.vars["p_deferrable"][1].value, dtype=float)
         dt = opt.time_step
         # L=2, nominal=3000 W, heating_rate=10 C/h, cooling_constant=0.5 /h.
         # For t < L only heat committed before the horizon could arrive; here
@@ -3837,20 +3839,6 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(temp[0], 20.0, delta=1e-4)
         self.assertGreater(power[0], 0.0, "the comfort floor must require actual heating")
         self.assertLessEqual(float(power.max()), 3000.0 + 1e-4)
-
-    def test_stage2e_thermal_lag_balance_detects_losses(self):
-        """A feasible comfort floor must coexist with the full delayed heat balance.
-
-        Unlike checking only Optimal or one target temperature, this rejects a
-        missing cooling term, wrong timestep scale, or an early/late power effect.
-        It does not pin the solver's particular choice among valid schedules.
-        """
-        min_temps = [0.0] * 48
-        min_temps[3] = 18.0
-        opt, result = self._solve_lag_window(min_temps, [30.0] * 48)
-        self.assertEqual(opt.optim_status, "Optimal")
-        self.assertGreaterEqual(result["predicted_temp_heater1"].iloc[3], 18.0 - 1e-4)
-        self._assert_stage2e_thermal_lag_balance(opt, result, outdoor=10.0)
 
     def test_stage2e_thermal_cache_refreshes_weather_and_comfort(self):
         """A cached re-solve must update both weather dynamics and the hard floor.
@@ -3875,7 +3863,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(opt.prob, cached_problem, "runtime refresh must use the cached problem")
         self.assertEqual(opt.optim_status, "Optimal")
-        temp = result["predicted_temp_heater1"].to_numpy(dtype=float)
+        temp = np.asarray(opt.predicted_temps[1].value, dtype=float)
         # The first two lagged temperatures cannot be influenced by this plan's
         # heating; they are the independent passive-cooling reference trajectory.
         self.assertAlmostEqual(temp[1], 18.75, delta=1e-4)
@@ -4024,6 +4012,9 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             temp.iloc[2],
             msg="T[3] should rise (or stop dropping) as heating kicks in",
         )
+
+        # Stage 2E: independent energy/loss balance on the existing inertia fixture.
+        self._assert_stage2e_thermal_lag_balance(self.opt, self.opt_res_dayahead, outdoor=10.0)
 
     def test_thermal_inertia_at_or_beyond_horizon_builds(self):
         """A thermal_inertia at (or past) the end of the horizon must not crash the
