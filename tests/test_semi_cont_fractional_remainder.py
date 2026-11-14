@@ -484,6 +484,16 @@ class TestFractionalRemainder(unittest.TestCase):
                 expected = (steps - np.floor(steps)) * NOMINAL
                 self.assertAlmostEqual(opt.param_rem_level[0].value, expected, delta=1e-6)
                 self.assertAlmostEqual(energy_wh(res), steps * DT * NOMINAL, delta=1e-2)
+                # Do not let solver energy tolerance make a dropped sub-watt
+                # remainder look like a passing schedule. Inspect the actual
+                # binary full-step and ON-state decisions, not only a parameter.
+                full = np.asarray(opt.vars["p_def_bin1"][0].value, dtype=float)
+                on = np.asarray(opt.vars["p_def_bin2"][0].value, dtype=float)
+                self.assertEqual(int(np.rint(full).sum()), int(np.floor(steps)))
+                self.assertEqual(int(np.rint(on - full).sum()), 1)
+                self.assertEqual(int(np.rint(on).sum()), int(np.ceil(steps)))
+                remainder_index = int(np.flatnonzero(on - full > 0.5)[0])
+                self.assertGreater(remainder_index, int(np.flatnonzero(full > 0.5).max()))
 
     def test_float_representation_noise_keeps_whole_steps(self):
         """An exact whole-step requirement with IEEE-754 roundoff must not
