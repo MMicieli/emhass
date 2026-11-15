@@ -1,0 +1,125 @@
+# Fork-only, research only. Never write upstream, publish, or deploy.
+name: Fork-only Python 3.15 wheel refresh
+
+on:
+  push:
+    branches: [research/python315-wheels-refresh-20261115]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+env:
+  QUALIFICATION_SOURCE_SHA: 08047a9c3319a58f08dc0ccc18818037f6a4faec
+  UV_NO_PROGRESS: "1"
+
+jobs:
+  compare-wheel-graphs:
+    name: Python 3.15 wheels / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-amd64, os: ubuntu-24.04 }
+          - { name: linux-arm64, os: ubuntu-24.04-arm }
+          - { name: windows-amd64, os: windows-latest }
+          - { name: macos-arm64, os: macos-15 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: davidusb-geek/emhass
+          ref: ${{ env.QUALIFICATION_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - name: Check wheel-only resolution before and after exactly two dependency removals
+        shell: bash
+        run: |
+          set +e
+          echo "SOURCE_SHA=$QUALIFICATION_SOURCE_SHA" > details.txt
+          echo "RUNNER_OS=$RUNNER_OS" >> details.txt
+          uv --version >> details.txt
+          uv pip compile pyproject.toml --python-version 3.15 --extra test --only-binary :all: \
+            --output-file wheels-before.txt > wheel-before.log 2>&1
+          echo "$?" > before-rc.txt
+          python - <<'PY'
+          from pathlib import Path
+          for path, needle in [
+             ("pyproject.toml", '    "tables>=3.10.0",\n'),
+             ("conda/meta.yaml", "    - pytables >=3.10.0\n")]:
+            f=Path(path)
+            s=f.read_text()
+            assert s.count(needle)==1, path
+            f.write_text(s.replace(needle,"",1))
+          PY
+          if test $? -ne 0; then echo 99 > after-rc.txt; exit 0; fi
+          git diff -- pyproject.toml conda/meta.yaml > dependency-diff.txt
+          uv pip compile pyproject.toml --python-version 3.15 --extra test --only-binary :all: \
+            --output-file wheels-after.txt > wheel-after.log 2>&1
+          echo "$?" > after-rc.txt
+          echo "BEFORE_RC=$(cat before-rc.txt)" >> details.txt
+          echo "AFTER_RC=$(cat after-rc.txt)" >> details.txt
+          cat details.txt
+          tail -n 25 wheel-before.log
+          tail -n 35 wheel-after.log
+          exit 0
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python315-wheels-${{ matrix.name }}
+          if-no-files-found: warn
+          path: |
+            details.txt
+            before-rc.txt
+            after-rc.txt
+            dependency-diff.txt
+            wheel-before.log
+            wheel-after.log
+            wheels-before.txt
+            wheels-after.txt
+
+  per-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: davidusb-geek/emhass
+          ref: ${{ env.QUALIFICATION_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - name: Fresh binary-only resolution for individual requirements
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json,subprocess,tempfile,pathlib
+          specs=[
+           "h5py>=3.12.1", "highspy>=1.10.0", "cvxpy>=1.6.0,<1.10.0",
+           "pyyaml>=6.0.2", "osqp", "numexpr", "tables>=3.10.0",
+           "skforecast>=0.19.1,<0.23.0", "sparsediffpy", "clarabel", "scs",
+           "pvlib>=0.11.0", "numpy>=2.0.0,<2.6.0", "pandas>=2.2.0",
+           "scipy>=1.15.0", "scikit-learn",
+          ]
+          results=[]
+          for spec in specs:
+            with tempfile.NamedTemporaryFile(mode="w",suffix=".txt",delete=False) as f:
+              f.write(spec+"\n")
+              path=f.name
+            try:
+              p=subprocess.run(["uv","pip","compile",path,"--python-version","3.15",
+                 "--only-binary",":all:","--quiet"],capture_output=True,text=True,timeout=75)
+              lines=(p.stderr+"\n"+p.stdout).splitlines()
+              errors=[x.strip() for x in lines if "error:" in x or "cause:" in x or "no usable wheels" in x]
+              status={"requirement":spec,"passed":p.returncode==0,"reason":" | ".join(errors)[:750]}
+            except subprocess.TimeoutExpired:
+              status={"requirement":spec,"passed":False,"reason":"timeout"}
+            pathlib.Path(path).unlink(missing_ok=True)
+            results.append(status)
+            print("WHEEL_PROBE|"+json.dumps(status),flush=True)
+          pathlib.Path("wheel-attribution.json").write_text(json.dumps(results,indent=2))
+          PY
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python315-individual-wheel-attribution
+          path: wheel-attribution.json
