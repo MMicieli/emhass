@@ -765,6 +765,105 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
             [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 50.0, 40.0, 30.0, 20.0, 10.0, 0.0],
         )
 
+    async def test_weather_covariates_use_time_not_row_positions_on_offset_grids(self):
+        """10-minute, irregular and DST grids use elapsed time in the source/target union."""
+        from unittest.mock import patch
+
+        cases = (
+            ("UTC", pd.Timestamp("2026-08-22 10:00", tz="UTC")),
+            (
+                "Europe/Copenhagen",
+                pd.Timestamp("2026-10-25 00:45", tz="UTC").tz_convert("Europe/Copenhagen"),
+            ),
+        )
+        for zone, start in cases:
+            samples = pd.date_range(start, periods=3, freq="15min")
+            payload = {
+                "minutely_15": {
+                    "time": [int(t.timestamp()) for t in samples],
+                    "temperature_2m": [0.0, 90.0, 0.0],
+                    "relative_humidity_2m": [40.0, 70.0, 40.0],
+                }
+            }
+            grids = (
+                (
+                    "regular-10min",
+                    pd.date_range(start, periods=4, freq="10min"),
+                    [0.0, 60.0, 60.0, 0.0],
+                    [40.0, 60.0, 60.0, 40.0],
+                ),
+                (
+                    "offset-10min",
+                    pd.date_range(start + pd.Timedelta(minutes=2), periods=3, freq="10min"),
+                    [12.0, 72.0, 48.0],
+                    [44.0, 64.0, 56.0],
+                ),
+                (
+                    "irregular",
+                    pd.DatetimeIndex([start + pd.Timedelta(minutes=m) for m in (0, 7, 19, 30)]),
+                    [0.0, 42.0, 66.0, 0.0],
+                    [40.0, 54.0, 62.0, 40.0],
+                ),
+            )
+            for case, grid, expected_temp, expected_humidity in grids:
+                with self.subTest(zone=zone, grid=case):
+                    with (
+                        patch.object(self.fcst, "time_zone", zone),
+                        patch.object(
+                            self.fcst,
+                            "_fetch_open_meteo_covariates_json",
+                            return_value=payload,
+                        ),
+                        patch.object(
+                            self.fcst,
+                            "_fetch_open_meteo_historical_covariates_json",
+                            return_value=None,
+                        ),
+                    ):
+                        covariates = await self.fcst.get_weather_covariates(
+                            grid, ["relative_humidity", "temp_air", "heating_degree"]
+                        )
+                    pd.testing.assert_index_equal(covariates.index, grid)
+                    self.assertEqual(
+                        list(covariates.columns),
+                        ["relative_humidity", "temp_air", "heating_degree"],
+                    )
+                    np.testing.assert_allclose(covariates["temp_air"], expected_temp)
+                    np.testing.assert_allclose(covariates["relative_humidity"], expected_humidity)
+                    self.assertFalse(covariates.isna().any().any())
+
+    async def test_weather_covariates_time_interpolation_preserves_historical_join(self):
+        """The forecast API wins overlap with history; interpolation respects elapsed time."""
+        from unittest.mock import patch
+
+        start = pd.Timestamp("2026-08-22 10:00", tz="UTC")
+        grid = pd.date_range(start, periods=4, freq="10min")
+        forecast = {
+            "minutely_15": {
+                "time": [int((start + pd.Timedelta(minutes=m)).timestamp()) for m in (15, 30)],
+                "temperature_2m": [90.0, 0.0],
+            }
+        }
+        historical = {
+            "minutely_15": {
+                "time": [int((start + pd.Timedelta(minutes=m)).timestamp()) for m in (0, 15)],
+                "temperature_2m": [0.0, 999.0],
+            }
+        }
+        with (
+            patch.object(self.fcst, "time_zone", "UTC"),
+            patch.object(self.fcst, "_fetch_open_meteo_covariates_json", return_value=forecast),
+            patch.object(
+                self.fcst,
+                "_fetch_open_meteo_historical_covariates_json",
+                return_value=historical,
+            ) as history_fetch,
+        ):
+            covariates = await self.fcst.get_weather_covariates(grid, ["temp_air"])
+        history_fetch.assert_awaited_once()
+        pd.testing.assert_index_equal(covariates.index, grid)
+        np.testing.assert_allclose(covariates["temp_air"], [0.0, 60.0, 60.0, 0.0])
+
     async def test_get_weather_covariates_rejects_unsupported(self):
         """An unsupported covariate name raises a clear ValueError."""
         with self.assertRaises(ValueError):
@@ -4458,6 +4557,61 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
                     np.testing.assert_allclose(
                         inside["temp_air"].to_numpy(), expected.loc[inside.index].to_numpy()
                     )
+
+    async def test_open_meteo_non_aligned_20_minute_grid_preserves_source_samples(self):
+        """20-minute and offset grids interpolate native instants, including over DST fallback.
+
+        The source curve is deliberately nonlinear. Dropping the 15-minute rows
+        before interpolation used to produce a silent flat-zero forecast.
+        """
+        cache_dir = self._isolate_weather_cache_dir()
+        cases = (
+            ("UTC", pd.Timestamp("2026-08-22 10:00", tz="UTC")),
+            (
+                "Europe/Copenhagen",
+                pd.Timestamp("2026-10-25 00:00", tz="UTC").tz_convert("Europe/Copenhagen"),
+            ),
+        )
+        for zone, start in cases:
+            samples = pd.date_range(start, periods=5, freq="15min")
+            payload = {
+                "minutely_15": {
+                    "time": [int(t.timestamp()) for t in samples],
+                    "temperature_2m": [0.0, 90.0, 0.0, 90.0, 0.0],
+                    "relative_humidity_2m": [50.0] * 5,
+                    "rain": [0.0] * 5,
+                    "cloud_cover": [0.0] * 5,
+                    "wind_speed_10m": [1.0] * 5,
+                    "shortwave_radiation_instant": [0.0] * 5,
+                    "diffuse_radiation_instant": [0.0] * 5,
+                    "direct_normal_irradiance_instant": [0.0] * 5,
+                }
+            }
+            grids = (
+                ("aligned", start, 4, [0.0, 60.0, 60.0, 0.0]),
+                ("fully-offset", start + pd.Timedelta(minutes=2), 3, [12.0, 48.0, 72.0]),
+                ("trailing-hold", start + pd.Timedelta(minutes=10), 4, [60.0, 0.0, 60.0, 0.0]),
+            )
+            for case, first, count, expected in grids:
+                with self.subTest(zone=zone, grid=case):
+                    grid = pd.date_range(first, periods=count, freq="20min")
+                    with (
+                        unittest.mock.patch.object(self.fcst, "time_zone", zone),
+                        unittest.mock.patch.object(self.fcst, "freq", pd.Timedelta(minutes=20)),
+                        unittest.mock.patch.object(self.fcst, "forecast_dates", grid),
+                        unittest.mock.patch.object(
+                            self.fcst,
+                            "get_cached_open_meteo_forecast_json",
+                            unittest.mock.AsyncMock(return_value=payload),
+                        ),
+                    ):
+                        weather = await self.fcst._get_weather_open_meteo(
+                            str(cache_dir / f"missing-{zone.replace('/', '-')}-{case}.pkl"),
+                            False,
+                        )
+                    pd.testing.assert_index_equal(weather.index, grid)
+                    np.testing.assert_allclose(weather["temp_air"].to_numpy(), expected)
+                    self.assertFalse(weather.isna().any().any())
 
     async def test_open_meteo_cold_start_retries_then_succeeds(self):
         """Cold start (no cache): a transient failure is retried, then succeeds.
