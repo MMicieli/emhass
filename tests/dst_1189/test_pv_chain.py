@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import pickle
+from unittest.mock import AsyncMock, patch
 
 import aiohttp
 import numpy as np
@@ -324,6 +325,15 @@ def test_issue1287_hourly_pv_keeps_utc_instant_through_saved_plan_and_publish(ru
             atol=0.5,
             rtol=0,
         )
+        # The reporter's original day-ahead setup used continual_publish,
+        # which reads saved entity JSON instead of the CSV read by publish-data.
+        # Save the real plan entities, then exercise both paths at each instant.
+        with time_machine.travel(at.to_pydatetime(), tick=False):
+            run_async(cl.publish_data(idd, LOG, entity_save=True, dont_post=True))
+        entity_path = env.data_path / "entities"
+        entity_name = "sensor.p_pv_forecast.json"
+        assert (entity_path / entity_name).is_file()
+
         for instant in publish_at:
             when = pd.Timestamp(instant)
             expected = when.round("h")
@@ -338,6 +348,23 @@ def test_issue1287_hourly_pv_keeps_utc_instant_through_saved_plan_and_publish(ru
             # step mean at the UTC instant it is supposed to represent.
             step_mean = _step_average(truth, pd.DatetimeIndex([expected]), 60)[0]
             assert with_publish.iloc[0]["P_PV"] == pytest.approx(step_mean, abs=0.5)
+
+            # Same selected PV value through the continual-publish JSON path.
+            # Mock only the external Home Assistant POST; leave index selection
+            # and JSON loading in production code, with both fall-hour offsets.
+            with patch.object(idd["rh"], "post_data", new_callable=AsyncMock) as poster:
+                with time_machine.travel(when.to_pydatetime(), tick=False):
+                    run_async(
+                        cl.publish_json(
+                            entity_name, idd, entity_path, LOG, "continual_publish"
+                        )
+                    )
+            poster.assert_awaited_once()
+            posted_series = poster.await_args.kwargs["data_df"]
+            posted_idx = poster.await_args.kwargs["idx"]
+            posted_instant = pd.Timestamp(posted_series.index[posted_idx]).tz_convert("UTC")
+            assert posted_instant == expected
+            assert posted_series.iloc[posted_idx] == pytest.approx(step_mean, abs=0.5)
     finally:
         env.close()
 
