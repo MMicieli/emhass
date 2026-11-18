@@ -765,7 +765,6 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
             [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 50.0, 40.0, 30.0, 20.0, 10.0, 0.0],
         )
 
-
     async def test_weather_covariates_use_time_not_row_positions_on_offset_grids(self):
         """10-minute, irregular and DST grids use elapsed time in the source/target union."""
         from unittest.mock import patch
@@ -801,9 +800,7 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
                 ),
                 (
                     "irregular",
-                    pd.DatetimeIndex(
-                        [start + pd.Timedelta(minutes=m) for m in (0, 7, 19, 30)]
-                    ),
+                    pd.DatetimeIndex([start + pd.Timedelta(minutes=m) for m in (0, 7, 19, 30)]),
                     [0.0, 42.0, 66.0, 0.0],
                     [40.0, 54.0, 62.0, 40.0],
                 ),
@@ -813,11 +810,13 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
                     with (
                         patch.object(self.fcst, "time_zone", zone),
                         patch.object(
-                            self.fcst, "_fetch_open_meteo_covariates_json",
+                            self.fcst,
+                            "_fetch_open_meteo_covariates_json",
                             return_value=payload,
                         ),
                         patch.object(
-                            self.fcst, "_fetch_open_meteo_historical_covariates_json",
+                            self.fcst,
+                            "_fetch_open_meteo_historical_covariates_json",
                             return_value=None,
                         ),
                     ):
@@ -830,9 +829,7 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
                         ["relative_humidity", "temp_air", "heating_degree"],
                     )
                     np.testing.assert_allclose(covariates["temp_air"], expected_temp)
-                    np.testing.assert_allclose(
-                        covariates["relative_humidity"], expected_humidity
-                    )
+                    np.testing.assert_allclose(covariates["relative_humidity"], expected_humidity)
                     self.assertFalse(covariates.isna().any().any())
 
     async def test_weather_covariates_time_interpolation_preserves_historical_join(self):
@@ -843,25 +840,19 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
         grid = pd.date_range(start, periods=4, freq="10min")
         forecast = {
             "minutely_15": {
-                "time": [
-                    int((start + pd.Timedelta(minutes=m)).timestamp()) for m in (15, 30)
-                ],
+                "time": [int((start + pd.Timedelta(minutes=m)).timestamp()) for m in (15, 30)],
                 "temperature_2m": [90.0, 0.0],
             }
         }
         historical = {
             "minutely_15": {
-                "time": [
-                    int((start + pd.Timedelta(minutes=m)).timestamp()) for m in (0, 15)
-                ],
+                "time": [int((start + pd.Timedelta(minutes=m)).timestamp()) for m in (0, 15)],
                 "temperature_2m": [0.0, 999.0],
             }
         }
         with (
             patch.object(self.fcst, "time_zone", "UTC"),
-            patch.object(
-                self.fcst, "_fetch_open_meteo_covariates_json", return_value=forecast
-            ),
+            patch.object(self.fcst, "_fetch_open_meteo_covariates_json", return_value=forecast),
             patch.object(
                 self.fcst,
                 "_fetch_open_meteo_historical_covariates_json",
@@ -4567,7 +4558,6 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
                         inside["temp_air"].to_numpy(), expected.loc[inside.index].to_numpy()
                     )
 
-
     async def test_open_meteo_non_aligned_20_minute_grid_preserves_source_samples(self):
         """20-minute and offset grids interpolate native instants, including over DST fallback.
 
@@ -4607,9 +4597,7 @@ class TestForecast(unittest.IsolatedAsyncioTestCase):
                     grid = pd.date_range(first, periods=count, freq="20min")
                     with (
                         unittest.mock.patch.object(self.fcst, "time_zone", zone),
-                        unittest.mock.patch.object(
-                            self.fcst, "freq", pd.Timedelta(minutes=20)
-                        ),
+                        unittest.mock.patch.object(self.fcst, "freq", pd.Timedelta(minutes=20)),
                         unittest.mock.patch.object(self.fcst, "forecast_dates", grid),
                         unittest.mock.patch.object(
                             self.fcst,
