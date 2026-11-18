@@ -257,9 +257,7 @@ def test_hourly_step_is_the_step_mean_not_the_step_start_sample(zone):
         ),
     ],
 )
-def test_issue1287_hourly_pv_keeps_utc_instant_through_saved_plan_and_publish(
-    run_at, publish_at
-):
+def test_issue1287_hourly_pv_keeps_utc_instant_through_saved_plan_and_publish(run_at, publish_at):
     """Exercise Open-Meteo -> PV -> saved MPC CSV -> publish-data at the reported instants.
 
     Freeze the clock at the original before/after DST dates, seed 15-minute
@@ -292,9 +290,7 @@ def test_issue1287_hourly_pv_keeps_utc_instant_through_saved_plan_and_publish(
             rc["sensor_power_photovoltaics"],
             rc["sensor_power_photovoltaics_forecast"],
         ]
-        history_index = pd.date_range(
-            at - pd.Timedelta(days=2), at, freq="h", tz="UTC"
-        )
+        history_index = pd.date_range(at - pd.Timedelta(days=2), at, freq="h", tz="UTC")
         history = pd.DataFrame(
             {names[0]: 1000.0, names[1]: 200.0, names[2]: 200.0},
             index=history_index,
@@ -309,9 +305,7 @@ def test_issue1287_hourly_pv_keeps_utc_instant_through_saved_plan_and_publish(
             pickle.dump((history, days, names, {}), out)
         runtime = list_runtimeparams(60, 24)
         del runtime["pv_power_forecast"]
-        idd, err = env.set_input(
-            at, runtime, "naive-mpc-optim", get_data_from_file=True
-        )
+        idd, err = env.set_input(at, runtime, "naive-mpc-optim", get_data_from_file=True)
         assert err is None, err
         plan = env.naive_mpc(idd, at)
         assert plan is not None and "P_PV" in plan and "P_Load" in plan
