@@ -673,13 +673,13 @@ class Forecast:
                 data_15min.to_csv(
                     self.emhass_conf["data_path"] / "debug-weather-forecast-open-meteo.csv"
                 )
-            data = data_15min.reindex(self.forecast_dates)
-            data.interpolate(
-                method="linear",
-                axis=0,
-                limit=None,
-                limit_direction="both",
-                inplace=True,
+            # Preserve native samples on grids that fall between Open-Meteo's 15-minute
+            # instants; reindexing to forecast_dates first silently loses those rows.
+            combined_index = data_15min.index.union(self.forecast_dates)
+            data = (
+                data_15min.reindex(combined_index)
+                .interpolate(method="time", axis=0, limit_direction="both")
+                .reindex(self.forecast_dates)
             )
             # The index is already self.forecast_dates (aligned by construction);
             # re-rounding it in UTC would collapse grids that are not UTC-aligned.
@@ -2040,7 +2040,9 @@ class Forecast:
         # do not coincide exactly with the 15-min Open-Meteo grid.
         combined_index = weather.index.union(index)
         aligned = weather.reindex(combined_index)
-        aligned = aligned.interpolate(method="linear", axis=0, limit_direction="both")
+        # The union has uneven spacings when the target grid is not 15-minute
+        # aligned. Weight by elapsed time, not by number of rows.
+        aligned = aligned.interpolate(method="time", axis=0, limit_direction="both")
         aligned = aligned.reindex(index).ffill().bfill()
         # Rows more than an hour from any real value (outside the retrieved span, or in a gap or
         # null stretch of it) are interpolated or repeat the nearest value: a model fitted on them
