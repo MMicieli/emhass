@@ -355,9 +355,7 @@ def test_issue1287_hourly_pv_keeps_utc_instant_through_saved_plan_and_publish(ru
             with patch.object(idd["rh"], "post_data", new_callable=AsyncMock) as poster:
                 with time_machine.travel(when.to_pydatetime(), tick=False):
                     run_async(
-                        cl.publish_json(
-                            entity_name, idd, entity_path, LOG, "continual_publish"
-                        )
+                        cl.publish_json(entity_name, idd, entity_path, LOG, "continual_publish")
                     )
             poster.assert_awaited_once()
             posted_series = poster.await_args.kwargs["data_df"]
