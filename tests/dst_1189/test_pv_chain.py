@@ -234,36 +234,43 @@ def test_hourly_step_is_the_step_mean_not_the_step_start_sample(zone):
 
 
 @pytest.mark.parametrize(
-    ("run_at", "publish_at"),
+    ("run_at", "publish_at", "action"),
     [
         pytest.param(
             "2026-10-10T18:20Z",
             ("2026-10-11T05:02Z", "2026-10-11T16:02Z"),
+            "dayahead-optim",
             id="oct-11-before-dst-same-publish-mode",
         ),
         pytest.param(
             "2026-10-25T19:20Z",
             ("2026-10-26T06:02Z", "2026-10-26T15:02Z"),
+            "dayahead-optim",
             id="oct-26-after-dst-same-publish-mode",
         ),
         pytest.param(
             "2026-10-24T22:05Z",
             ("2026-10-25T00:02Z", "2026-10-25T01:02Z", "2026-10-25T15:02Z"),
+            "dayahead-optim",
             id="both-occurrences-of-fallback-hour",
         ),
         pytest.param(
             "2026-10-29T06:02Z",
             ("2026-10-29T07:00Z", "2026-10-29T07:02Z"),
+            "naive-mpc-optim",
             id="hourly-mpc-next-hour-uses-second-step",
         ),
     ],
 )
-def test_issue1287_hourly_pv_keeps_utc_instant_through_saved_plan_and_publish(run_at, publish_at):
+def test_issue1287_hourly_pv_keeps_utc_instant_through_saved_plan_and_publish(
+    run_at, publish_at, action
+):
     """Exercise Open-Meteo -> PV -> saved MPC CSV -> publish-data at the reported instants.
 
     Freeze the clock at the original before/after DST dates, seed 15-minute
-    irradiance for the reported Copenhagen coordinates, run a real MPC solve,
-    then invoke publish-data with the separately frozen publication clock.
+    irradiance for the reported Copenhagen coordinates, run the real day-ahead
+    or hourly-MPC action (matching the report), then publish at a separately
+    frozen clock. Both CSV and continual-publish JSON paths must preserve UTC.
     Each selected PV scalar must be the correctly time-labelled pvlib step
     mean, not the adjacent hour. The fallback hour is tested on both offsets.
 
@@ -282,33 +289,38 @@ def test_issue1287_hourly_pv_keeps_utc_instant_through_saved_plan_and_publish(ru
         env.params["retrieve_hass_conf"]["Latitude"] = LAT
         env.params["retrieve_hass_conf"]["Longitude"] = LON
         _seed(env, at)
-        # Real naive-MPC reads PV/load history even when Open-Meteo supplies
-        # the future PV. Provide the standard offline pickle used by the DST
-        # harness so there is no HA or network dependency in this regression.
-        rc = env.params["retrieve_hass_conf"]
-        names = [
-            rc["sensor_power_load_no_var_loads"],
-            rc["sensor_power_photovoltaics"],
-            rc["sensor_power_photovoltaics_forecast"],
-        ]
-        history_index = pd.date_range(at - pd.Timedelta(days=2), at, freq="h", tz="UTC")
-        history = pd.DataFrame(
-            {names[0]: 1000.0, names[1]: 200.0, names[2]: 200.0},
-            index=history_index,
-        )
-        days = pd.date_range(
-            at.normalize() - pd.Timedelta(days=2),
-            periods=3,
-            freq="D",
-            tz="UTC",
-        )
-        with (env.data_path / "test_df_final.pkl").open("wb") as out:
-            pickle.dump((history, days, names, {}), out)
+        if action == "naive-mpc-optim":
+            # Only the hourly MPC action reads live PV/load history. Seed its
+            # normal offline pickle, not an unavailable Home Assistant server.
+            rc = env.params["retrieve_hass_conf"]
+            names = [
+                rc["sensor_power_load_no_var_loads"],
+                rc["sensor_power_photovoltaics"],
+                rc["sensor_power_photovoltaics_forecast"],
+            ]
+            history_index = pd.date_range(at - pd.Timedelta(days=2), at, freq="h", tz="UTC")
+            history = pd.DataFrame(
+                {names[0]: 1000.0, names[1]: 200.0, names[2]: 200.0},
+                index=history_index,
+            )
+            days = pd.date_range(
+                at.normalize() - pd.Timedelta(days=2), periods=3, freq="D", tz="UTC"
+            )
+            with (env.data_path / "test_df_final.pkl").open("wb") as out:
+                pickle.dump((history, days, names, {}), out)
         runtime = list_runtimeparams(60, 24)
         del runtime["pv_power_forecast"]
-        idd, err = env.set_input(at, runtime, "naive-mpc-optim", get_data_from_file=True)
+        idd, err = env.set_input(
+            at, runtime, action, get_data_from_file=(action == "naive-mpc-optim")
+        )
         assert err is None, err
-        plan = env.naive_mpc(idd, at)
+        if action == "naive-mpc-optim":
+            plan = env.naive_mpc(idd, at)
+        else:
+            with time_machine.travel(at.to_pydatetime(), tick=False):
+                plan = run_async(
+                    cl.dayahead_forecast_optim(idd, LOG, save_data_to_file=False, debug=False)
+                )
         assert plan is not None and "P_PV" in plan and "P_Load" in plan
 
         # Independent time-labelled PV series from the Open-Meteo -> pvlib
@@ -317,11 +329,12 @@ def test_issue1287_hourly_pv_keeps_utc_instant_through_saved_plan_and_publish(ru
         start_instants = pd.DatetimeIndex(plan.index).tz_convert("UTC")
         assert start_instants.is_unique
         assert start_instants[0] == pd.Timestamp(run_at).round("h")
-        # The live-history feedback is allowed to adjust only the first MPC
-        # slot; every later PV slot must match the unblended time oracle.
+        # Only naive-MPC blends feedback into its first forecast slot. For
+        # day-ahead check every slot, including the first.
+        skip = int(action == "naive-mpc-optim")
         np.testing.assert_allclose(
-            plan["P_PV"].to_numpy(float)[1:],
-            pv_reference.reindex(plan.index).to_numpy(float)[1:],
+            plan["P_PV"].to_numpy(float)[skip:],
+            pv_reference.reindex(plan.index).to_numpy(float)[skip:],
             atol=0.5,
             rtol=0,
         )
