@@ -232,6 +232,94 @@ def test_hourly_step_is_the_step_mean_not_the_step_start_sample(zone):
     assert got.sum() == pytest.approx(sampled.sum(), rel=0.03)
 
 
+@pytest.mark.parametrize(
+    ("run_at", "publish_at"),
+    [
+        pytest.param(
+            "2026-10-10T18:20Z",
+            ("2026-10-11T05:02Z", "2026-10-11T16:02Z"),
+            id="oct-11-before-dst-same-publish-mode",
+        ),
+        pytest.param(
+            "2026-10-25T19:20Z",
+            ("2026-10-26T06:02Z", "2026-10-26T15:02Z"),
+            id="oct-26-after-dst-same-publish-mode",
+        ),
+        pytest.param(
+            "2026-10-24T22:05Z",
+            ("2026-10-25T00:02Z", "2026-10-25T01:02Z", "2026-10-25T15:02Z"),
+            id="both-occurrences-of-fallback-hour",
+        ),
+        pytest.param(
+            "2026-10-29T06:02Z",
+            ("2026-10-29T07:00Z", "2026-10-29T07:02Z"),
+            id="hourly-mpc-next-hour-uses-second-step",
+        ),
+    ],
+)
+def test_issue1287_hourly_pv_keeps_utc_instant_through_saved_plan_and_publish(
+    run_at, publish_at
+):
+    """Exercise Open-Meteo -> PV -> saved MPC CSV -> publish-data at the reported instants.
+
+    Freeze the clock at the original before/after DST dates, seed 15-minute
+    irradiance for the reported Copenhagen coordinates, run a real MPC solve,
+    then invoke publish-data with the separately frozen publication clock.
+    Each selected PV scalar must be the correctly time-labelled pvlib step
+    mean, not the adjacent hour. The fallback hour is tested on both offsets.
+
+    This covers the reported hourly publish-data path. It does not simulate
+    Home Assistant Recorder statistics or prove weather accuracy at the site.
+    """
+    at = pd.Timestamp(run_at)
+    env = Env(
+        "Europe/Copenhagen",
+        60,
+        "nearest",
+        weather_forecast_method="open-meteo",
+        set_use_pv=True,
+    )
+    try:
+        env.params["retrieve_hass_conf"]["Latitude"] = LAT
+        env.params["retrieve_hass_conf"]["Longitude"] = LON
+        _seed(env, at)
+        runtime = list_runtimeparams(60, 24)
+        del runtime["pv_power_forecast"]
+        idd, err = env.set_input(at, runtime, "naive-mpc-optim")
+        assert err is None, err
+        plan = env.naive_mpc(idd, at)
+        assert plan is not None and "P_PV" in plan and "P_Load" in plan
+
+        # Independent time-labelled PV series from the Open-Meteo -> pvlib
+        # pipeline, computed without the optimisation solver or publish path.
+        pv_reference, truth, _ = _run("Europe/Copenhagen", 60, "nearest", at)
+        start_instants = pd.DatetimeIndex(plan.index).tz_convert("UTC")
+        assert start_instants.is_unique
+        assert start_instants[0] == pd.Timestamp(run_at).round("h")
+        np.testing.assert_allclose(
+            plan["P_PV"].to_numpy(float),
+            pv_reference.reindex(plan.index).to_numpy(float),
+            atol=0.5,
+            rtol=0,
+        )
+        for instant in publish_at:
+            when = pd.Timestamp(instant)
+            expected = when.round("h")
+            with_publish, err = env.publish(when)
+            assert err is None, err
+            published = pd.Timestamp(with_publish.index[0]).tz_convert("UTC")
+            assert published == expected, (
+                f"{when.tz_convert('Europe/Copenhagen')} selected {published}, "
+                f"not the expected UTC instant {expected}"
+            )
+            # Compare published scalar to an independent, native-15-minute
+            # step mean at the UTC instant it is supposed to represent.
+            step_mean = _step_average(truth, pd.DatetimeIndex([expected]), 60)[0]
+            assert with_publish.iloc[0]["P_PV"] == pytest.approx(step_mean, abs=0.5)
+    finally:
+        env.close()
+
+
 def test_pv_plants_of_a_step_average_add_up_to_the_aggregate():
     utc = pd.Timestamp("2026-10-25T23:05Z")
     env = Env(
