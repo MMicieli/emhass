@@ -23,7 +23,7 @@ import pandas as pd
 from emhass import last_run, plan_store, utils
 from emhass.atomic_file import atomic_write
 from emhass.battery_identification import SCHEMA_VERSION as _BATTERY_ID_SCHEMA_VERSION_V1
-from emhass.battery_identification import BatteryIdentification
+from emhass.battery_identification import BatteryIdentification, apply_staleness_fill
 from emhass.forecast import Forecast
 from emhass.forecast_calibration import (
     CALIBRATION_DEFAULT_DAYS,
@@ -118,7 +118,7 @@ def _record_optim_snapshot(
 def _write_results(input_data_dict: dict, opt_res: pd.DataFrame, filename: str) -> None:
     """Write the results CSV that publish-data reads, except on a dry run."""
     if not is_dry_run(input_data_dict):
-        target = input_data_dict["emhass_conf"]["data_path"] / filename
+        target = utils.data_file_path(input_data_dict["emhass_conf"]["data_path"], filename)
         atomic_write(target, lambda stream: opt_res.to_csv(stream, index_label="timestamp"))
 
 
@@ -291,16 +291,16 @@ class OptimizationCache:
                 return None
             return val.total_seconds() if hasattr(val, "total_seconds") else float(val)
 
-        def to_tuple(val):
+        def to_tuple(val) -> tuple:
             """Convert lists/arrays to tuples for hashability."""
             if val is None:
-                return ()
-            if hasattr(val, "tolist"):
-                val = val.tolist()
-            if isinstance(val, list | tuple):
-                # Handle nested lists (e.g., nominal_power with sequences)
-                return tuple(tuple(v) if isinstance(v, list | tuple) else v for v in val)
-            return (val,)
+                items = []
+            else:
+                if hasattr(val, "tolist"):
+                    val = val.tolist()
+                items = val if isinstance(val, list | tuple) else [val]
+            # Handle nested lists (e.g., nominal_power with sequences)
+            return tuple(tuple(v) if isinstance(v, list | tuple) else v for v in items)
 
         def config_hash(cfg: dict, exclude_keys: set | None = None) -> str:
             """Create a stable hash of config dict for cache key comparison.
@@ -699,6 +699,9 @@ async def _retrieve_from_hass(
         # A stale battery's sensor shouldn't cost a healthy battery days it did
         # have data for; each battery's fit only reads its own two columns (#1061).
         keep_partial_days=(set_type == "battery_id"),
+        # Lets battery identification hold short silences of its sensors at the
+        # last recorded state (#1073); every other set_type is unchanged.
+        record_staleness=(set_type == "battery_id"),
     )
     return success, days_list
 
@@ -1676,8 +1679,8 @@ async def _identify_battery_impl(
             json_path, max_age_hours, logger, label="Battery identification model"
         ):
             try:
-                with open(json_path, "rb") as inp:
-                    payload = json.loads(inp.read())
+                async with aiofiles.open(json_path, "rb") as inp:
+                    payload = json.loads(await inp.read())
             except (KeyError, ValueError, OSError) as e:
                 logger.warning(
                     f"Battery identification result unreadable ({type(e).__name__}); will re-fit."
@@ -1742,6 +1745,16 @@ async def _identify_battery_impl(
             )
             return
         configured_capacity_wh = float(plant_conf.get("battery_nominal_energy_capacity", 0) or 0)
+        df = apply_staleness_fill(
+            df,
+            power_col,
+            soc_col,
+            getattr(rh, "bucket_last_state", {}),
+            getattr(rh, "marker_buckets", {}),
+            retrieve_hass_conf.get("optimization_time_step"),
+            logger,
+            row_counts=getattr(rh, "bucket_row_count", {}),
+        )
         result = BatteryIdentification(
             logger, time_step=retrieve_hass_conf.get("optimization_time_step")
         ).identify(df, power_col, soc_col, configured_capacity_wh)
@@ -1947,9 +1960,21 @@ async def _identify_battery_impl(
         configured_capacity_wh = float(
             _batt_conf_val(plant_conf.get("battery_nominal_energy_capacity", 0), k) or 0
         )
+        # Only this battery's two columns change; the shared frame stays as
+        # retrieved for the other batteries.
+        df_k = apply_staleness_fill(
+            df,
+            power_col,
+            soc_col,
+            getattr(rh, "bucket_last_state", {}),
+            getattr(rh, "marker_buckets", {}),
+            retrieve_hass_conf.get("optimization_time_step"),
+            logger,
+            row_counts=getattr(rh, "bucket_row_count", {}),
+        )
         result = BatteryIdentification(
             logger, time_step=retrieve_hass_conf.get("optimization_time_step")
-        ).identify(df, power_col, soc_col, configured_capacity_wh)
+        ).identify(df_k, power_col, soc_col, configured_capacity_wh)
         for msg in result.messages:
             logger.info("Battery %d identification: %s", k, msg)
         if not result.is_ok:
@@ -2276,7 +2301,7 @@ async def _prepare_ml_fit_predict(ctx: SetupContext):
     var_model = ctx.params["passed_data"]["var_model"]
     if ctx.get_data_from_file:
         filename = model_type + ".pkl"
-        filename_path = ctx.emhass_conf["data_path"] / filename
+        filename_path = utils.data_file_path(ctx.emhass_conf["data_path"], filename)
         async with aiofiles.open(filename_path, "rb") as inp:
             content = await inp.read()
             df_input_data, _, _, _ = pickle.loads(content)
@@ -2304,11 +2329,7 @@ def _prepare_regressor_fit(ctx: SetupContext):
     if not csv_file:
         ctx.logger.error("csv_file is required for regressor actions but was not provided.")
         return None
-    if ctx.get_data_from_file:
-        base_path = ctx.emhass_conf["data_path"]
-        filename_path = pathlib.Path(base_path) / csv_file
-    else:
-        filename_path = ctx.emhass_conf["data_path"] / csv_file
+    filename_path = utils.data_file_path(ctx.emhass_conf["data_path"], csv_file)
     if filename_path.is_file():
         df_input_data = pd.read_csv(filename_path, parse_dates=True)
     else:
@@ -3330,7 +3351,7 @@ async def forecast_model_fit(
     # Save model
     if not debug:
         filename = model_type + default_pkl_suffix
-        filename_path = input_data_dict["emhass_conf"]["data_path"] / filename
+        filename_path = utils.data_file_path(input_data_dict["emhass_conf"]["data_path"], filename)
         # Whole, so a run loading the model at the same moment never reads half of it.
         await utils.replace_file(filename_path, pickle.dumps(mlf, pickle.HIGHEST_PROTOCOL))
         logger.debug("saved model to " + str(filename_path))
@@ -3486,7 +3507,7 @@ async def forecast_model_predict(
     # Load model
     model_type = input_data_dict["params"]["passed_data"]["model_type"]
     filename = model_type + default_pkl_suffix
-    filename_path = input_data_dict["emhass_conf"]["data_path"] / filename
+    filename_path = utils.data_file_path(input_data_dict["emhass_conf"]["data_path"], filename)
     if not debug:
         if filename_path.is_file():
             async with aiofiles.open(filename_path, "rb") as inp:
@@ -3581,7 +3602,7 @@ async def forecast_model_tune(
     # Load model
     model_type = input_data_dict["params"]["passed_data"]["model_type"]
     filename = model_type + default_pkl_suffix
-    filename_path = input_data_dict["emhass_conf"]["data_path"] / filename
+    filename_path = utils.data_file_path(input_data_dict["emhass_conf"]["data_path"], filename)
     if not debug:
         if filename_path.is_file():
             async with aiofiles.open(filename_path, "rb") as inp:
@@ -3607,7 +3628,7 @@ async def forecast_model_tune(
     # Save model
     if not debug:
         filename = model_type + default_pkl_suffix
-        filename_path = input_data_dict["emhass_conf"]["data_path"] / filename
+        filename_path = utils.data_file_path(input_data_dict["emhass_conf"]["data_path"], filename)
         # Whole, so a run loading the model at the same moment never reads half of it.
         await utils.replace_file(filename_path, pickle.dumps(mlf, pickle.HIGHEST_PROTOCOL))
         logger.debug("Saved model to " + str(filename_path))
@@ -3666,7 +3687,7 @@ async def regressor_model_fit(
     # Save model
     if not debug:
         filename = model_type + "_mlr.pkl"
-        filename_path = input_data_dict["emhass_conf"]["data_path"] / filename
+        filename_path = utils.data_file_path(input_data_dict["emhass_conf"]["data_path"], filename)
         async with aiofiles.open(filename_path, "wb") as outp:
             await outp.write(pickle.dumps(mlr, pickle.HIGHEST_PROTOCOL))
     return mlr
@@ -3693,7 +3714,7 @@ async def regressor_model_predict(
         logger.error("parameter: 'model_type' not passed")
         return False
     filename = model_type + "_mlr.pkl"
-    filename_path = input_data_dict["emhass_conf"]["data_path"] / filename
+    filename_path = utils.data_file_path(input_data_dict["emhass_conf"]["data_path"], filename)
     if not debug:
         if filename_path.is_file():
             async with aiofiles.open(filename_path, "rb") as inp:
@@ -3876,7 +3897,7 @@ async def export_influxdb_to_csv(
     numeric_cols = df_export.select_dtypes(include=[np.number]).columns
     df_export[numeric_cols] = df_export[numeric_cols].round(decimal_places)
     # Save to CSV
-    csv_path = pathlib.Path(data_path) / csv_filename
+    csv_path = utils.data_file_path(data_path, csv_filename)
     df_export.to_csv(csv_path, index=False)
     logger.info(f"✓ Successfully exported to {csv_filename}")
     logger.info(f"  Rows: {df_export.shape[0]}")
@@ -5059,82 +5080,68 @@ async def main():
     # Perform selected action
     if args.action == "perfect-optim":
         opt_res = await perfect_forecast_optim(input_data_dict, logger, debug=args.debug)
+        action_result = opt_res
     elif args.action == "dayahead-optim":
         opt_res = await dayahead_forecast_optim(input_data_dict, logger, debug=args.debug)
+        action_result = opt_res
     elif args.action == "naive-mpc-optim":
         opt_res = await naive_mpc_optim(input_data_dict, logger, debug=args.debug)
+        action_result = opt_res
     elif args.action == "forecast-model-fit":
-        df_fit_pred, df_fit_pred_backtest, mlf = await forecast_model_fit(
-            input_data_dict, logger, debug=args.debug
-        )
+        action_result = await forecast_model_fit(input_data_dict, logger, debug=args.debug)
         opt_res = None
     elif args.action == "forecast-model-predict":
         if args.debug:
             _, _, mlf = await forecast_model_fit(input_data_dict, logger, debug=args.debug)
         else:
             mlf = None
-        df_pred = await forecast_model_predict(input_data_dict, logger, debug=args.debug, mlf=mlf)
+        action_result = await forecast_model_predict(
+            input_data_dict, logger, debug=args.debug, mlf=mlf
+        )
         opt_res = None
     elif args.action == "forecast-model-tune":
         if args.debug:
             _, _, mlf = await forecast_model_fit(input_data_dict, logger, debug=args.debug)
         else:
             mlf = None
-        df_pred_optim, mlf = await forecast_model_tune(
+        action_result = await forecast_model_tune(
             input_data_dict, logger, debug=args.debug, mlf=mlf
         )
         opt_res = None
     elif args.action == "forecast-calibration":
         await forecast_calibration(input_data_dict, logger)
         opt_res = None
+        action_result = opt_res
     elif args.action == "regressor-model-fit":
-        mlr = await regressor_model_fit(input_data_dict, logger, debug=args.debug)
+        action_result = await regressor_model_fit(input_data_dict, logger, debug=args.debug)
         opt_res = None
     elif args.action == "regressor-model-predict":
         if args.debug:
             mlr = await regressor_model_fit(input_data_dict, logger, debug=args.debug)
         else:
             mlr = None
-        prediction = await regressor_model_predict(
+        action_result = await regressor_model_predict(
             input_data_dict, logger, debug=args.debug, mlr=mlr
         )
         opt_res = None
     elif args.action == "export-influxdb-to-csv":
-        success = await export_influxdb_to_csv(input_data_dict, logger)
+        action_result = await export_influxdb_to_csv(input_data_dict, logger)
         opt_res = None
     elif args.action == "publish-data":
         opt_res = await publish_data(input_data_dict, logger)
+        action_result = opt_res
     else:
         logger.error("The passed action argument is not valid")
         logger.error(
             "Try setting --action: perfect-optim, dayahead-optim, naive-mpc-optim, forecast-model-fit, forecast-model-predict, forecast-model-tune, forecast-calibration, pv-bias-calibration, export-influxdb-to-csv or publish-data"
         )
         opt_res = None
+        action_result = opt_res
     logger.info(opt_res)
     # Flush the logger
     ch.close()
     logger.removeHandler(ch)
-    if (
-        args.action == "perfect-optim"
-        or args.action == "dayahead-optim"
-        or args.action == "naive-mpc-optim"
-        or args.action == "publish-data"
-    ):
-        return opt_res
-    elif args.action == "forecast-model-fit":
-        return df_fit_pred, df_fit_pred_backtest, mlf
-    elif args.action == "forecast-model-predict":
-        return df_pred
-    elif args.action == "regressor-model-fit":
-        return mlr
-    elif args.action == "regressor-model-predict":
-        return prediction
-    elif args.action == "export-influxdb-to-csv":
-        return success
-    elif args.action == "forecast-model-tune":
-        return df_pred_optim, mlf
-    else:
-        return opt_res
+    return action_result
 
 
 def main_sync():

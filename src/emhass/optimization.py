@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from emhass import utils
+from emhass.coordinator.site import site_inverter, site_kind, site_problem
 
 # Most segments accepted for battery_stress_segments / inverter_stress_segments
 # (see Optimization._get_stress_segments for why this bound is generous).
@@ -112,7 +113,9 @@ INVERTER_TIEBREAK_EPS = 1e-9
 # so drain-first wins at any currency/price scale) but can always fall back to
 # importing when that is the only feasible option (e.g. recharging to a terminal
 # SoC target with no PV), instead of returning infeasible. The gate confines the
-# penalty to genuinely avoidable import, so an aggressive factor is safe.
+# penalty to slots where the battery still holds charge, and the per-step import
+# floor (#1253) exempts import no schedule can avoid, such as a load above what PV
+# and the battery can deliver, so an aggressive factor is safe.
 BATTERY_FIRST_IMPORT_PENALTY_FACTOR = 100.0
 
 # Soft terminal-SoC target, the same treatment #1002 gave set_battery_first_priority.
@@ -163,11 +166,188 @@ THERMAL_FREE_GAIN_RELIEF = 100.0
 HEAT_PUMP_COP_MAX = 8.0
 
 
+# Resolution of a fractional operating requirement (issue #1105), in timesteps. HiGHS
+# accepts a binary within 1e-6 of an integer, so a remainder step of ``r`` steps with
+# ``r`` near 1e-6 can be reported as an "almost full" or "almost off" step instead of the
+# remainder step: the energy stays exact but the full/remainder split is not
+# determinable (measured with the 3 kW test load: failures at r <= 1e-6, none at 2e-6 and
+# above, for 100 W to 22 kW), and a remainder of about 1e-8 steps or less can make the
+# strict solve numerically infeasible. A requirement within 1e-5 steps (10x that
+# tolerance) of a whole number of steps is therefore taken as that whole number, up or
+# down, and a positive requirement below 1e-5 steps is raised to 1e-5 steps (never
+# dropped, never promoted to a full step), in the required steps and the energy target
+# alike. The error is at most ``1e-5 * nominal * dt`` Wh and ``1e-5 * dt`` of run time per
+# load and request (0.015 Wh, 18 ms for 3 kW at 30 min). Only loads with a remainder step
+# use it. See docs/advanced_math_model.md.
+FRACTIONAL_STEP_RESOLUTION = 1e-5
+# Gurobi/CPLEX integer feasibility tolerance while a remainder step is active (their default
+# 1e-5 equals the resolution above; HiGHS' 1e-6 does not need it).
+REMAINDER_INTEGRALITY_TOL = 1e-7
+
+
+def _snap_to_whole_steps(steps: float):
+    """Return the whole number of steps ``steps`` is within the resolution of, else None.
+
+    Snaps in either direction, only to >= 1 (a positive requirement never becomes "no
+    requirement"). Only called for a load that carries a remainder step.
+    """
+    nearest = round(steps)
+    tol = max(FRACTIONAL_STEP_RESOLUTION, 16 * np.finfo(float).eps * abs(steps))
+    return int(nearest) if nearest >= 1 and abs(steps - nearest) <= tol else None
+
+
 def _cop_upper_bound(cops) -> float:
     """Highest COP a source can have this run. A DP-refinable heat pump's COP is a
     cp.Parameter that the refinement re-values, so it is bounded by the COP clip
     rather than by today's value."""
     return HEAT_PUMP_COP_MAX if isinstance(cops, cp.Parameter) else float(np.max(cops))
+
+
+def _coordinated_plan(opt, *args, **kwargs):
+    """Plan with the coordinator `optimization_backend` names.
+
+    The coordinator is emhass.coordinator, imported only when a coordinator
+    backend is configured, so a default configuration never loads it.
+
+    Args:
+        opt: The calling Optimization (its configuration, logger and time step).
+        *args, **kwargs: perform_optimization's own arguments, passed through.
+
+    Returns:
+        tuple[pandas.DataFrame | None, str | None]: The plan, with the columns
+        perform_optimization returns plus the coordinator's own (fed_*), and
+        None; or None and why not, when the coordinator cannot plan this
+        configuration, so the caller runs the default cvxpy solver.
+    """
+    reason = _coordinated_config_problem(opt.optim_conf) or _coordinated_plant_problem(
+        opt.plant_conf
+    )
+    if reason:
+        opt.logger.warning(f"optimization_backend: {reason}; using the default solver")
+        return None, reason
+    from emhass.coordinator.backend import optimize
+
+    # Whatever happens in the coordinator, a plan is published: any failure
+    # is logged and the default solver plans instead, live run or dry run.
+    opt.fed_fallback_reason = None
+    kwargs = _soc_endpoints_as_the_default_solver(opt, kwargs)
+    try:
+        res = optimize(opt, *args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the fallback is the point
+        reason = f"the coordinator raised {type(exc).__name__}: {exc}"
+        opt.logger.error(f"optimization_backend: {reason}; using the default solver")
+        return None, reason
+    if res is None:
+        # The coordinator logged why, and says so here.
+        reason = getattr(opt, "fed_fallback_reason", None)
+        return None, str(reason) if reason else "the coordinator cannot plan this configuration"
+    return res, None
+
+
+def _soc_endpoints_as_the_default_solver(opt, kwargs: dict) -> dict:
+    """soc_init and soc_final filled in as the default solver fills them: a
+    missing one from the other, and the target only when both are missing.
+    The coordinator would fill each from the target, so a run given only
+    soc_init would plan a different day. One battery only: the coordinator
+    declines more."""
+    if not opt.optim_conf.get("set_use_battery"):
+        return kwargs
+    init, final = kwargs.get("soc_init"), kwargs.get("soc_final")
+    # one battery's endpoints as a one-element list, as the default solver
+    # takes them; a longer list is left for the coordinator to decline
+    if isinstance(init, list | tuple) and len(init) == 1:
+        init = init[0]
+    if isinstance(final, list | tuple) and len(final) == 1:
+        final = final[0]
+    if isinstance(init, list | tuple) or isinstance(final, list | tuple):
+        return kwargs
+    target = opt.plant_conf.get("battery_target_state_of_charge")
+    if isinstance(target, list | tuple):
+        target = target[0] if target else None
+    if init is None:
+        init = final if final is not None else target
+    if final is None:
+        final = init
+    return {**kwargs, "soc_init": init, "soc_final": final}
+
+
+def _warn_unheld_limits(opt) -> None:
+    """On a fallback, say what of `site` the default solver does not hold:
+    its nodes and limits, beyond the main meter and a hybrid inverter EMHASS's
+    own keys describe (site.site_grid, site.site_inverter). For deferrable
+    loads alone, deferrable_load_groups it does hold."""
+    site = opt.optim_conf.get("site")
+    if not site or site_problem(site):
+        return
+    kinds = [site_kind(e) for e in site]
+    held = site_inverter(site, bool(opt.optim_conf.get("set_use_battery")))
+    if "limit" in kinds or kinds.count("node") > (1 if held else 0):
+        opt.logger.warning(
+            "optimization_backend: the default solver does not hold site's nodes and limits "
+            "(beyond the main meter and a hybrid inverter EMHASS's own model can hold); "
+            "for deferrable loads alone, deferrable_load_groups is"
+        )
+
+
+def _with_backend(res, requested: str, fallback_reason: str | None):
+    """Mark which backend made the plan in `res`: the one requested, or cvxpy
+    and why. Only with a coordinator backend requested, so a default
+    configuration's results keep exactly their columns."""
+    res["backend_requested"] = requested
+    res["backend_used"] = "cvxpy" if fallback_reason else requested
+    res["backend_fallback_reason"] = fallback_reason or ""
+    return res
+
+
+_BACKENDS = ("cvxpy", "dantzig_wolfe")
+
+
+def _coordinated_plant_problem(plant_conf: dict) -> str | None:
+    """Why the coordinator cannot plan this plant, or None if it can.
+
+    It models one inverter. With more (number_of_inverters, #1150) the default
+    solver plans, which holds each inverter and the PV and battery on it.
+    """
+    try:
+        inverters = utils.validate_num_inverters(plant_conf)
+    except utils.InverterConfigError as exc:
+        return str(exc)
+    if inverters > 1:
+        return f"number_of_inverters is {inverters}; the coordinator models one inverter"
+    if plant_conf.get("inverter_is_hybrid"):
+        curves = [
+            k
+            for k in ("inverter_power_curve_dc_ac", "inverter_power_curve_ac_dc")
+            if plant_conf.get(k)
+        ]
+        if curves:
+            # The coordinator models a hybrid inverter by its scalar efficiencies.
+            return f"{' and '.join(curves)}; the coordinator models efficiencies, not curves"
+    return None
+
+
+def _coordinated_config_problem(optim_conf: dict) -> str | None:
+    """Why `optimization_backend` and `site` cannot be used as given, or None
+    if they can.
+
+    Both may come from a request as well as from the configuration, so they
+    are checked for shape and type before anything reads them: a known
+    backend, and `site` (site.site_problem).
+
+    Args:
+        optim_conf: The optimisation configuration.
+
+    Returns:
+        str | None: The problem, for the log; None when it can be used.
+    """
+    backend = optim_conf.get("optimization_backend")
+    if backend == "admm":
+        return "admm is planned for a later release, not available yet"
+    if backend not in _BACKENDS:
+        return f"unknown backend {backend!r} (known: {', '.join(_BACKENDS)})"
+    if optim_conf.get("site") is not None:
+        return site_problem(optim_conf["site"])
+    return None
 
 
 class Optimization:
@@ -352,6 +532,16 @@ class Optimization:
         self.param_export_ceiling = cp.Parameter(
             self.num_timesteps, nonneg=True, name="export_ceiling"
         )
+        # Grid import no schedule can avoid, per step, for the battery-first penalty
+        # (#1253): the load above the most PV and battery discharge can deliver. Set
+        # per solve by _battery_first_import_floor; zero leaves the penalty as before.
+        self.param_battery_first_import_floor = cp.Parameter(
+            self.num_timesteps, nonneg=True, name="battery_first_import_floor"
+        )
+        self.param_battery_first_import_floor.value = np.zeros(self.num_timesteps)
+        # AC output cap the one-inverter hybrid problem is built with; set by
+        # _add_hybrid_inverter_constraints and read by the import floor.
+        self._hybrid_ac_output_cap = None
         # Currency per Wh charged for missing the terminal SoC target. Set per solve
         # from the horizon's highest import tariff so the target stays dominant at any
         # price scale; a Parameter (not a baked-in constant) keeps that correct across
@@ -1025,14 +1215,7 @@ class Optimization:
                             "running cannot be interrupted."
                         )
             if k < len(self.param_running_lb):
-                lb = np.asarray(self.param_running_lb[k].value, dtype=float).copy()
-                blocked_forced = np.flatnonzero(cannot_run & (lb > 0))
-                if blocked_forced.size:
-                    # The forced run ends at the first step the load cannot run.
-                    lb[blocked_forced[0] :] = 0.0
-                    self.param_running_lb[k].value = lb
-                    if k < len(self.param_already_running_sc):
-                        self.param_already_running_sc[k].value = 0.0
+                self._release_force_on_at(k, cannot_run)
             if (
                 k < len(self.param_def_current_power_active)
                 and self.param_def_current_power_active[k].value > 0
@@ -1053,6 +1236,66 @@ class Optimization:
                 int(np.sum((avail > 0.0) & (avail < 1.0))),
                 len(avail),
             )
+
+    def _release_force_on_at(self, k: int, cannot_run: np.ndarray) -> None:
+        """End a forced run at the first step the load cannot run.
+
+        A forced run (single-constant pin, min-on remainder, current-power
+        force-on) pins ``p_def_bin2[k] >= 1``. Where the load cannot run at all -
+        ``def_availability`` blocks the step, or ``max_thermal_power`` leaves a
+        ceiling below its minimum power - that pin contradicts the power bounds
+        and makes the MILP infeasible. The run ends at the first such step, and a
+        single-constant load loses its "already running" credit there, so the
+        rest of its run counts as a new block.
+
+        A released step is also released from the "full step only" mask of a
+        still-running minimum on-time (#1105), so the fractional remainder step
+        is free to land where the run ends.
+        """
+        if k >= len(self.param_running_lb):
+            return
+        lb = np.asarray(self.param_running_lb[k].value, dtype=float).copy()
+        blocked_forced = np.flatnonzero(cannot_run & (lb > 0))
+        if not blocked_forced.size:
+            return
+        lb[blocked_forced[0] :] = 0.0
+        self.param_running_lb[k].value = lb
+        min_on_full_lb = getattr(self, "param_min_on_full_lb", [])
+        if k < len(min_on_full_lb):
+            min_on_full_lb[k].value = np.minimum(
+                np.asarray(min_on_full_lb[k].value, dtype=float), lb
+            )
+        if k < len(self.param_already_running_sc):
+            self.param_already_running_sc[k].value = 0.0
+
+    def _capped_steps_below_min_power(self, k: int, n: int) -> np.ndarray:
+        """Steps where ``max_thermal_power`` leaves no room for the load's
+        minimum power: ``cap / COP < min_power`` makes the step impossible to run,
+        because the thermal ceiling and the electrical floor contradict each
+        other there. Empty for every load that is not capped."""
+        cap_entry = getattr(self, "_thermal_cap_by_load", {}).get(k)
+        if cap_entry is None:
+            return np.zeros(n, dtype=bool)
+        min_powers = getattr(self, "_min_power_of_deferrable_loads", None)
+        if min_powers is None:
+            min_powers = self.optim_conf.get("minimum_power_of_deferrable_loads") or []
+        min_power = float(min_powers[k]) if k < len(min_powers) and min_powers[k] else 0.0
+        if min_power <= 0:
+            return np.zeros(n, dtype=bool)
+        # The live parameter carries the COP a cache hit refreshed; the recorded
+        # array is the build-time fallback.
+        params = getattr(self, "param_thermal", {}).get(k)
+        cops = None
+        if params is not None and "heatpump_cops" in params:
+            cops = np.asarray(params["heatpump_cops"].value, dtype=float)
+        if cops is None or cops.size != n:
+            cops = np.asarray(cap_entry[1], dtype=float)
+            if cops.size == 1:
+                cops = np.full(n, float(cops[0]))
+        if cops.size != n:
+            # A horizon the build did not see: no reliable per-step answer.
+            return np.zeros(n, dtype=bool)
+        return float(cap_entry[0]) / np.maximum(cops, 1e-9) < min_power
 
     def _init_current_period_peak_param(self) -> None:
         """Initialize the CVXPY parameter for the peak grid import already
@@ -1250,6 +1493,8 @@ class Optimization:
         self.param_energy_active = []  # 1 = constraint active, 0 = inactive (relaxed via Big-M)
         self.param_required_timesteps = []  # For binary loads: number of timesteps to run
         self.param_timesteps_active = []  # 1 = timestep constraint active, 0 = inactive
+        self.param_rem_level = []  # Power (W) of the fractional remainder step (issue #1105)
+        self.param_rem_active = []  # 1 = a fractional remainder step is required, 0 = none
         for k in range(num_def_loads):
             # Target energy parameter
             energy_param = cp.Parameter(nonneg=True, name=f"target_energy_{k}")
@@ -1260,6 +1505,16 @@ class Optimization:
             energy_active = cp.Parameter(nonneg=True, name=f"energy_active_{k}")
             energy_active.value = 0.0
             self.param_energy_active.append(energy_active)
+
+            # Fractional remainder step of a semi-continuous load (issue #1105): the
+            # power (W) of the single step that carries the part of the energy target
+            # that is not a whole number of steps, and whether such a step exists.
+            rem_level = cp.Parameter(nonneg=True, name=f"semi_cont_rem_level_{k}")
+            rem_level.value = 0.0
+            self.param_rem_level.append(rem_level)
+            rem_active = cp.Parameter(nonneg=True, name=f"semi_cont_rem_active_{k}")
+            rem_active.value = 0.0
+            self.param_rem_active.append(rem_active)
 
             # Required timesteps for binary loads
             timesteps_param = cp.Parameter(nonneg=True, name=f"required_timesteps_{k}")
@@ -1287,10 +1542,16 @@ class Optimization:
         # solver doesn't try to turn the load off and back on to satisfy sum(starts)==1.
         self.param_running_lb = []
         self.param_already_running_sc = []
+        # Steps that a still-running minimum on-time forces to be FULL steps (not the
+        # fractional remainder step); only read for loads with a remainder (issue #1105).
+        self.param_min_on_full_lb = []
         for k in range(num_def_loads):
             lb = cp.Parameter(n, nonneg=True, name=f"running_lb_{k}")
             lb.value = np.zeros(n)
             self.param_running_lb.append(lb)
+            full_lb = cp.Parameter(n, nonneg=True, name=f"min_on_full_lb_{k}")
+            full_lb.value = np.zeros(n)
+            self.param_min_on_full_lb.append(full_lb)
             ar = cp.Parameter(nonneg=True, name=f"already_running_sc_{k}")
             ar.value = 0.0
             self.param_already_running_sc.append(ar)
@@ -1810,8 +2071,9 @@ class Optimization:
 
             # The power PIN additionally needs a free t=0 power variable, so semi_cont
             # is excluded from the pin (its power == nominal*bin); for an affected
-            # semi_cont load the t=0 force-on alone injects nominal, which is correct
-            # for an on/off device.
+            # semi_cont load the t=0 force-on alone injects nominal (or the remainder
+            # step's average power when under one step of energy remains), which is
+            # correct for an on/off device.
             pin_active = affected and not is_semi_cont
             if k < len(self.param_def_current_power_active):
                 self.param_def_current_power_active[k].value = 1.0 if pin_active else 0.0
@@ -2187,6 +2449,40 @@ class Optimization:
                 # flat value for constant-efficiency sources like gas boilers).
                 heatpump_cops = utils.resolve_thermal_battery_cop(hc, outdoor_temp, length=n)
                 params["heatpump_cops"].value = np.array(heatpump_cops)
+
+                # A cache hit re-values the COP but cannot re-add constraints, so the
+                # semi-continuous ON level (built as min(nominal, cap/COP)) has to
+                # follow: a higher COP shrinks cap/COP, and keeping the old level would
+                # leave the source unable to turn on where the cap binds.
+                cap_entry = getattr(self, "_thermal_cap_by_load", {}).get(k)
+                if cap_entry is not None:
+                    on_level = getattr(self, "_semi_cont_on_level", {}).get(k)
+                    if on_level is not None:
+                        nominal = np.broadcast_to(
+                            np.asarray(
+                                self.optim_conf["nominal_power_of_deferrable_loads"][k],
+                                dtype=float,
+                            ),
+                            on_level.shape,
+                        )
+                        on_level.value = np.minimum(
+                            nominal,
+                            float(cap_entry[0])
+                            / np.maximum(
+                                np.asarray(heatpump_cops, dtype=float)[: on_level.size], 1e-9
+                            ),
+                        )
+                    # The refreshed COP can also push cap/COP under min_power, which
+                    # forces the source off at those steps: warn, exactly as the
+                    # build path and the DP refinement do.
+                    self._warn_capped_level_below_min_power(
+                        "Thermal battery load",
+                        k,
+                        heatpump_cops,
+                        cap_entry[0],
+                        n,
+                        when="after a COP refresh",
+                    )
 
                 # Thermal losses and heating demand
                 base_loss = hc.get("thermal_loss", 0.045)
@@ -3721,29 +4017,14 @@ class Optimization:
         store[f"{name}_b"] = b
         return sum(w * u_k for w, u_k in zip(widths, u, strict=True))
 
-    def _add_hybrid_inverter_constraints(self, constraints, inv_stress_conf):
-        """Add the inverter constraints (Vectorized).
+    def _hybrid_inverter_ac_caps(self) -> tuple[float, float]:
+        """AC output and input caps (W) of the one-inverter hybrid model.
 
-        Above one inverter this hands over to ``_add_per_inverter_constraints``; the
-        rest is the one-inverter hybrid model.
+        ``inverter_ac_output_max`` / ``inverter_ac_input_max``, with the legacy
+        fallback of the output cap to the ``pv_inverter_model`` rating and of the
+        input cap to the output cap. Shared by the hybrid builder and the
+        battery-first import floor, so both read the same cap.
         """
-        if self.n_inv > 1:
-            self._add_per_inverter_constraints(constraints, inv_stress_conf)
-            return
-        if not self.plant_conf["inverter_is_hybrid"]:
-            return
-
-        # Retrieve main interface variables
-        p_hybrid_inverter = self.vars["p_hybrid_inverter"]
-        p_pv_curtailment = self.vars["p_pv_curtailment"]
-        # #610: fold every battery's power into the DC-bus balance the same
-        # way the main balance does - sum over the actual list length so the
-        # off-case single dummy entry contributes exactly zero.
-        p_sto_pos_total = sum(self.vars["p_sto_pos"])
-        p_sto_neg_total = sum(self.vars["p_sto_neg"])
-        p_pv = self.param_pv_forecast
-
-        # Determine Inverter Capacity (Configuration Logic)
         p_nom_inverter_output = self.plant_conf.get("inverter_ac_output_max", None)
         p_nom_inverter_input = self.plant_conf.get("inverter_ac_input_max", None)
 
@@ -3780,6 +4061,36 @@ class Optimization:
 
         if p_nom_inverter_input is None:
             p_nom_inverter_input = p_nom_inverter_output
+
+        return p_nom_inverter_output, p_nom_inverter_input
+
+    def _add_hybrid_inverter_constraints(self, constraints, inv_stress_conf):
+        """Add the inverter constraints (Vectorized).
+
+        Above one inverter this hands over to ``_add_per_inverter_constraints``; the
+        rest is the one-inverter hybrid model.
+        """
+        if self.n_inv > 1:
+            self._add_per_inverter_constraints(constraints, inv_stress_conf)
+            return
+        if not self.plant_conf["inverter_is_hybrid"]:
+            return
+
+        # Retrieve main interface variables
+        p_hybrid_inverter = self.vars["p_hybrid_inverter"]
+        p_pv_curtailment = self.vars["p_pv_curtailment"]
+        # #610: fold every battery's power into the DC-bus balance the same
+        # way the main balance does - sum over the actual list length so the
+        # off-case single dummy entry contributes exactly zero.
+        p_sto_pos_total = sum(self.vars["p_sto_pos"])
+        p_sto_neg_total = sum(self.vars["p_sto_neg"])
+        p_pv = self.param_pv_forecast
+
+        p_nom_inverter_output, p_nom_inverter_input = self._hybrid_inverter_ac_caps()
+        # The cap this problem is built with, read back by the battery-first import
+        # floor on every solve, so the pv_inverter_model fallback (which reads the CEC
+        # inverter table) runs once per build, not once per solve.
+        self._hybrid_ac_output_cap = p_nom_inverter_output
 
         # Optional exact piecewise-linear AC<->DC transfer curves (issue #746). A
         # direction with a curve ignores its scalar efficiency entirely, so the scalar
@@ -4019,10 +4330,79 @@ class Optimization:
         for spec, pv in zip(self.inverter_specs, pv_inv, strict=True):
             if pv is None:
                 continue
-            curve = spec["curve_dc_ac"]
-            ac = spec["eff_dc_ac"] * pv if curve is None else np.interp(pv, curve[1], curve[0])
-            total += np.minimum(ac, spec["cap_out"])
+            total += self._inverter_ac_reach(spec, pv)
         return total
+
+    @staticmethod
+    def _inverter_ac_reach(spec: dict, dc: np.ndarray | float) -> np.ndarray:
+        """The most AC power an inverter can deliver from ``dc`` W on its DC bus.
+
+        ``dc * eff`` for a scalar efficiency, or the highest AC power on the DC-to-AC
+        curve whose DC input does not exceed ``dc`` (DC is non-decreasing along the
+        curve, so a flat DC stretch gives its highest AC, and the value is capped at
+        the last AC point), then at the AC output cap. ``spec`` needs ``curve_dc_ac``,
+        ``eff_dc_ac`` and ``cap_out``.
+        """
+        dc = np.asarray(dc, dtype=float)
+        curve = spec["curve_dc_ac"]
+        ac = spec["eff_dc_ac"] * dc if curve is None else np.interp(dc, curve[1], curve[0])
+        return np.minimum(ac, spec["cap_out"])
+
+    def _battery_first_import_floor(self) -> np.ndarray:
+        """Grid import per step that no schedule can avoid, for the battery-first penalty (#1253).
+
+        The load above the most AC power PV and every battery at full discharge can
+        put on the bus: ``max(0, load - reach)``. Battery k reaches
+        ``eff_dis * min(discharge_power_max, availability ceiling)``, the bounds its
+        discharge has in the model. That reach goes straight to the bus on an
+        AC-coupled system, joins the PV on the DC bus of the one hybrid inverter
+        (converted, then capped at ``inverter_ac_output_max``), and above one inverter
+        joins the PV of the inverter it sits on, each inverter converted and capped on
+        its own.
+
+        Every term is an upper bound on what the plant can deliver, so the floor
+        never exceeds the import the step needs and the penalty still prices any
+        import the battery could have replaced. Deferrable loads (decision
+        variables) and limits that depend on the plan (ramp rates, the discharge
+        energy budget, a battery too empty to hold full power for the step) are
+        left out: they can only make the floor smaller than exact, never larger.
+        Reads this solve's Parameter values and the cap the hybrid builder used, so it
+        runs after the build.
+        """
+        n = self.num_timesteps
+        batt_conf = self._battery_conf_as_lists()
+        reach = [
+            batt_conf["eff_dis"][k]
+            * np.minimum(
+                float(self.param_battery_discharge_power_max[k].value),
+                np.asarray(self.param_batt_discharge_ceiling[k].value, dtype=float),
+            )
+            for k in range(self.n_batt)
+        ]
+        if self.n_inv > 1:
+            deliverable = np.zeros(n)
+            for i, spec in enumerate(self.inverter_specs):
+                if spec["shape"] == "inert":
+                    continue
+                dc = sum((reach[k] for k in spec["batteries"]), np.zeros(n))
+                if spec["has_pv"]:
+                    dc = dc + np.asarray(self.param_pv_inv[i].value, dtype=float)
+                deliverable += self._inverter_ac_reach(spec, dc)
+        else:
+            dc = np.asarray(self.param_pv_forecast.value, dtype=float) + sum(reach, np.zeros(n))
+            if self.plant_conf["inverter_is_hybrid"]:
+                curve = self._inverter_power_curve("inverter_power_curve_dc_ac", "dc_ac")
+                spec = {
+                    "curve_dc_ac": curve,
+                    "eff_dc_ac": self.plant_conf.get("inverter_efficiency_dc_ac", 1.0),
+                    # The cap the problem was built with (the floor runs after the build).
+                    "cap_out": self._hybrid_ac_output_cap,
+                }
+                deliverable = self._inverter_ac_reach(spec, dc)
+            else:
+                deliverable = dc
+        p_load = np.asarray(self.param_load_forecast.value, dtype=float)
+        return np.maximum(p_load - deliverable, 0.0)
 
     def _add_battery_constraints(self, constraints, batt_stress_conf):
         """Add all battery-related constraints (Vectorized).
@@ -4349,9 +4729,10 @@ class Optimization:
         # the import tariff. That dwarfs any realistic tariff gradient, so the
         # solver still drains the battery before importing, but it can always fall
         # back to importing when that is the only feasible option (recharging to a
-        # terminal SoC target with no PV, or a load that exceeds the battery's
-        # discharge power) instead of returning infeasible as the old hard bound
-        # `p_grid_pos <= max_from_grid * import_gate` did.
+        # terminal SoC target with no PV) instead of returning infeasible as the old
+        # hard bound `p_grid_pos <= max_from_grid * import_gate` did. Import that no
+        # schedule can avoid (a load above what PV and the batteries can deliver)
+        # is exempt from the penalty, see _battery_first_import_floor (#1253).
         #
         # #610: with N batteries there is one shared gate/penalty (not
         # per-battery), gated on AGGREGATE stored energy vs AGGREGATE minimum -
@@ -4399,10 +4780,17 @@ class Optimization:
                 aggregate_stored_energy - aggregate_min_energy - soc_tolerance_energy
                 <= aggregate_cap * (1 - import_gate)
             )
-            # battery_first_penalty >= import beyond the free (gated) allowance;
-            # nonneg, so it equals max(0, import while the fleet is charged).
+            # battery_first_penalty >= import beyond the free (gated) allowance and
+            # beyond the import no schedule can avoid in that step (#1253: a load
+            # above what PV and the batteries can deliver); nonneg, so it equals
+            # max(0, import above that floor while the fleet is charged). Without that
+            # floor the unavoidable part was penalized too, and the cheapest way out
+            # was to keep the battery near empty ahead of every such load.
             constraints.append(
-                battery_first_penalty >= p_grid_pos - cp.multiply(max_from_grid, import_gate)
+                battery_first_penalty
+                >= p_grid_pos
+                - cp.multiply(max_from_grid, import_gate)
+                - self.param_battery_first_import_floor
             )
 
     # ------------------------------------------------------------------
@@ -5168,6 +5556,45 @@ class Optimization:
 
         constraints.append(predicted_temp_thermal[0] == start_temperature)
 
+        # Delivered-heat ceiling (issue #1324). `max_thermal_power` is the source's
+        # rated thermal output; without this bound the only ceiling on the heat the
+        # model may inject is cop * nominal_power, so a high mild-weather COP plans
+        # more heat than the emitter can physically deliver. The field sits with the
+        # other source-side fields (`thermal_source`, legacy fallback `thermal_battery`),
+        # exactly where the shared-tank builder reads it.
+        thermal_cap = self._get_load_source_config(k).get("max_thermal_power")
+        if thermal_cap is not None:
+            thermal_cap = float(thermal_cap)
+            # A NaN cap would pass `<= 0` and then crash CVXPY when it reaches the
+            # nonneg ON-level Parameter; an infinite one would silently mean "no
+            # cap". The heat-topology compiler rejects both, so the standalone
+            # path does too.
+            if not np.isfinite(thermal_cap) or thermal_cap <= 0:
+                raise ValueError(
+                    f"Load {k}: 'max_thermal_power' must be a positive finite number, "
+                    f"got {thermal_cap}"
+                )
+            # Same form, and the same DPP-safety argument, as
+            # _add_shared_thermal_tank_constraints: `heatpump_cops` is a cp.Parameter
+            # on a parameterised load and a constant array on the fallback path, so
+            # parameter * variable <= const survives a cache hit unchanged.
+            constraints.append(cp.multiply(heatpump_cops, p_deferrable) <= thermal_cap)
+            cop_vals = np.asarray(
+                heatpump_cops.value if hasattr(heatpump_cops, "value") else heatpump_cops,
+                dtype=float,
+            )
+            # A semi-continuous member runs at p == ON_level * bin with the ON level
+            # defaulting to nominal; a binding cap would leave OFF as the only feasible
+            # state and the source would be silently abandoned. The level has to come
+            # down to min(nominal, cap/COP) - but this builder runs before the load
+            # loop creates that Parameter, so record the cap here and let the
+            # semi-continuous block apply it. update_thermal_params re-applies it when
+            # a cache hit re-values the COP.
+            self._thermal_cap_by_load[k] = (thermal_cap, cop_vals)
+            self._warn_capped_level_below_min_power(
+                "Thermal battery load", k, cop_vals, thermal_cap, required_len
+            )
+
         # Thermal inertia: first-order low-pass filter on heat input
         tau_hours = float(hc.get("thermal_inertia_time_constant", 0.0) or 0.0)
 
@@ -5539,18 +5966,23 @@ class Optimization:
                 return
 
     def _warn_capped_level_below_min_power(
-        self, tank_id, k, cop_vals, thermal_cap, n_steps, after_dp=False
+        self, store_label, k, cop_vals, thermal_cap, n_steps, after_dp=False, when=""
     ):
         """Warn when a capped source cannot run at some steps.
+
+        `store_label` names the storage in the message ("Shared tank 'x'",
+        "Thermal battery load"): the same cap applies to a source feeding a
+        shared tank and to a standalone thermal_battery load.
 
         Where cap/COP < min_power, `cop * p <= cap` and `p >= min_power * bin` leave
         OFF as the only feasible state, whether the source is semi-continuous (its
         ON level is min(nominal, cap/COP)) or continuous, so the source is dropped
         at those steps. That is physically right (the unit cannot modulate below
         its floor), but it must not happen silently: warn rather than lower the
-        floor. After the DP refinement, or in the relaxed-LP rebuild, the warning
-        is repeated only when the number of affected steps changed. Returns that
-        number.
+        floor. `when` names a later re-derivation of the level ("after a COP
+        refresh"); the DP refinement (`after_dp`) and the relaxed-LP rebuild
+        repeat the warning only when the number of affected steps changed.
+        Returns that number.
         """
         cap_over_cop = float(thermal_cap) / np.maximum(np.asarray(cop_vals, dtype=float), 1e-9)
         min_powers = getattr(self, "_min_power_of_deferrable_loads", None)
@@ -5559,20 +5991,20 @@ class Optimization:
         min_power_k = float(min_powers[k]) if k < len(min_powers) and min_powers[k] else 0.0
         below_min = int(np.count_nonzero(cap_over_cop < min_power_k)) if min_power_k > 0 else 0
         counts = self.__dict__.setdefault("_capped_below_min_counts", {})
-        repeat = after_dp or getattr(self, "_relaxed_rebuild", False)
+        repeat = after_dp or bool(when) or getattr(self, "_relaxed_rebuild", False)
         if repeat and counts.get(k) == below_min:
             return below_min
         counts[k] = below_min
         if below_min > 0:
             self.logger.warning(
-                "Shared tank '%s': deferrable load %s cannot run at %s/%s steps%s; its "
+                "%s: deferrable load %s cannot run at %s/%s steps%s; its "
                 "min_power (%s W) exceeds the level max_thermal_power allows "
                 "(cap/COP), so those steps are forced off.",
-                tank_id,
+                store_label,
                 k,
                 below_min,
                 n_steps,
-                " after the DP COP refinement" if after_dp else "",
+                f" {when}" if when else (" after the DP COP refinement" if after_dp else ""),
                 min_power_k,
             )
         return below_min
@@ -6285,7 +6717,9 @@ class Optimization:
                 on_level.value = np.minimum(
                     on_level.value, float(thermal_cap) / np.maximum(cop_vals, 1e-9)
                 )
-            self._warn_capped_level_below_min_power(tank_id, k, cop_vals, thermal_cap, required_len)
+            self._warn_capped_level_below_min_power(
+                f"Shared tank '{tank_id}'", k, cop_vals, thermal_cap, required_len
+            )
 
         # Soft comfort constraints (issue #539): the tank's desired_temperatures
         # set a comfort target whose shortfall is penalized in the objective
@@ -6848,7 +7282,12 @@ class Optimization:
                             base, float(cap_w) / np.maximum(new_cop[: on_level.size], 1e-9)
                         )
                     self._warn_capped_level_below_min_power(
-                        e["tank_id"], hp["load_idx"], new_cop, cap_w, n, after_dp=True
+                        f"Shared tank '{e['tank_id']}'",
+                        hp["load_idx"],
+                        new_cop,
+                        cap_w,
+                        n,
+                        after_dp=True,
                     )
                 # Bound the re-solve to the range the DP priced: at most 1 C above its
                 # peak (below its trough when cooling). A per-step bound at the DP's
@@ -6918,6 +7357,90 @@ class Optimization:
             _restore_static_solve(saved_values)
             self.logger.warning("DP COP refinement re-solve failed (%s); keeping static solve", exc)
 
+    def _has_remainder_step(self, k, shared_tank_membership=None):
+        """Whether load ``k`` is a standard semi-continuous load with an energy target.
+
+        Only such a load may carry the fractional remainder step (issue #1105): sequence,
+        thermal and thermal-battery loads have no operating-hours energy constraint.
+        Structural (config only), so the build and the per-solve parameter update, which
+        runs before the first build, agree.
+        """
+        optim_conf = self.optim_conf
+        semi_cont = optim_conf["treat_deferrable_load_as_semi_cont"]
+        nominal = optim_conf["nominal_power_of_deferrable_loads"]
+        configs = optim_conf.get("def_load_config") or []
+        load_config = configs[k] if 0 <= k < len(configs) else {}
+        if shared_tank_membership is None:
+            shared_tank_membership = self._load_shared_tank_membership()
+        return bool(
+            k < len(semi_cont)
+            and semi_cont[k]
+            and not isinstance(nominal[k], list)
+            and "thermal_config" not in load_config
+            and "thermal_battery" not in load_config
+            and k not in shared_tank_membership
+            and k not in self.param_thermal
+            and k < len(self.param_rem_active)
+            and k < len(self.param_target_energy)
+        )
+
+    def _required_steps_for_hours(self, k, hours, shared_tank_membership=None):
+        """Whole timesteps a load needs for ``hours``: the ceiling, except that a load
+        with a remainder step takes a requirement within FRACTIONAL_STEP_RESOLUTION of a
+        whole number of steps as that number. Shared by the build-time window check and
+        the per-solve update so both see the same requirement."""
+        steps = hours / self.time_step
+        if self._has_remainder_step(k, shared_tank_membership):
+            whole_steps = _snap_to_whole_steps(steps)
+            if whole_steps is not None:
+                return whole_steps
+        return ceil(steps)
+
+    def _add_semi_cont_remainder(self, constraints, k, on_level, bin1, bin2):
+        """Semi-continuous power with at most one fractional remainder step (#1105).
+
+        ``bin2`` is the ON state (startups, min on/off time, groups); ``bin1`` marks
+        the steps at the full ON level. ``bin2 - bin1`` is the remainder step, whose
+        power is the ``param_rem_level`` (``r * nominal`` for ``N = f + r`` steps of
+        energy), so the energy equality delivers exactly ``f`` full steps plus one
+        remainder step. ``param_rem_active`` is 0 unless the (remaining) energy is
+        not a whole number of steps, which collapses to ``bin1 == bin2`` and the
+        previous strict ON/OFF model: all other loads and cases are unchanged.
+
+        The remainder step is the last operating step of the load: no full step
+        follows it. A rolling-MPC caller counts completed *steps*
+        (``def_current_operating_timesteps``), so a remainder executed early would be
+        counted as a whole step and under-deliver energy. The price is a possibly
+        dearer plan: a free remainder would take the dearest of the chosen steps.
+
+        ``r * nominal`` is the INTERVAL AVERAGE; the model does not place the ON time
+        inside the step. An executor that can only switch ON/OFF realises it as ``r``
+        of the step at the full level. Full steps of an ordinary load need not be
+        contiguous (only single-constant, minimum on-time and startup rules shape
+        them); the remainder step merely follows all of them.
+        """
+        n = self.num_timesteps
+        remainder = bin2 - bin1
+        constraints.append(bin1 <= bin2)
+        constraints.append(cp.sum(remainder) <= self.param_rem_active[k])
+        # Implied by the row above; stated per step so presolve reduces whole-step
+        # requirements (rem_active == 0) to bin1 == bin2 instead of a sum row.
+        constraints.append(remainder <= self.param_rem_active[k])
+        constraints.append(
+            self.vars["p_deferrable"][k]
+            == cp.multiply(on_level, bin1) + self.param_rem_level[k] * remainder
+        )
+        # done[t] = 1 once the remainder step has happened by t; no full step after it.
+        # (A scalar rem_pos ordering row was benchmarked at 48/96/288 steps: same
+        # objective, 7% fewer variables, but 2-10x slower solves from the weaker big-M
+        # relaxation, so the recurrence is kept.)
+        done = cp.Variable(n, nonneg=True, name=f"semi_cont_rem_done_{k}")
+        constraints.append(done[0] == remainder[0])
+        constraints.append(done[1:] == done[:-1] + remainder[1:])
+        constraints.append(bin1[1:] + done[:-1] <= 1)
+        # A run that still owes minimum on-time (running_lb from min-on) is full steps.
+        constraints.append(bin1 >= self.param_min_on_full_lb[k])
+
     def _add_deferrable_load_constraints(
         self,
         constraints,
@@ -6946,6 +7469,13 @@ class Optimization:
         # nominal). The shared-tank builder lowers it for thermal-capped sources,
         # and the DP COP refinement re-derives it when it re-values the COP.
         self._semi_cont_on_level: dict[int, cp.Parameter] = {}
+        # Thermal cap recorded by the standalone thermal_battery builder, keyed by
+        # load: (max_thermal_power in W, COP array). The ON-level Parameter does not
+        # exist yet when that builder runs, so it is applied here and re-applied by
+        # update_thermal_params when a cache hit re-values the COP.
+        self._thermal_cap_by_load: dict[int, tuple[float, np.ndarray]] = {}
+        # Semi-continuous loads that may carry one fractional remainder step (#1105).
+        self._semi_cont_remainder: set[int] = set()
 
         # Compute shared-tank membership once. Used by the per-load loop to
         # skip loads that belong to a shared tank (handled after the loop)
@@ -7171,7 +7701,9 @@ class Optimization:
             elif def_total_timestep and def_total_timestep[k] > 0:
                 min_steps = ceil(def_total_timestep[k])
             else:
-                min_steps = ceil(def_total_hours[k] / self.time_step)
+                min_steps = self._required_steps_for_hours(
+                    k, def_total_hours[k], shared_tank_membership
+                )
             def_start, def_end, warning = Optimization.validate_def_timewindow(
                 def_start_timestep[k],
                 def_end_timestep[k],
@@ -7220,6 +7752,12 @@ class Optimization:
                 or has_min_power
                 or has_startup_penalty
             )
+            # A standard semi-continuous load with an energy target may need one
+            # fractional remainder step (issue #1105). Sequence and thermal loads have
+            # no operating-hours energy constraint, so they keep strict ON/OFF.
+            has_remainder = self._has_remainder_step(k, shared_tank_membership)
+            if has_remainder:
+                self._semi_cont_remainder.add(k)
 
             if use_binary_logic:
                 # Standard Binary/Mixed-Integer Constraints
@@ -7233,8 +7771,11 @@ class Optimization:
 
                 # Minimum Power (if active)
                 if has_min_power:
+                    # The remainder step runs at the ON level for part of the step; its
+                    # step average may be below the minimum power, so only full steps count.
+                    min_power_bin = p_def_bin1[k] if has_remainder else p_def_bin2[k]
                     constraints.append(
-                        p_deferrable[k] >= min_power_of_deferrable_loads[k] * p_def_bin2[k]
+                        p_deferrable[k] >= min_power_of_deferrable_loads[k] * min_power_bin
                     )
 
                 # Status consistency: P_def <= M * Bin2
@@ -7299,10 +7840,13 @@ class Optimization:
                         # Self-protecting vs window: if a start can't fit N on-steps
                         # within its operating window, the solver simply won't start the
                         # load -> stays Optimal. (Tested by FEASIBILITY test.)
+                        # With a remainder step the run must be made of FULL steps
+                        # (bin1): a fractional step is not a whole step of on-time.
+                        min_on_bin = p_def_bin1[k] if has_remainder else p_def_bin2[k]
                         for t in range(n):
                             window_end = min(t + min_on_n, n)
                             constraints.append(
-                                cp.sum(p_def_bin2[k][t:window_end])
+                                cp.sum(min_on_bin[t:window_end])
                                 >= (window_end - t) * p_def_start[k][t]
                             )
 
@@ -7435,8 +7979,26 @@ class Optimization:
                             value=np.broadcast_to(np.asarray(nominal, dtype=float), n).copy(),
                         )
                         self._semi_cont_on_level[k] = on_level
-                        constraints.append(p_deferrable[k] == cp.multiply(on_level, p_def_bin1[k]))
-                        constraints.append(p_def_bin1[k] == p_def_bin2[k])
+                        # A standalone thermal_battery with max_thermal_power: lower the
+                        # ON level to min(nominal, cap/COP) per step. With the plain
+                        # nominal, a binding cap would make OFF the only feasible state
+                        # and the source would be silently dropped.
+                        cap_entry = self._thermal_cap_by_load.get(k)
+                        if cap_entry is not None:
+                            cap_w, cap_cops = cap_entry
+                            on_level.value = np.minimum(
+                                on_level.value,
+                                float(cap_w) / np.maximum(np.asarray(cap_cops)[:n], 1e-9),
+                            )
+                        if has_remainder:
+                            self._add_semi_cont_remainder(
+                                constraints, k, on_level, p_def_bin1[k], p_def_bin2[k]
+                            )
+                        else:
+                            constraints.append(
+                                p_deferrable[k] == cp.multiply(on_level, p_def_bin1[k])
+                            )
+                            constraints.append(p_def_bin1[k] == p_def_bin2[k])
 
             else:
                 # Pure Continuous Constraints (Faster!)
@@ -7623,10 +8185,19 @@ class Optimization:
 
             self.logger.debug(f"Adding group {gi} constraints for deferrable loads {indices}")
 
-            # Shared power budget: sum of group members <= max_power at each timestep
+            # Shared power budget: sum of group members <= max_power at each timestep.
+            # A semi-continuous load with a fractional remainder step counts at its ON
+            # level, not at the remainder step's average power (issue #1105).
             if max_power is not None:
-                group_power_sum = sum(p_deferrable[i] for i in indices)
-                constraints.append(group_power_sum <= max_power)
+                group_power_terms = []
+                for i in indices:
+                    if i in self._semi_cont_remainder and i in self._semi_cont_on_level:
+                        group_power_terms.append(
+                            cp.multiply(self._semi_cont_on_level[i], self.vars["p_def_bin2"][i])
+                        )
+                    else:
+                        group_power_terms.append(p_deferrable[i])
+                constraints.append(sum(group_power_terms) <= max_power)
 
             # Mutual exclusion: at most one load active per timestep. This is a
             # PHYSICAL limit (one heat source cannot serve two targets at once), so
@@ -7999,6 +8570,21 @@ class Optimization:
         return not Optimization._needs_relaxed_retry(status_norm, value, feasible_incumbent)
 
     @staticmethod
+    def _remainder_solver_opts(selected_solver, solver_opts: dict) -> dict:
+        """Copy of ``solver_opts`` with a 1e-7 integer feasibility tolerance for the
+        solvers whose default (1e-5) equals the remainder resolution: Gurobi
+        ``IntFeasTol`` and CPLEX ``mip.tolerances.integrality``. HiGHS is unchanged."""
+        opts = dict(solver_opts)
+        if selected_solver == cp.GUROBI:
+            opts["IntFeasTol"] = REMAINDER_INTEGRALITY_TOL
+        elif selected_solver == cp.CPLEX:
+            opts["cplex_params"] = {
+                **opts.get("cplex_params", {}),
+                "mip.tolerances.integrality": REMAINDER_INTEGRALITY_TOL,
+            }
+        return opts
+
+    @staticmethod
     def _dp_resolve_opts(solver_opts: dict) -> dict:
         """Solver options for the DP refinement's re-solve: half the time budget.
 
@@ -8157,6 +8743,20 @@ class Optimization:
         pv_plant_inverters: list | None = None,
     ) -> pd.DataFrame:
         _build_start_perf = time.perf_counter() if stage_times is not None else 0.0
+        # Opt-in coordinator backend (emhass.coordinator): the devices are planned as separate
+        # participants. None means it cannot plan this configuration, so cvxpy runs below.
+        backend = self.optim_conf.get("optimization_backend", "cvxpy")
+        fallback_reason = None
+        if backend not in (None, "cvxpy"):
+            inputs = {
+                k: v
+                for k, v in locals().items()
+                if k not in ("self", "_build_start_perf", "backend", "fallback_reason")
+            }
+            res, fallback_reason = _coordinated_plan(self, **inputs)
+            if res is not None:
+                return _with_backend(res, backend, None)
+            _warn_unheld_limits(self)
         # Shared thermal tanks bake forecast-dependent physics into constraints as constants.
         # Rebuild problem when forecast inputs change to ensure fresh forecasts are applied.
         if self.optim_conf.get("shared_thermal_tanks"):
@@ -8187,6 +8787,9 @@ class Optimization:
             self.param_load_cost = cp.Parameter(current_n, name="load_cost")
             self.param_load_cost_pos = cp.Parameter(current_n, nonneg=True, name="load_cost_pos")
             self.param_export_ceiling = cp.Parameter(current_n, nonneg=True, name="export_ceiling")
+            self.param_battery_first_import_floor = cp.Parameter(
+                current_n, nonneg=True, name="battery_first_import_floor"
+            )
             if self.n_inv > 1:
                 self.param_spill_price = cp.Parameter(current_n, nonneg=True, name="spill_price")
             self.param_prod_price = cp.Parameter(current_n, name="prod_price")
@@ -8513,11 +9116,16 @@ class Optimization:
         # Under self-consumption grid import costs SELF_CONSUMPTION_BIGM times the tariff,
         # so the miss is scaled by the same factor to stay above the import it would save.
         penalty_scale = SELF_CONSUMPTION_BIGM if self.costfun == "self-consumption" else 1.0
+        # The tariff these terminal-SoC coefficients scale with: the one given,
+        # unless a caller pins them to another (the coordinated backend, whose
+        # queries change the price but must not change the battery's objective).
+        soc_tariff = getattr(self, "soc_final_reference_tariff", None)
+        soc_tariff = unit_load_cost if soc_tariff is None else soc_tariff
         self.param_soc_final_penalty.value = (
             0.001
             * SOC_FINAL_DEVIATION_PENALTY_FACTOR
             * penalty_scale
-            * max(float(np.max(np.maximum(np.asarray(unit_load_cost, dtype=float), 0.0))), 1e-3)
+            * max(float(np.max(np.maximum(np.asarray(soc_tariff, dtype=float), 0.0))), 1e-3)
         )
         # If soc_final_reward_factor is defined, missing the final SOC
         # with more energy is rewarded by the purchase cost of the
@@ -8526,13 +9134,13 @@ class Optimization:
         reward_factor = self.optim_conf.get("battery_soc_final_reward_factor", 0.0)
         if reward_factor > 0.0:
             self.param_soc_final_reward.value = (
-                0.001 * reward_factor * float(np.asarray(unit_load_cost, dtype=float)[-1])
+                0.001 * reward_factor * float(np.asarray(soc_tariff, dtype=float)[-1])
             )
         else:
             self.param_soc_final_reward.value = (
                 -0.001
                 * SOC_FINAL_DEVIATION_PENALTY_FACTOR
-                * max(float(np.max(np.maximum(np.asarray(unit_load_cost, dtype=float), 0.0))), 1e-3)
+                * max(float(np.max(np.maximum(np.asarray(soc_tariff, dtype=float), 0.0))), 1e-3)
             )
         self.param_prod_price.value = unit_prod_price
         if self.n_inv > 1:
@@ -8786,6 +9394,10 @@ class Optimization:
             if isinstance(nominal_power, list):
                 nominal_power = max(nominal_power)
 
+            # Only a standard semi-continuous load carries a remainder step; every other
+            # load keeps the previous ceil / exact-energy behaviour (issue #1105).
+            has_remainder = self._has_remainder_step(k, shared_tank_membership)
+
             # Determine operating requirement: def_total_timestep takes priority over def_total_hours
             # def_total_timestep is specified in number of timesteps
             # def_total_hours is specified in hours
@@ -8798,7 +9410,11 @@ class Optimization:
             elif def_total_hours and k < len(def_total_hours) and def_total_hours[k] > 0:
                 # Use hours-based specification
                 operating_hours = def_total_hours[k]
-                required_timesteps = ceil(operating_hours / self.time_step)
+                # A load with a remainder step takes a requirement within
+                # FRACTIONAL_STEP_RESOLUTION of a whole number of steps as that number.
+                required_timesteps = self._required_steps_for_hours(
+                    k, operating_hours, shared_tank_membership
+                )
                 target_energy = nominal_power * operating_hours
                 constraint_active = True
             else:
@@ -8869,6 +9485,56 @@ class Optimization:
             else:
                 self.param_target_energy[k].value = 0.0
                 self.param_energy_active[k].value = 0.0  # Constraint is relaxed (Big-M)
+
+            # Fractional remainder step (issue #1105): the (remaining) energy target as
+            # steps at nominal power is f + r. Whole steps stay strict ON/OFF; the single
+            # remainder step carries r * nominal so the energy is delivered exactly.
+            if has_remainder:
+                self.param_rem_level[k].value = 0.0
+                self.param_rem_active[k].value = 0.0
+            if (
+                has_remainder
+                and constraint_active
+                and k not in window_empty_loads
+                and nominal_power > 0
+            ):
+                steps_of_energy = target_energy / (nominal_power * self.time_step)
+                if 0.0 < steps_of_energy < FRACTIONAL_STEP_RESOLUTION:
+                    # Not below the resolution: a remainder this small is numerically
+                    # unreliable, and the error stays within the documented bound.
+                    steps_of_energy = FRACTIONAL_STEP_RESOLUTION
+                    target_energy = steps_of_energy * nominal_power * self.time_step
+                    self.param_target_energy[k].value = target_energy
+                whole_steps = _snap_to_whole_steps(steps_of_energy)
+                if whole_steps is not None:
+                    # Below the solver's resolution (FRACTIONAL_STEP_RESOLUTION): the
+                    # target is the whole number of steps, so the energy equality
+                    # stays satisfiable by whole steps alone.
+                    if steps_of_energy != whole_steps:
+                        self.logger.debug(
+                            "Deferrable load %d: requirement of %.9f steps is within %g "
+                            "steps of %d; using %d whole steps",
+                            k,
+                            steps_of_energy,
+                            FRACTIONAL_STEP_RESOLUTION,
+                            whole_steps,
+                            whole_steps,
+                        )
+                        self.param_target_energy[k].value = float(
+                            whole_steps * nominal_power * self.time_step
+                        )
+                else:
+                    rem_fraction = steps_of_energy - float(np.floor(steps_of_energy))
+                    if rem_fraction > 0.0:
+                        self.param_rem_level[k].value = float(rem_fraction * nominal_power)
+                        self.param_rem_active[k].value = 1.0
+                # One snap decision per load: the remaining energy decides, so the
+                # required steps always match the ON steps that energy needs (the
+                # hours-based and the energy-based ratio can differ by an ulp
+                # exactly at the resolution).
+                required_timesteps = (
+                    whole_steps if whole_steps is not None else ceil(steps_of_energy)
+                )
 
             # For single-constant (binary) loads, set the required timesteps
             is_single_const = self.optim_conf["set_deferrable_load_single_constant"][k]
@@ -9046,7 +9712,7 @@ class Optimization:
                 # def_current_power, force bin2[k][0] = 1 so the load stays ON at
                 # t=0. Only index 0 matters here; for pinned loads the power-pin
                 # constraint already implies bin2[0]=1, so this is what keeps an affected
-                # semi_cont load ON (at nominal). Excludes single_const / sequence /
+                # semi_cont load ON (at nominal, or at the remainder step's average power). Excludes single_const / sequence /
                 # thermal via _def_current_power_affected (set in the update method).
                 # Widen window_mask[0] too so a load whose window starts after t=0 is
                 # not immediately blocked by the mask (mirrors the single-const / min-on
@@ -9069,6 +9735,8 @@ class Optimization:
                 # the stricter force wins.
                 combined_lb = np.maximum(np.maximum(single_const_lb, min_on_lb), current_power_lb)
                 self.param_running_lb[k].value = combined_lb
+                if k < len(self.param_min_on_full_lb):
+                    self.param_min_on_full_lb[k].value = min_on_lb
 
                 # --- C) Min-off-time remainder (#952 follow-on) ---
                 # Applies when: load is currently OFF, N > 0, NOT single-constant,
@@ -9302,6 +9970,24 @@ class Optimization:
             self._batt_stress_conf = batt_stress_conf
             self._inv_stress_conf = inv_stress_conf
 
+        # A max_thermal_power cap below the load's minimum power forces that step
+        # off, so a forced run pinned there would make the model infeasible -
+        # exactly as a def_availability block does. Released after the build, which
+        # is what fills the registry, so a process's first plan is covered too, and
+        # on every cache hit before the solve.
+        for k in getattr(self, "_thermal_cap_by_load", {}):
+            self._release_force_on_at(k, self._capped_steps_below_min_power(k, n))
+
+        # The battery-first import floor (#1253) reads this solve's PV, load and
+        # battery power Parameters and the inverter cap the problem was built with,
+        # so it is set after the build and before the solve. Only the battery-first
+        # penalty uses it; it is set whenever a battery is modelled, so a reused
+        # problem never reads a stale value.
+        if self.optim_conf["set_use_battery"]:
+            self.param_battery_first_import_floor.value = self._battery_first_import_floor()
+        else:
+            self.param_battery_first_import_floor.value = np.zeros(self.num_timesteps)
+
         # Thermal artifacts read by the extraction below. Locals so a relaxed
         # retry can swap in its own rebuilt artifacts for this run only, while
         # the instance attributes stay paired with the cached problem
@@ -9380,14 +10066,24 @@ class Optimization:
             solver_opts["mip_rel_gap"] = float(mip_gap)
             self.logger.debug(f"MIP gap tolerance set to {mip_gap:.1%}")
 
+        # A remainder step makes integrality matter at 1e-5 steps (FRACTIONAL_STEP_RESOLUTION).
+        # Gurobi and CPLEX default to a 1e-5 integer feasibility tolerance, so tighten it
+        # for them only while a remainder is active. HiGHS keeps its own (1e-6) default.
+        if any(float(p.value or 0.0) > 0.0 for p in self.param_rem_active):
+            solver_opts = self._remainder_solver_opts(selected_solver, solver_opts)
+
         # Stage-timer breadcrumb: end of build phase, start of solve phase.
         _solve_start_perf = time.perf_counter() if stage_times is not None else 0.0
         if stage_times is not None:
             stage_times["optim_solve.build"] = _solve_start_perf - _build_start_perf
 
         # Solve Execution with Fallback
+        # No warm start for HiGHS: given the previous run's solution as a MIP start, it can
+        # return that start on a cache hit while reporting the new optimum's objective
+        # (#1364). The cached problem is still reused; warm_start only seeds the solver.
+        warm_start = selected_solver != cp.HIGHS
         try:
-            self.prob.solve(solver=selected_solver, warm_start=True, **solver_opts)
+            self.prob.solve(solver=selected_solver, warm_start=warm_start, **solver_opts)
         except Exception as e:
             self.logger.warning(
                 f"Solver {selected_solver} failed: {e}. Checking status for fallback..."
@@ -9472,6 +10168,7 @@ class Optimization:
             original_transfer_vars = getattr(self, "transfer_vars", {})
             original_dp_tank_entries = self._dp_tank_entries
             original_semi_cont_on_level = self._semi_cont_on_level
+            original_semi_cont_remainder = self._semi_cont_remainder
 
             # The rebuild switches the configuration to the relaxed form and
             # repoints instance state at the relaxed build; restore both even
@@ -9580,6 +10277,7 @@ class Optimization:
                 self.transfer_vars = original_transfer_vars
                 self._dp_tank_entries = original_dp_tank_entries
                 self._semi_cont_on_level = original_semi_cont_on_level
+                self._semi_cont_remainder = original_semi_cont_remainder
                 for k, params in self.param_thermal.items():
                     if k in original_q_input_vars:
                         params["q_input_var"] = original_q_input_vars[k]
@@ -9606,6 +10304,9 @@ class Optimization:
         # Fix for Status Case: Map "optimal" -> "Optimal"
         status_raw = solved_prob.status
         self.optim_status = status_raw.title() if status_raw else "Failure"
+        # The objective of the problem whose plan is published: after a relaxed
+        # retry or an accepted DP re-solve that is not self.prob (#1048).
+        self.solved_value = solved_prob.value
 
         # Helper: Ensure we return "Optimal" for tests if it was "Optimal (Relaxed)" or "Optimal_Inaccurate"
         if solved_prob.value is None or solved_prob.status not in [
@@ -9622,6 +10323,8 @@ class Optimization:
             # explicitely set the status column so downstream functions (like get_injection_dict)
             # don't crash when trying to access or drop it.
             opt_tp["optim_status"] = self.optim_status
+            if fallback_reason:
+                _with_backend(opt_tp, backend, fallback_reason)
 
             if stage_times is not None:
                 stage_times["optim_solve.extract"] = time.perf_counter() - _extract_start_perf
@@ -9654,6 +10357,8 @@ class Optimization:
             transfer_vars=solved_transfer_vars,
             p_pv_plants=p_pv_plants,
         )
+        if fallback_reason:
+            _with_backend(results_df, backend, fallback_reason)
         if stage_times is not None:
             stage_times["optim_solve.extract"] = time.perf_counter() - _extract_start_perf
         return results_df

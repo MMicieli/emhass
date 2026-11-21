@@ -11,6 +11,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Self
+from urllib.parse import quote
 
 import aiofiles
 import aiohttp
@@ -19,7 +20,13 @@ import orjson
 import pandas as pd
 
 from emhass.connection_manager import get_websocket_client
-from emhass.utils import set_df_index_freq
+from emhass.utils import (
+    data_file_path,
+    is_valid_db_host,
+    is_valid_db_port,
+    is_valid_entity_id,
+    set_df_index_freq,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +46,55 @@ _RECORDER_COMMIT_GRACE = pd.Timedelta(seconds=10)
 _TIMESTAMP_TOLERANCE = pd.Timedelta(seconds=1)
 hass_url = "http://supervisor/core/api"
 sensor_prefix = "sensor."
+# The forms of the Supervisor proxy URL the code accepts (compared without a trailing slash).
+_SUPERVISOR_URLS = frozenset({hass_url, "https://supervisor/core/api"})
+
+
+def _influx_string(value) -> str:
+    """``value`` escaped for the inside of an InfluxQL single-quoted string."""
+    return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _influx_identifier(value) -> str:
+    """``value`` escaped for the inside of an InfluxQL double-quoted identifier."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+# InfluxDB error messages worth naming in the log. Only these fixed texts are shown,
+# never the server's own words.
+_KNOWN_DB_ERRORS = (
+    "database not found",
+    "retention policy not found",
+    "authorization failed",
+    "user not found",
+    "error parsing query",
+)
+
+
+def _upstream_error(exc: BaseException) -> str:
+    """Describe a database client error by its type, HTTP status and a known reason.
+
+    The server's reply is left out: it ends up in an action's error response,
+    which would let a caller read whatever the configured address answers.
+    """
+    code = getattr(exc, "status", None) or getattr(exc, "code", None)
+    text = type(exc).__name__ + (f" (HTTP {code})" if isinstance(code, int) else "")
+    if type(exc).__name__ == "TooManyRedirects":
+        return text + (
+            ": the server answered with a redirect, which EMHASS does not follow "
+            "(check the host, port and SSL settings)"
+        )
+    message = str(exc).lower()
+    reason = next((known for known in _KNOWN_DB_ERRORS if known in message), None)
+    return text + (f": {reason}" if reason else "")
+
+
+def _is_supervisor_url(url: str | None) -> bool:
+    """True when ``url`` is the Supervisor proxy, or unset (which means the Supervisor)."""
+    if url is None or not str(url).strip() or str(url).strip() == "empty":
+        return True
+    return str(url).strip().rstrip("/").lower() in _SUPERVISOR_URLS
+
 
 # When a var_list entry is an arithmetic expression, every entity it references is
 # queried over a window padded this much earlier than the requested start, then sliced
@@ -125,6 +181,18 @@ class RetrieveHass:
         """
         self.hass_url = hass_url
         self.long_lived_token = long_lived_token
+        # The Supervisor token is only for the Supervisor proxy. Never send it to another host.
+        supervisor_token = os.getenv("SUPERVISOR_TOKEN", "")
+        if (
+            supervisor_token
+            and long_lived_token == supervisor_token
+            and not _is_supervisor_url(hass_url)
+        ):
+            logger.error(
+                "The Supervisor token is set as the token for a Home Assistant URL that is not "
+                "the Supervisor. It will not be sent. Set a long-lived access token for that URL."
+            )
+            self.long_lived_token = ""
         if isinstance(freq, int | float | str):
             self.freq = pd.Timedelta(minutes=int(freq))
         else:
@@ -132,6 +200,13 @@ class RetrieveHass:
         self.time_zone = time_zone
         # Buckets of the last REST retrieval where the sensor was unavailable or unknown
         self.unavailable_buckets: dict[str, pd.DatetimeIndex] = {}
+        # Per sensor, the last real recorded state and the number of real readings
+        # of each bucket, and the buckets holding an unavailable/unknown row, of the
+        # last REST retrieval made with record_staleness=True (battery
+        # identification, #1073). Empty otherwise.
+        self.bucket_last_state: dict[str, pd.Series] = {}
+        self.bucket_row_count: dict[str, pd.Series] = {}
+        self.marker_buckets: dict[str, pd.DatetimeIndex] = {}
         if (params is None) or (params == "null"):
             self.params = {}
         elif type(params) is dict:
@@ -187,6 +262,16 @@ class RetrieveHass:
             self.influxdb_retention_policy = influx_conf.get("influxdb_retention_policy", "autogen")
             self.influxdb_use_ssl = influx_conf.get("influxdb_use_ssl", False)
             self.influxdb_verify_ssl = influx_conf.get("influxdb_verify_ssl", False)
+            if not is_valid_db_host(self.influxdb_host) or not is_valid_db_port(self.influxdb_port):
+                # A path or query in the host or port would send the stored login, and
+                # the request, somewhere other than the database server
+                self.logger.error(
+                    "influxdb_host must be a host name or IP address, without a scheme or "
+                    "path, and influxdb_port a port number. InfluxDB is disabled until "
+                    "they are fixed."
+                )
+                self.use_influxdb = False
+        if self.use_influxdb:
             self.logger.info(
                 f"InfluxDB integration enabled: {self.influxdb_host}:{self.influxdb_port}/{self.influxdb_database}"
             )
@@ -219,6 +304,16 @@ class RetrieveHass:
                 self.victoriametrics_entity_label = ""
             self.victoriametrics_use_ssl = vm_conf.get("victoriametrics_use_ssl", False)
             self.victoriametrics_verify_ssl = vm_conf.get("victoriametrics_verify_ssl", False)
+            if not is_valid_db_host(self.victoriametrics_host) or not is_valid_db_port(
+                self.victoriametrics_port
+            ):
+                self.logger.error(
+                    "victoriametrics_host must be a host name or IP address, without a scheme "
+                    "or path, and victoriametrics_port a port number. VictoriaMetrics is "
+                    "disabled until they are fixed."
+                )
+                self.use_victoriametrics = False
+        if self.use_victoriametrics:
             if self.use_influxdb:
                 self.logger.warning(
                     "Both use_influxdb and use_victoriametrics are enabled, InfluxDB takes precedence"
@@ -279,7 +374,8 @@ class RetrieveHass:
         # Resolve the token: if empty, fall back to SUPERVISOR_TOKEN env var (injected by HA addon supervisor)
         token = self.long_lived_token
         if not token or token == "empty":
-            token = os.getenv("SUPERVISOR_TOKEN", "")
+            # Only the Supervisor proxy may receive the Supervisor token.
+            token = os.getenv("SUPERVISOR_TOKEN", "") if _is_supervisor_url(self.hass_url) else ""
             if token:
                 self.logger.debug(
                     "Using SUPERVISOR_TOKEN from environment for HA config retrieval."
@@ -369,6 +465,7 @@ class RetrieveHass:
         test_url: str | None = "empty",
         keep_partial_days: bool = False,
         hold_unchanged_tail: bool = False,
+        record_staleness: bool = False,
     ) -> None:
         r"""
         Retrieve the actual data from hass.
@@ -407,9 +504,26 @@ class RetrieveHass:
             verification cannot be established. It also records the unavailable \
             buckets in ``unavailable_buckets``; other calls do not. Defaults to False
         :type hold_unchanged_tail: bool, optional
+        :param record_staleness: Only applies to the REST API path, including \
+            when a websocket-configured retrieval falls back to REST. When True, \
+            also records, per sensor, the last real recorded state of each bucket \
+            in ``bucket_last_state`` (NaN where the bucket has none; the state row \
+            Home Assistant adds at the start of each requested day does not count), \
+            the number of real readings in each bucket in ``bucket_row_count`` and \
+            the buckets holding an unavailable or unknown row in \
+            ``marker_buckets``, all limited to the buckets ``df_final`` holds. \
+            ``df_final`` is the same either way. Used by battery \
+            self-identification to hold short silences at the last recorded state. \
+            All three attributes are emptied at the start of every call. Defaults to False
+        :type record_staleness: bool, optional
         :return: The DataFrame populated with the retrieved data from hass
         :rtype: pandas.DataFrame
         """
+        # Only a REST retrieval asked to record them fills these (battery
+        # identification), so no other call can see a previous call's values.
+        self.bucket_last_state = {}
+        self.bucket_row_count = {}
+        self.marker_buckets = {}
         # Use InfluxDB if configured (Prioritize over WebSocket/REST for history)
         if self.use_influxdb:
             return self.get_data_influxdb(days_list, var_list)
@@ -432,6 +546,7 @@ class RetrieveHass:
                     test_url,
                     keep_partial_days=keep_partial_days,
                     hold_unchanged_tail=hold_unchanged_tail,
+                    record_staleness=record_staleness,
                 )
             return success
 
@@ -444,6 +559,7 @@ class RetrieveHass:
             test_url,
             keep_partial_days=keep_partial_days,
             hold_unchanged_tail=hold_unchanged_tail,
+            record_staleness=record_staleness,
         )
 
     def _build_history_url(
@@ -470,7 +586,8 @@ class RetrieveHass:
                 )
                 self.hass_url = self.hass_url + "/"
             base_url = f"{self.hass_url}api/history/period/{day_str}"
-        url = f"{base_url}?filter_entity_id={var}"
+        # Encoded, so a sensor name cannot add query parameters of its own
+        url = f"{base_url}?filter_entity_id={quote(str(var), safe='')}"
         if minimal_response:
             url += "&minimal_response"  # Note: fixed to & if query params exist, but ? is fine if it's the only one. Actually, filter_entity_id uses ?, so we MUST use & here.
         if significant_changes_only:
@@ -537,10 +654,14 @@ class RetrieveHass:
         is_last_day: bool,
         hold_unchanged_tail: bool = False,
         unavailable: list | None = None,
+        staleness: list | None = None,
     ) -> pd.DataFrame | None:
         """Helper to convert raw data to a resampled DataFrame.
 
         ``unavailable`` collects the buckets where the sensor was unavailable or unknown.
+        ``staleness`` collects the (last real state per bucket, real readings per
+        bucket, marker buckets) triple described for ``record_staleness`` in
+        :meth:`get_data`.
         """
         df_raw = pd.DataFrame.from_dict(data)
         # Check for empty DataFrame
@@ -572,7 +693,10 @@ class RetrieveHass:
         df_tp.set_index(pd.to_datetime(df_raw["last_changed"], format="ISO8601"), inplace=True)
         states = df_tp[var].sort_index()
         last_state = states.iloc[-1]
+        raw_states = df_tp[var] if staleness is not None else None
         df_tp = df_tp.resample(self.freq).mean()
+        if staleness is not None:
+            staleness.append(self._staleness_buckets(raw_states, states, df_tp.index, day))
         tail = self._tail_buckets(df_tp.index[-1], day, is_last_day)
         if unavailable is not None:
             day_end = self._as_utc(day) + pd.Timedelta(days=1) - self.freq
@@ -626,10 +750,52 @@ class RetrieveHass:
         buckets = resampled.index[resampled.isna().to_numpy() & carried]
         return buckets.append(after) if pd.isna(states.iloc[-1]) else buckets
 
+    def _staleness_buckets(
+        self,
+        raw_states: pd.Series,
+        states: pd.Series,
+        buckets: pd.DatetimeIndex,
+        day: pd.Timestamp,
+    ) -> tuple[pd.Series, pd.Series, pd.DatetimeIndex]:
+        """Last real recorded state and number of real readings per bucket, and the
+        buckets with a marker row.
+
+        ``raw_states`` is in Home Assistant's row order. Its first row, when stamped
+        exactly at the requested day start, is the state Home Assistant carries into
+        the period rather than a reading taken then, so it is no real observation and
+        is left out of the last states and the counts (its marker, if any, still
+        counts). Buckets with no real numeric state are NaN, with a count of 0. Rows
+        sharing a timestamp (an attribute-only update) count as one reading.
+        """
+        real = raw_states
+        if len(raw_states) and self._as_utc(raw_states.index[0]) == self._as_utc(day):
+            real = raw_states.iloc[1:]
+        real = real.dropna().sort_index(kind="stable")
+        if real.empty:
+            last = pd.Series(np.nan, index=buckets, name=states.name)
+            count = pd.Series(0, index=buckets, name=states.name, dtype="int64")
+        else:
+            last = real.resample(self.freq, origin=buckets[0]).last().reindex(buckets)
+            readings = pd.Series(1, index=real.index.unique(), name=states.name, dtype="int64")
+            count = (
+                readings.resample(self.freq, origin=buckets[0])
+                .sum()
+                .reindex(buckets, fill_value=0)
+                .astype("int64")
+            )
+        has_marker = states.isna().resample(self.freq).sum().reindex(buckets, fill_value=0)
+        return last, count, buckets[has_marker.to_numpy() > 0]
+
     async def _fetch_live_state(
         self, session: aiohttp.ClientSession, entity_id: str, headers: dict
     ) -> dict | None:
         """The entity's current state object from ``/api/states``, or None on any failure."""
+        if not is_valid_entity_id(entity_id):
+            # Not a plain entity id (an expression, say): it must not become a URL path
+            self.logger.error(
+                f"{entity_id} is not a plain entity id; its freshness cannot be verified."
+            )
+            return None
         if self.hass_url == hass_url:  # Supervisor API
             url = f"{self.hass_url}/states/{entity_id}"
         else:
@@ -737,6 +903,7 @@ class RetrieveHass:
         test_url: str | None = "empty",
         keep_partial_days: bool = False,
         hold_unchanged_tail: bool = False,
+        record_staleness: bool = False,
     ) -> None:
         """Internal method to handle REST API data retrieval."""
         self.logger.info("Retrieve hass get data method initiated...")
@@ -745,7 +912,8 @@ class RetrieveHass:
         # environment variable injected by Home Assistant when running as an addon.
         token = self.long_lived_token
         if not token or token == "empty":
-            token = os.getenv("SUPERVISOR_TOKEN", "")
+            # Only the Supervisor proxy may receive the Supervisor token.
+            token = os.getenv("SUPERVISOR_TOKEN", "") if _is_supervisor_url(self.hass_url) else ""
             if token:
                 self.logger.debug(
                     "Using SUPERVISOR_TOKEN from environment for REST API authentication."
@@ -762,6 +930,12 @@ class RetrieveHass:
         var_list = [var for var in var_list if var != ""]
         self.df_final = pd.DataFrame()
         self.unavailable_buckets = {}
+        self.bucket_last_state = {}
+        self.bucket_row_count = {}
+        self.marker_buckets = {}
+        # Per sensor, the kept days' (last real state, readings, marker buckets);
+        # only collected when record_staleness is on.
+        staleness_by_var: dict[str, list] = {}
 
         days_skipped = 0
         # Concurrent fetch: run all (day, var) HTTP requests in parallel, bounded
@@ -816,6 +990,7 @@ class RetrieveHass:
             partial_days = 0
             for day_idx, day in enumerate(days_list):
                 day_frames = []
+                day_staleness = {}
                 skip_day = False
                 missing_var = False
                 for var in var_list:
@@ -824,6 +999,7 @@ class RetrieveHass:
                     df_resampled = None
                     # Outages are only tracked for the ML opt-in; other callers skip the work.
                     unavailable: list | None = [] if hold_unchanged_tail else None
+                    staleness: list | None = [] if record_staleness else None
                     if data is not None:
                         df_resampled = self._process_history_dataframe(
                             data,
@@ -833,7 +1009,10 @@ class RetrieveHass:
                             is_last_day=(day_idx == len(days_list) - 1),
                             hold_unchanged_tail=hold_unchanged_tail,
                             unavailable=unavailable,
+                            staleness=staleness,
                         )
+                    if staleness:
+                        day_staleness[var] = staleness[0]
                     if unavailable:
                         self.unavailable_buckets[var] = self.unavailable_buckets.get(
                             var, pd.DatetimeIndex([], tz="UTC")
@@ -855,6 +1034,8 @@ class RetrieveHass:
                     continue
                 if keep_partial_days and missing_var:
                     partial_days += 1
+                for var, aux in day_staleness.items():
+                    staleness_by_var.setdefault(var, []).append(aux)
                 # Merge the day's per-variable frames on their real resampled
                 # indices; a variable missing for this day (kept mode) is just
                 # absent from the day's frame, and the cross-day concat below
@@ -890,6 +1071,24 @@ class RetrieveHass:
         # entire range is listed here without a matching df_final column, so
         # consumers must key off df_final.columns rather than this list.
         self.var_list = var_list
+        # Each day is resampled from its own midnight, so with a step that does
+        # not divide a day the days sit on different grids, and the cleanup above
+        # keeps only the days on the first day's grid. Keep the aux series to the
+        # labels df_final holds, so the off-grid days do not void the days on it.
+        final_index = self.df_final.index
+        for var, parts in staleness_by_var.items():
+            last = pd.concat([last for last, _, _ in parts])
+            count = pd.concat([count for _, count, _ in parts])
+            on_final = last.index.isin(final_index)
+            if not on_final.all():
+                self.logger.debug(
+                    f"Staleness data of {var}: {int((~on_final).sum())} of {len(last)} "
+                    "buckets are off the history grid and were left out"
+                )
+            self.bucket_last_state[var] = last[on_final]
+            self.bucket_row_count[var] = count[count.index.isin(final_index)]
+            markers = parts[0][2].append([m for _, _, m in parts[1:]]).unique().sort_values()
+            self.marker_buckets[var] = markers[markers.isin(final_index)]
         return True
 
     async def get_data_websocket(
@@ -1306,8 +1505,14 @@ class RetrieveHass:
             self.logger.error(f"Invalid VictoriaMetrics credentials: {e}")
             return None
         try:
+            # Redirects are not followed: the configured server must not be able to send
+            # EMHASS, with its credentials, to an address and path of its choosing.
             async with session.get(
-                url, params=params, headers=headers, ssl=self._vm_ssl()
+                url,
+                params=params,
+                headers=headers,
+                ssl=self._vm_ssl(),
+                allow_redirects=False,
             ) as response:
                 body = await response.read()
                 if response.status == 401:
@@ -1317,18 +1522,23 @@ class RetrieveHass:
                     return None
                 if response.status > 299:
                     self.logger.error(
-                        f"VictoriaMetrics query_range error {response.status}: {body[:300]!r}"
+                        f"VictoriaMetrics query_range error {response.status} ({len(body)} bytes)"
                     )
                     return None
                 payload = orjson.loads(body)
         except aiohttp.ClientError as e:
-            self.logger.error(f"Network error connecting to VictoriaMetrics at {url}: {e}")
+            self.logger.error(
+                f"Network error connecting to VictoriaMetrics at {url}: {_upstream_error(e)}"
+            )
             return None
         except (orjson.JSONDecodeError, ValueError) as e:
-            self.logger.error(f"Invalid JSON from VictoriaMetrics: {e}")
+            self.logger.error(f"Invalid JSON from VictoriaMetrics: {type(e).__name__}")
             return None
-        if payload.get("status") != "success":
-            self.logger.error(f"VictoriaMetrics query failed: {payload.get('error', payload)}")
+        if not isinstance(payload, dict) or payload.get("status") != "success":
+            status = payload.get("status") if isinstance(payload, dict) else None
+            # Only a known value is shown: the field is the server's text
+            shown = status if status == "error" else "unexpected"
+            self.logger.error(f"VictoriaMetrics query failed (status {shown})")
             return None
         return payload.get("data", {}).get("result", [])
 
@@ -1399,16 +1609,17 @@ class RetrieveHass:
         if len(series_values) > 1:
             # Several metrics matched: the sensor changed unit at some point (e.g. W -> kW).
             # Keep the one with the most samples rather than mixing units.
+            # The metric names and labels are the server's: count them, don't print them
             self.logger.warning(
                 f"Entity '{sensor}' matches several VictoriaMetrics metrics "
-                f"{sorted(series_values)}, keeping the one with the most samples. "
+                f"({len(series_values)}), keeping the one with the most samples. "
                 "Set victoriametrics_metric_regex to pin the metric."
             )
-        metric_name, values = max(series_values.items(), key=lambda kv: len(kv[1]))
+        _, values = max(series_values.items(), key=lambda kv: len(kv[1]))
         if not values:
             self.logger.warning(f"No data found in VictoriaMetrics for entity: {sensor}")
             return None
-        self.logger.info(f"Retrieved {len(values)} data points for {sensor} ({metric_name})")
+        self.logger.info(f"Retrieved {len(values)} data points for {sensor}")
 
         df_sensor = pd.DataFrame(values, columns=["time", sensor])
         df_sensor["time"] = pd.to_datetime(
@@ -1435,9 +1646,7 @@ class RetrieveHass:
         full_index = pd.date_range(df_sensor.index.min(), last_bucket, freq=self.freq)
         df_sensor = df_sensor.reindex(full_index).ffill()
         df_sensor.index.name = "time"
-        self.logger.debug(
-            f"Successfully retrieved {len(df_sensor)} data points for '{sensor}' from metric '{metric_name}'"
-        )
+        self.logger.debug(f"Successfully retrieved {len(df_sensor)} data points for '{sensor}'")
         return df_sensor
 
     def _is_influx_expression(self, variable: str) -> bool:
@@ -1622,6 +1831,12 @@ class RetrieveHass:
             return None
 
         try:
+            import requests
+
+            # A redirect raises instead of being followed: the configured server must
+            # not be able to send EMHASS, with its login, to an address of its choosing.
+            session = requests.Session()
+            session.max_redirects = 0
             client = InfluxDBClient(
                 host=self.influxdb_host,
                 port=self.influxdb_port,
@@ -1630,6 +1845,7 @@ class RetrieveHass:
                 database=self.influxdb_database,
                 ssl=self.influxdb_use_ssl,
                 verify_ssl=self.influxdb_verify_ssl,
+                session=session,
             )
             # Test connection
             client.ping()
@@ -1643,8 +1859,15 @@ class RetrieveHass:
 
             return client
         except Exception as e:
-            self.logger.error(f"Failed to connect to InfluxDB: {e}")
+            self.logger.error(f"Failed to connect to InfluxDB: {_upstream_error(e)}")
             return None
+
+    def _shown_measurement(self, measurement) -> str:
+        """A measurement name for the log: the configured one by name, any other (it
+        came from the server, and the log can end up in an action's reply) not."""
+        if measurement == getattr(self, "influxdb_measurement", None):
+            return repr(measurement)
+        return "found on the server"
 
     def _discover_entity_measurement(self, client, entity_id: str) -> str:
         """Auto-discover which measurement contains the given entity."""
@@ -1675,9 +1898,12 @@ class RetrieveHass:
 
                 try:
                     # Use SHOW TAG VALUES to get all entity_ids in this measurement
-                    tag_query = f'SHOW TAG VALUES FROM "{measurement}" WITH KEY = "entity_id"'
+                    tag_query = (
+                        f'SHOW TAG VALUES FROM "{_influx_identifier(measurement)}" '
+                        'WITH KEY = "entity_id"'
+                    )
                     self.logger.debug(
-                        f"Checking measurement '{measurement}' with tag query: {tag_query}"
+                        f"Checking measurement {self._shown_measurement(measurement)}"
                     )
                     result = client.query(tag_query)
                     points = list(result.get_points())
@@ -1686,7 +1912,8 @@ class RetrieveHass:
                     for point in points:
                         if point.get("value") == entity_id:
                             self.logger.debug(
-                                f"Found entity '{entity_id}' in measurement '{measurement}'"
+                                f"Found entity '{entity_id}' in measurement "
+                                f"{self._shown_measurement(measurement)}"
                             )
                             # Cache the result
                             self._measurement_cache[entity_id] = measurement
@@ -1694,12 +1921,15 @@ class RetrieveHass:
 
                 except Exception as query_error:
                     self.logger.debug(
-                        f"Tag query failed for measurement '{measurement}': {query_error}"
+                        f"Tag query failed for measurement {self._shown_measurement(measurement)}: "
+                        f"{_upstream_error(query_error)}"
                     )
                     continue
 
         except Exception as e:
-            self.logger.error(f"Error discovering measurement for entity {entity_id}: {e}")
+            self.logger.error(
+                f"Error discovering measurement for entity {entity_id!r}: {_upstream_error(e)}"
+            )
 
         # Fallback to default measurement if not found
         self.logger.warning(
@@ -1719,13 +1949,18 @@ class RetrieveHass:
         start_time_str = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
         end_time_str = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        # Every value is escaped, so a sensor name or a saved setting cannot end the
+        # string or identifier and add statements of its own.
+        database = _influx_identifier(self.influxdb_database)
+        retention_policy = _influx_identifier(self.influxdb_retention_policy)
+        measurement_id = _influx_identifier(measurement)
         # Use FILL(previous) instead of FILL(linear) for compatibility with open-source InfluxDB
         query = f"""
         SELECT mean("value") AS "mean_value"
-        FROM "{self.influxdb_database}"."{self.influxdb_retention_policy}"."{measurement}"
+        FROM "{database}"."{retention_policy}"."{measurement_id}"
         WHERE time >= '{start_time_str}'
         AND time < '{end_time_str}'
-        AND "entity_id"='{entity_id}'
+        AND "entity_id"='{_influx_string(entity_id)}'
         GROUP BY time({interval}) FILL(previous)
         """
         return query
@@ -1761,7 +1996,11 @@ class RetrieveHass:
             query = self._build_influx_query_for_measurement(
                 entity_id, measurement, start_time, end_time
             )
-            self.logger.debug(f"InfluxDB query: {query}")
+            # Not the query text: it names a measurement the server may have supplied
+            self.logger.debug(
+                f"InfluxDB query for {entity_id!r} in measurement "
+                f"{self._shown_measurement(measurement)}"
+            )
 
             # Execute query
             result = client.query(query)
@@ -1769,7 +2008,8 @@ class RetrieveHass:
 
             if not points:
                 self.logger.warning(
-                    f"No data found for entity: {entity_id} in measurement: {measurement}"
+                    f"No data found for entity: {entity_id} in measurement "
+                    f"{self._shown_measurement(measurement)}"
                 )
                 return None
 
@@ -1787,7 +2027,8 @@ class RetrieveHass:
                 df_sensor = df_sensor[["mean_value"]].rename(columns={"mean_value": sensor})
             else:
                 self.logger.error(
-                    f"Expected 'mean_value' column not found for {sensor} in measurement {measurement}"
+                    f"Expected 'mean_value' column not found for {sensor} in measurement "
+                    f"{self._shown_measurement(measurement)}"
                 )
                 return None
 
@@ -1805,13 +2046,16 @@ class RetrieveHass:
                     )
 
             self.logger.debug(
-                f"Successfully retrieved {len(df_sensor)} data points for '{entity_id}' from measurement '{measurement}'"
+                f"Successfully retrieved {len(df_sensor)} data points for '{entity_id}' "
+                f"from measurement {self._shown_measurement(measurement)}"
             )
             return df_sensor
 
         except Exception as e:
             self.logger.error(
-                f"Failed to query entity {entity_id} from measurement {measurement}: {e}"
+                f"Failed to query entity {entity_id!r} from measurement "
+                f"{self._shown_measurement(measurement)}: "
+                f"{_upstream_error(e)}"
             )
             return None
 
@@ -2136,6 +2380,12 @@ class RetrieveHass:
         """
         # Add a possible prefix to the entity ID
         entity_id = entity_id.replace(sensor_prefix, sensor_prefix + publish_prefix)
+        # It becomes part of the URL path and of a saved file name
+        if not is_valid_entity_id(entity_id):
+            self.logger.error(
+                "Not publishing: %r is not an entity id like sensor.my_name", entity_id
+            )
+            return None
         # Set the URL
         if self.hass_url == hass_url:  # If we are using the supervisor API
             url = self.hass_url + "/states/" + entity_id
@@ -2402,7 +2652,7 @@ class RetrieveHass:
                 # in-place truncating write would expose. The uuid suffix keeps
                 # the temp name unique even if the same entity is published
                 # concurrently (this write is not under _metadata_lock).
-                entity_file = entities_path / (entity_id + ".json")
+                entity_file = data_file_path(entities_path, entity_id + ".json")
                 tmp_entity_path = entity_file.with_name(
                     f"{entity_id}.json.{os.getpid()}.{uuid.uuid4().hex}.tmp"
                 )
@@ -2502,6 +2752,12 @@ class RetrieveHass:
         :param attributes: Attribute dict to attach (friendly_name, unit, CI, ...).
         :return: True if the post succeeded (or was skipped in file mode), else False.
         """
+        # It becomes part of the URL path
+        if not is_valid_entity_id(entity_id):
+            self.logger.error(
+                "Not publishing: %r is not an entity id like sensor.my_name", entity_id
+            )
+            return False
         if self.hass_url == hass_url:  # supervisor API
             url = self.hass_url + "/states/" + entity_id
         else:  # Home Assistant Core API
