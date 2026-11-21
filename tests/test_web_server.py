@@ -118,10 +118,9 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         data = await response.get_data()
         self.assertEqual(orjson.loads(data), {"converted": "config"})
-        # Test invalid YAML
-        # Expect 500 because the app currently lets YAMLError propagate
+        # Test invalid YAML: refused with 400 (test_api_auth checks the log)
         response = await self.client.post("/get-json", data=b": - invalid")
-        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.status_code, 400)
 
     @patch("emhass.web_server.replace_file", new_callable=AsyncMock)
     @patch("emhass.web_server.aiofiles.open")
@@ -526,8 +525,9 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         await web_server.clear_file_log()
         f.write.assert_called_with("")
 
+    @patch("emhass.web_server._configure_api_auth", new_callable=AsyncMock)
     @patch("emhass.web_server.initialize")
-    async def test_before_serving(self, mock_init):
+    async def test_before_serving(self, mock_init, _mock_auth):
         # Happy path
         await web_server.before_serving()
         mock_init.assert_called_once()
@@ -1266,8 +1266,11 @@ class TestBootTs(unittest.IsolatedAsyncioTestCase):
     mutate global "emhass" logger state and leak into other tests.
     """
 
+    @patch("emhass.web_server._configure_api_auth", new_callable=AsyncMock)
     @patch("emhass.web_server.initialize", new_callable=AsyncMock)
-    async def test_before_serving_sets_boot_ts_even_if_initialize_fails(self, mock_init):
+    async def test_before_serving_sets_boot_ts_even_if_initialize_fails(
+        self, mock_init, _mock_auth
+    ):
         mock_init.side_effect = RuntimeError("init boom")
         web_server.app.config.pop("boot_ts", None)
         await web_server.before_serving()  # before_serving catches the init error and continues
@@ -1296,6 +1299,105 @@ class TestHealthzSchema(unittest.TestCase):
         # required must list the contract keys, else a property is silently optional
         self.assertTrue(top_level.issubset(schema["required"]))
         self.assertTrue(version_keys.issubset(props["versions"]["required"]))
+
+
+class TestThermalCalibrationAndUiMetadata(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.client = web_server.app.test_client()
+        self._orig_data_path = web_server.emhass_conf.get("data_path")
+        web_server.emhass_conf["data_path"] = pathlib.Path("/tmp/test_data")
+
+    async def asyncTearDown(self):
+        if self._orig_data_path is None:
+            web_server.emhass_conf.pop("data_path", None)
+        else:
+            web_server.emhass_conf["data_path"] = self._orig_data_path
+
+    @patch("emhass.web_server._save_injection_dict", new_callable=AsyncMock)
+    @patch("emhass.web_server.get_injection_dict_thermal_calibration", return_value={"title": "ok"})
+    @patch("emhass.web_server.compute_thermal_model_calibration", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_thermal_model_calibration_success_and_error(
+        self, mock_load, mock_calib, mock_inj, mock_save
+    ):
+        mock_load.return_value = ("{}", "profit", "{}")
+        mock_calib.return_value = {"best_params": {}}
+        resp = await self.client.post("/action/thermal-model-calibration", json={})
+        self.assertEqual(resp.status_code, 200)
+        mock_save.assert_awaited_once()
+
+        mock_calib.side_effect = ValueError("bad sense")
+        resp_err = await self.client.post("/action/thermal-model-calibration", json={})
+        self.assertEqual(resp_err.status_code, 400)
+        self.assertIn("bad sense", await resp_err.get_data(as_text=True))
+
+    @patch("emhass.web_server.last_run.read")
+    def test_attach_ui_metadata_populates_load_history_quantiles_and_stages(self, mock_read):
+        idx = pd.date_range("2026-11-19 00:00", periods=4, freq="30min", tz="UTC")
+        opt_res = pd.DataFrame({"P_PV": [0.0, 100.0, 200.0, 0.0]}, index=idx)
+        df_hist = pd.DataFrame(
+            {"sensor.power_load_no_var_loads_positive": [400.0, 420.0, 410.0, 430.0]},
+            index=idx - pd.Timedelta(days=1),
+        )
+
+        class _Fcst:
+            last_pv_quantiles = {
+                "p50": pd.Series([0.0, 100.0, 200.0, 0.0], index=idx),
+                "p10": [0.0, 70.0, 140.0, 0.0],
+                "p90": None,
+                "bias": 0.3,
+                "source": "solcast",
+            }
+
+        # Persisted snapshot from a different action must not override current stage_times
+        mock_read.return_value = {
+            "status": "ok",
+            "action": "old-action",
+            "stage_times": {"pv_forecast": 9.9},
+            "duration_total_seconds": 9.9,
+        }
+        web_server._attach_ui_metadata(
+            opt_res,
+            {
+                "optim_conf": {
+                    "set_use_pv": True,
+                    "set_nodischarge_to_grid": True,
+                    "is_electric_load": [True, False],
+                },
+                "retrieve_hass_conf": {"optimization_time_step": pd.Timedelta(minutes=15)},
+                "df_input_data": df_hist,
+                "fcst": _Fcst(),
+                "stage_times": {"pv_forecast": 0.1, "optim_solve.build": 0.05, "optim_solve": 0.2},
+            },
+            action_name="dayahead-optim",
+        )
+        meta = opt_res.attrs["emhass_ui_meta"]
+        self.assertEqual(meta["optimization_time_step_hours"], 0.25)
+        self.assertEqual(meta["last_run"]["action"], "dayahead-optim")
+        self.assertAlmostEqual(meta["last_run"]["duration_total_seconds"], 0.3, places=4)
+        self.assertIsNotNone(meta["load_history_series"])
+        self.assertEqual(len(meta["pv_quantiles"]["timestamps"]), 4)
+        self.assertIsNone(meta["pv_quantiles"]["p90"])
+
+        # Matching persisted snapshot is reused; numeric step in minutes is also converted
+        mock_read.return_value = {
+            "status": "ok",
+            "action": "dayahead-optim",
+            "stage_times": {"pv_forecast": 0.1},
+            "duration_total_seconds": 0.12,
+        }
+        web_server._attach_ui_metadata(
+            opt_res,
+            {
+                "optim_conf": {},
+                "retrieve_hass_conf": {"optimization_time_step": 30},
+                "stage_times": {"pv_forecast": 0.1},
+            },
+            action_name="dayahead-optim",
+        )
+        meta2 = opt_res.attrs["emhass_ui_meta"]
+        self.assertEqual(meta2["optimization_time_step_hours"], 0.5)
+        self.assertEqual(meta2["last_run"]["duration_total_seconds"], 0.12)
 
 
 if __name__ == "__main__":

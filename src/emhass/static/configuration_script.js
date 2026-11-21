@@ -87,6 +87,20 @@ const INVERTER_SYNC_LIMIT = 100;
 //says (see updateInverterCurveAccess)
 const INVERTER_CURVE_PARAMS = ["inverter_power_curve_dc_ac", "inverter_power_curve_ac_dc"];
 
+const INVERTER_CARD_PARAMS = new Set([
+  "maximum_power_from_grid",
+  "maximum_power_to_grid",
+  "number_of_inverters",
+  "inverter_is_hybrid",
+  ...INVERTER_ARRAY_PARAMS,
+  ...INVERTER_CURVE_PARAMS,
+  "inverter_stress_segments",
+  "battery_inverter_index",
+  "pv_plant_inverter_index",
+]);
+
+let lastLoadedConfig = null;
+
 //a request still pending after this long fails with an error instead of leaving the page waiting
 //(browsers without AbortSignal.timeout keep waiting, as before)
 const REQUEST_TIMEOUT_MS = 30000;
@@ -98,15 +112,15 @@ window.onload = async function () {
   //obtain configuration from emhass (pull)
   let config = param_definitions && (await obtainConfig());
   //obtain configuration_list.html html as a template to dynamically to render parameters in a list view (parameters as input items)
-  let list_html = config && (await getListHTML());
+  let list_template = config && (await getListTemplate());
   //fail closed: a failed load is not an empty configuration. Render no form, allow no save, say how to recover
-  if (!list_html) {
+  if (!list_template) {
     document.getElementById("save").disabled = true;
     document.getElementById("alert-text").textContent += "\r\n\u2022 Reload the page to try again.";
     return;
   }
   //load list parameter page (default)
-  loadConfigurationListView(param_definitions, config, list_html);
+  loadConfigurationListView(param_definitions, config, list_template);
 
   //add event listener to save button
   document
@@ -122,15 +136,28 @@ window.onload = async function () {
   document
     .getElementById("defaults")
     .addEventListener("click", () =>
-      ToggleView(param_definitions, list_html, true)
+      ToggleView(param_definitions, list_template, true)
     );
 
   //add event listener to json-toggle button (toggle between json box and list view)
   document
     .getElementById("json-toggle")
     .addEventListener("click", () =>
-      ToggleView(param_definitions, list_html, false)
+      ToggleView(param_definitions, list_template, false)
     );
+
+  const yearEl = document.getElementById("current-year");
+  if (yearEl) {
+    yearEl.textContent = String(new Date().getFullYear());
+  }
+  const searchInput = document.getElementById("config-search-input");
+  if (searchInput) {
+    searchInput.addEventListener("input", () => applyConfigFilters());
+  }
+  const levelSelect = document.getElementById("config-level-filter");
+  if (levelSelect) {
+    levelSelect.addEventListener("change", () => applyConfigFilters());
+  }
 };
 
 //obtain file containing information about parameters (definitions)
@@ -205,35 +232,48 @@ async function readErrorLog(response) {
   return [`HTTP ${response.status}`];
 }
 
-//get html data from configuration_list.html (list template)
-//returns null when the template could not be obtained
-async function getListHTML() {
-  try {
-    const response = await fetch(`static/configuration_list.html`, {
-      cache: "no-cache", //revalidate: the template changes with the release
-      signal: AbortSignal.timeout?.(REQUEST_TIMEOUT_MS),
-    });
-    if (response.status !== 200 && response.status !== 201) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    let blob = await response.blob(); //get data blob
-    const html = await new Response(blob).text(); //obtain html from blob
-    //an empty template cannot render a form: report it instead of failing closed without a message
-    if (!html.trim()) {
-      throw new Error("the file is empty");
-    }
-    return html;
-  } catch (error) {
-    errorAlert(`Unable to obtain configuration_list.html file: ${error.message}`);
+// Sections (and their .section-body) that loadConfigurationListView() and the tab bar
+// rely on; configuration_list.html must provide every one of them.
+const REQUIRED_CONFIG_SECTIONS = [
+  "Local",
+  "System",
+  "Tariff",
+  "Solar System (PV)",
+  "Inverters",
+  "Battery",
+  "Deferrable Loads",
+];
+
+// The packaged configuration fragment is embedded in an inert HTML template
+// by the server. Clone parsed, trusted DOM nodes instead of parsing fetched HTML.
+// Fail closed (null) when the fragment is missing, empty or lacks a required section.
+function getListTemplate() {
+  const template = document.getElementById("configuration-list-template");
+  const content = template && template.content;
+  if (!content || typeof content.querySelectorAll !== "function") {
+    errorAlert("Unable to obtain the configuration list template.");
     return null;
   }
+  const present = new Set();
+  for (const card of content.querySelectorAll(".section-card")) {
+    if (card.querySelector(".section-body")) {
+      present.add(card.id);
+    }
+  }
+  const missing = REQUIRED_CONFIG_SECTIONS.filter((id) => !present.has(id));
+  if (missing.length > 0) {
+    errorAlert("The configuration list template is incomplete (missing: " + missing.join(", ") + ").");
+    return null;
+  }
+  return template;
 }
 
 //load list configuration view
-function loadConfigurationListView(param_definitions, config, list_html) {
-  if (list_html == null || config == null || param_definitions == null) {
+function loadConfigurationListView(param_definitions, config, list_template) {
+  if (list_template == null || config == null || param_definitions == null) {
     return 1;
   }
+  lastLoadedConfig = config;
 
   //list parameters used in the section headers
   //#610: number_of_batteries added to auto-sync the 15 per-battery array params
@@ -242,7 +282,7 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   let header_input_list = ["set_use_battery", "set_use_pv", "number_of_deferrable_loads", "number_of_batteries"];
 
   //get the main container and append list template html
-  document.getElementById("configuration-container").innerHTML = list_html;
+  document.getElementById("configuration-container").replaceChildren(list_template.content.cloneNode(true));
 
   //loop through configuration sections ('Local','System','Tariff','Solar System (PV)') in definitions file
   for (let section in param_definitions) {
@@ -286,72 +326,28 @@ function loadConfigurationListView(param_definitions, config, list_html) {
   //#1150: size the per-inverter lists to number_of_inverters
   setupInverterSync(param_definitions, config);
 
-  // Dynamic hiding for InfluxDB options
-  const use_influx_param = "use_influxdb";
-  const influx_related_params = [
-    "influxdb_host",
-    "influxdb_port",
-    "influxdb_username",
-    "influxdb_password",
-    "influxdb_database",
-    "influxdb_measurement",
-    "influxdb_retention_policy",
-    "influxdb_use_ssl",
-    "influxdb_verify_ssl"
-  ];
-
-  const influx_toggle_div = document.getElementById(use_influx_param);
-  if (influx_toggle_div) {
-    // The actual input is inside the div with the ID
-    const influx_input = influx_toggle_div.querySelector("input");
-    if (influx_input) {
-      const toggleInfluxVisibility = () => {
-        const isChecked = influx_input.checked;
-        influx_related_params.forEach(paramId => {
-          const paramDiv = document.getElementById(paramId);
-          if (paramDiv) {
-            paramDiv.style.display = isChecked ? "" : "none";
-          }
-        });
-      };
-
-      // Add listener and set initial state
-      influx_input.addEventListener("change", toggleInfluxVisibility);
-      toggleInfluxVisibility();
+  setupDynamicVisibility();
+  initConfigTabs();
+  setupThermalLoadsBuilder(config);
+  applyConfigFilters();
+  updateConfigSystemOverviewBadges(config);
+  const cfgContainer = document.getElementById("configuration-container");
+  if (
+    cfgContainer &&
+    typeof cfgContainer.addEventListener === "function" &&
+    !cfgContainer._boundOverviewBadges &&
+    (!cfgContainer.dataset || !cfgContainer.dataset.boundOverviewBadges)
+  ) {
+    cfgContainer._boundOverviewBadges = true;
+    if (cfgContainer.dataset) {
+      cfgContainer.dataset.boundOverviewBadges = "1";
     }
-  }
-
-  // ML Forecaster Visibility Logic
-  const forecast_method_param = "load_forecast_method";
-  const ml_related_params = [
-    "model_type",
-    "var_model",
-    "sklearn_model",
-    "regression_model",
-    "num_lags",
-    "split_date_delta",
-    "n_trials",
-    "perform_backtest"
-  ];
-
-  const forecast_method_div = document.getElementById(forecast_method_param);
-  if (forecast_method_div) {
-    const method_select = forecast_method_div.querySelector("select, input");
-    if (method_select) {
-      const toggleMLVisibility = () => {
-        const isML = method_select.value === "mlforecaster";
-        ml_related_params.forEach(paramId => {
-          const paramDiv = document.getElementById(paramId);
-          if (paramDiv) {
-            paramDiv.style.display = isML ? "" : "none";
-          }
-        });
-      };
-      // Add listener and set initial state
-      method_select.addEventListener("change", toggleMLVisibility);
-      method_select.addEventListener("input", toggleMLVisibility); // Handle both select and text input types
-      toggleMLVisibility();
-    }
+    cfgContainer.addEventListener("change", () =>
+      updateConfigSystemOverviewBadges(lastLoadedConfig)
+    );
+    cfgContainer.addEventListener("input", () =>
+      updateConfigSystemOverviewBadges(lastLoadedConfig)
+    );
   }
 }
 
@@ -364,12 +360,25 @@ function buildParamContainers(
 ) {
   //get the section container element
   let SectionContainer = document.getElementById(section);
+  if (SectionContainer == null) {
+    console.error("Unable to find Section container: " + section);
+    return 0;
+  }
   //get the body container inside the section (where the parameters will be appended)
   let SectionParamElement = SectionContainer.getElementsByClassName("section-body");
-  if (SectionContainer == null || SectionParamElement.length == 0) {
+  if (SectionParamElement.length == 0) {
     console.error("Unable to find Section container or Section Body");
     return 0;
   }
+
+  const invertersSection =
+    section === "System" ? document.getElementById("Inverters") : null;
+  const invertersBodies = invertersSection
+    ? invertersSection.getElementsByClassName("section-body")
+    : [];
+  const invertersTargetBody =
+    invertersBodies.length > 0 ? invertersBodies[0] : null;
+  let routedToInverters = false;
 
   //loop though the sections parameters in definition file, generate and append param (div) elements for the section
   for (const [
@@ -405,21 +414,10 @@ function buildParamContainers(
       continue;
     }
 
-    //if parameter type == array.*, append plus and minus buttons in param div so
-    //the user can grow/shrink the list. Three groups of array.* params are excluded
-    //because their length is managed elsewhere: the DEFERRABLE_ARRAY_PARAMS in
-    //the "Deferrable Loads" section (by number_of_deferrable_loads), the 15
-    //BATTERY_ARRAY_PARAMS in the "Battery" section (by number_of_batteries) and
-    //the INVERTER_ARRAY_PARAMS in the "System" section (by number_of_inverters,
-    //see setupInverterSync) - a free +/- button on those would desync their
-    //length and crash check_batt_params/check_def_loads (or be refused by
-    //check_inverter_params) on save. Any other array.* param in
-    //those sections (e.g. the #540 Part B capacity_cost_per_kw /
-    //capacity_charge_interval_timesteps in Battery, which are NOT per-battery)
-    //still gets the normal generic +/- controls - the allow-lists, not the
-    //section name, own cardinality.
-    let array_buttons = "";
-    if (
+    // Generic array controls are excluded when another header owns cardinality.
+    // Keep the original names in data attributes: a CSS class token cannot
+    // preserve whitespace (or other non-class-token characters) in an ID.
+    const has_array_buttons =
       parameter_definition_object["input"].search("array.") > -1 &&
       !(
         parameter_definition_object["input"] === "array.array.float" &&
@@ -427,34 +425,66 @@ function buildParamContainers(
       ) &&
       !(section == "Deferrable Loads" && DEFERRABLE_ARRAY_PARAMS.includes(parameter_definition_name)) &&
       !(section == "Battery" && BATTERY_ARRAY_PARAMS.includes(parameter_definition_name)) &&
-      !(section == "System" && INVERTER_ARRAY_PARAMS.includes(parameter_definition_name))
-    ) {
-      array_buttons = `
-                  <button type="button" class="input-plus ${parameter_definition_name}">+</button>
-                  <button type="button" class="input-minus ${parameter_definition_name}">-</button>
-                  <br>
-                  `;
+      !(section == "System" && INVERTER_ARRAY_PARAMS.includes(parameter_definition_name));
+
+    // Definition metadata must be DOM text, not interpolated HTML. This also
+    // avoids reparsing previously rendered siblings on each new parameter.
+    const param_container = document.createElement("div");
+    param_container.className = "param";
+    param_container.id = parameter_definition_name;
+
+    const heading = document.createElement("h5");
+    heading.textContent = String(parameter_definition_object["friendly_name"]) + ":";
+    const param_name = document.createElement("i");
+    param_name.textContent = parameter_definition_name;
+    param_container.append(heading, document.createTextNode(" "), param_name, document.createElement("br"));
+
+    if (has_array_buttons) {
+      const plus = document.createElement("button");
+      plus.type = "button";
+      plus.className = "input-plus";
+      plus.dataset.paramName = parameter_definition_name;
+      plus.textContent = "+";
+      const minus = document.createElement("button");
+      minus.type = "button";
+      minus.className = "input-minus";
+      minus.dataset.paramName = parameter_definition_name;
+      minus.textContent = "-";
+      param_container.append(plus, minus, document.createElement("br"));
     }
 
-    //generates and appends param container into section
-    //buildParamElement() builds the parameter input/s and returns html to append in param-input
-    SectionParamElement[0].innerHTML += `
-          <div class="param" id="${parameter_definition_name}">
-             <h5>${
-               parameter_definition_object["friendly_name"]
-             }:</h5> <i>${parameter_definition_name}</i> </br>
-              ${array_buttons}
-             <div class="param-input"> 
-                  ${buildParamElement(
-                    parameter_definition_object,
-                    parameter_definition_name,
-                    config
-                  )}
-             </div>
-              <p>${parameter_definition_object["Description"]}</p>
-          </div>
-          `;
+    const input_container = document.createElement("div");
+    input_container.className = "param-input";
+    // buildParamElement supplies only fixed markup and HTML-encodes all
+    // configuration/default/option values. Metadata above never enters this
+    // parser; it is written through textContent and DOM properties instead.
+    const input_range = document.createRange();
+    input_range.selectNodeContents(input_container);
+    input_container.append(
+      input_range.createContextualFragment(
+        buildParamElement(parameter_definition_object, parameter_definition_name, config)
+      )
+    );
+    param_container.append(input_container);
+
+    const description = document.createElement("p");
+    description.textContent = parameter_definition_object["Description"];
+    param_container.append(description);
+
+    const useInvertersCard =
+      invertersTargetBody !== null &&
+      INVERTER_CARD_PARAMS.has(parameter_definition_name);
+    if (useInvertersCard) {
+      routedToInverters = true;
+    }
+    const targetBody = useInvertersCard ? invertersTargetBody : SectionParamElement[0];
+    targetBody.append(param_container);
   }
+
+  const containerTargets =
+    routedToInverters && invertersSection
+      ? [SectionContainer, invertersSection]
+      : [SectionContainer];
 
   //after looping though, build and appending the parameters in the corresponding section:
   //create add button (array plus) event listeners
@@ -464,29 +494,31 @@ function buildParamContainers(
   //not in this function's scope - the generic +/- path threw ReferenceError on
   //click; it was only ever reached by load_peak_hour_periods until #540 Part B
   //routed capacity_cost_per_kw / capacity_charge_interval_timesteps through it.)
-  let plus = SectionContainer.querySelectorAll(".input-plus");
-  plus.forEach(function (answer) {
-    answer.addEventListener("click", () =>
-      plusElements(
-        answer.classList[1],
-        { [section]: section_parameters_definitions },
-        section,
-        {}
-      )
-    );
-  });
+  containerTargets.forEach(function (container) {
+    let plus = container.querySelectorAll(".input-plus");
+    plus.forEach(function (answer) {
+      answer.addEventListener("click", () =>
+        plusElements(
+          answer.dataset.paramName,
+          { [section]: section_parameters_definitions },
+          section,
+          {}
+        )
+      );
+    });
 
-  //create subtract button (array minus) event listeners
-  let minus = SectionContainer.querySelectorAll(".input-minus");
-  minus.forEach(function (answer) {
-    answer.addEventListener("click", () => minusElements(answer.classList[1]));
-  });
+    //create subtract button (array minus) event listeners
+    let minus = container.querySelectorAll(".input-minus");
+    minus.forEach(function (answer) {
+      answer.addEventListener("click", () => minusElements(answer.dataset.paramName));
+    });
 
-  //check initial checkbox state, check "value" of input and match to "checked" value
-  let checkbox = SectionContainer.querySelectorAll("input[type='checkbox']");
-  checkbox.forEach(function (answer) {
-    let value = answer.value === "true";
-    answer.checked = value;
+    //check initial checkbox state, check "value" of input and match to "checked" value
+    let checkbox = container.querySelectorAll("input[type='checkbox']");
+    checkbox.forEach(function (answer) {
+      let value = answer.value === "true";
+      answer.checked = value;
+    });
   });
 
   //loop though sections params again, check if param has a requirement, if so add a event listener to the required param input
@@ -546,8 +578,9 @@ function buildParamContainers(
   }
 }
 
-//HTML-encode a configuration-derived value for use inside a double-quoted
-//attribute or as element text, so it is always parsed as data (#1290).
+//HTML-encode configuration/default/option values for use in buildParamElement's
+//generated form controls. Definition metadata is assigned via DOM properties and
+//textContent instead of being parsed as HTML (#1374).
 //String() keeps the textual form template interpolation produced before.
 function escapeHtml(value) {
   return String(value)
@@ -870,9 +903,12 @@ function headerElement(element, param_definitions, config) {
           "number_of_batteries",
         ]);
         element.checked = true;
+        setupDynamicVisibility();
       } else {
         param_container.innerHTML = "";
+        applyConfigFilters();
       }
+      updateConfigSystemOverviewBadges(lastLoadedConfig || config);
       break;
 
     //if set_use_pv, add or remove PV section (inc. related params)
@@ -883,9 +919,12 @@ function headerElement(element, param_definitions, config) {
           "set_use_pv",
         ]);
         element.checked = true;
+        setupDynamicVisibility();
       } else {
         param_container.innerHTML = "";
+        applyConfigFilters();
       }
+      updateConfigSystemOverviewBadges(lastLoadedConfig || config);
       break;
 
     //if number_of_deferrable_loads, the number of inputs in the "Deferrable Loads" section should add up to number_of_deferrable_loads value in header
@@ -983,7 +1022,11 @@ function parseInverterCount(raw) {
 
 //#1150: the first input of a param row, or undefined when the row is missing
 function paramInputOf(param_id) {
-  return document.getElementById(param_id)?.getElementsByClassName("param_input")[0];
+  const el = document.getElementById(param_id);
+  if (!el || typeof el.getElementsByClassName !== "function") {
+    return undefined;
+  }
+  return el.getElementsByClassName("param_input")[0];
 }
 
 //#1150: keep the INVERTER_ARRAY_PARAMS at number_of_inverters entries, the way
@@ -1279,6 +1322,22 @@ async function saveConfiguration(param_definitions) {
         }
       }
     }
+    const builtThermalList =
+      typeof buildThermalLoadsConfig === "function"
+        ? buildThermalLoadsConfig()
+        : null;
+    if (builtThermalList !== null) {
+      const hasThermalModel = builtThermalList.some(
+        (entry) => entry && Object.keys(entry).length > 0
+      );
+      const hadExistingThermal =
+        typeof lastLoadedConfig !== "undefined" &&
+        lastLoadedConfig &&
+        Array.isArray(lastLoadedConfig.def_load_config);
+      if (hasThermalModel || hadExistingThermal) {
+        config["def_load_config"] = builtThermalList;
+      }
+    }
   }
 
   //if box view, extract json from box view
@@ -1325,7 +1384,7 @@ async function saveConfiguration(param_definitions) {
 }
 
 //Toggle between box (json) and list view
-async function ToggleView(param_definitions, list_html, default_reset) {
+async function ToggleView(param_definitions, list_template, default_reset) {
   let selected = "";
   config = {};
 
@@ -1368,16 +1427,26 @@ async function ToggleView(param_definitions, list_html, default_reset) {
   //remove contents of current view
   configuration_container.innerHTML = "";
   //build new view
+  const filterBar =
+    typeof document.querySelector === "function"
+      ? document.querySelector(".config-filter-bar")
+      : null;
   switch (selected) {
     case "box":
       //load list
-      loadConfigurationListView(param_definitions, config, list_html);
+      loadConfigurationListView(param_definitions, config, list_template);
       yaml_button.style.display = "none";
+      if (filterBar) {
+        filterBar.style.display = "";
+      }
       break;
     case "list":
       //load box
       loadConfigurationBoxPage(config);
       yaml_button.style.display = "block";
+      if (filterBar) {
+        filterBar.style.display = "none";
+      }
       break;
   }
 }
@@ -1391,15 +1460,27 @@ async function loadConfigurationBoxPage(config) {
   }
   //append configuration container with textbox area
   configuration_container.innerHTML = `
-      <textarea id="config-box" rows="30" placeholder="{}"></textarea>
+      <textarea id="config-box" rows="30" placeholder="{}" aria-label="Configuration JSON or YAML text editor"></textarea>
       `;
   //set created textarea box with retrieved config
   //.value, not innerHTML: a textarea's HTML parsing would decode &amp; etc. in the data (#1290)
-  document.getElementById("config-box").value = JSON.stringify(
-    config,
-    null,
-    2
-  );
+  const box = document.getElementById("config-box");
+  box.value = JSON.stringify(config, null, 2);
+  lastLoadedConfig = config;
+  updateConfigSystemOverviewBadges(config);
+  if (typeof box.addEventListener === "function") {
+    box.addEventListener("input", () => {
+      try {
+        const parsed = JSON.parse(box.value);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          lastLoadedConfig = parsed;
+          updateConfigSystemOverviewBadges(parsed);
+        }
+      } catch (_err) {
+        // ignore incomplete JSON/YAML while editing
+      }
+    });
+  }
 }
 
 //function in control of status icons and alert box from a fetch request
@@ -1411,6 +1492,7 @@ async function showChangeStatus(status, logJson) {
   }
   if (status === 200 || status === 201) {
     //if status is 200 or 201, then show a tick
+    loading.classList.remove("loading");
     loading.innerHTML = `<p class=tick>&#x2713;</p>`;
     //a request that succeeds ends the failure shown for the one before it
     document.getElementById("alert").style.display = "none";
@@ -1459,7 +1541,7 @@ async function yamlToJson() {
       body: config_box_element.value,
     });
     let response_status = response.status; //return status
-    if (response_status == 201) {
+    if (response_status == 200 || response_status == 201) {
       showChangeStatus(response_status, {});
       let blob = await response.blob(); //get data blob
       config = await new Response(blob).json(); //obtain json from blob
@@ -1469,4 +1551,1060 @@ async function yamlToJson() {
     }
   }
   return 0;
+}
+
+const BASIC_PARAM_IDS = new Set([
+  "costfun",
+  "optimization_time_step",
+  "historic_days_to_retrieve",
+  "delta_forecast_daily",
+  "load_forecast_method",
+  "sensor_power_photovoltaics",
+  "sensor_power_load_no_var_loads",
+  "load_cost_forecast_method",
+  "load_peak_hour_periods",
+  "load_peak_hours_cost",
+  "load_offpeak_hours_cost",
+  "production_price_forecast_method",
+  "photovoltaic_production_sell_price",
+  "capacity_cost_per_kw",
+  "capacity_charge_interval_timesteps",
+  "set_use_pv",
+  "weather_forecast_method",
+  "pv_module_model",
+  "pv_inverter_model",
+  "surface_tilt",
+  "surface_azimuth",
+  "modules_per_string",
+  "strings_per_inverter",
+  "inverter_ac_output_max",
+  "maximum_power_from_grid",
+  "maximum_power_to_grid",
+  "set_use_battery",
+  "number_of_batteries",
+  "battery_nominal_energy_capacity",
+  "battery_discharge_power_max",
+  "battery_charge_power_max",
+  "battery_minimum_state_of_charge",
+  "battery_maximum_state_of_charge",
+  "battery_target_state_of_charge",
+  "number_of_deferrable_loads",
+  "nominal_power_of_deferrable_loads",
+  "operating_hours_of_each_deferrable_load",
+  "start_timesteps_of_each_deferrable_load",
+  "end_timesteps_of_each_deferrable_load",
+  "continual_publish",
+  "logging_level",
+]);
+
+let activeConfigTab = "all";
+
+function initConfigTabs() {
+  if (typeof document.querySelectorAll !== "function") {
+    return;
+  }
+  const buttons = Array.from(document.querySelectorAll(".config-tab-btn"));
+  const cards = Array.from(document.querySelectorAll(".section-card"));
+  if (!buttons.length || !cards.length) {
+    return;
+  }
+
+  function selectTab(tabId) {
+    activeConfigTab = tabId;
+    buttons.forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset?.configTab === tabId);
+    });
+    cards.forEach((card) => {
+      card.style.display = tabId === "all" || card.id === tabId ? "" : "none";
+    });
+  }
+
+  buttons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      selectTab(btn.dataset?.configTab || "all");
+      applyConfigFilters();
+    });
+  });
+
+  selectTab(activeConfigTab);
+}
+
+function resolveControllerInput(controllerId) {
+  const controllerDiv = document.getElementById(controllerId);
+  if (!controllerDiv) {
+    return null;
+  }
+  if (controllerDiv.tagName === "INPUT" || controllerDiv.tagName === "SELECT") {
+    return controllerDiv;
+  }
+  return typeof controllerDiv.querySelector === "function"
+    ? controllerDiv.querySelector("input, select")
+    : null;
+}
+
+function setupDynamicVisibility() {
+  const rules = [
+    {
+      controller: "use_influxdb",
+      targets: [
+        "influxdb_host",
+        "influxdb_port",
+        "influxdb_username",
+        "influxdb_password",
+        "influxdb_database",
+        "influxdb_measurement",
+        "influxdb_retention_policy",
+        "influxdb_use_ssl",
+        "influxdb_verify_ssl",
+      ],
+      when: (el) => Boolean(el.checked),
+    },
+    {
+      controller: "use_victoriametrics",
+      targets: [
+        "victoriametrics_host",
+        "victoriametrics_port",
+        "victoriametrics_database",
+        "victoriametrics_metric_regex",
+        "victoriametrics_entity_label",
+        "victoriametrics_use_ssl",
+        "victoriametrics_verify_ssl",
+      ],
+      when: (el) => Boolean(el.checked),
+    },
+    {
+      controller: "load_forecast_method",
+      targets: [
+        "mlforecaster_weather_features",
+        "model_type",
+        "var_model",
+        "sklearn_model",
+        "regression_model",
+        "num_lags",
+        "split_date_delta",
+        "n_trials",
+        "perform_backtest",
+      ],
+      when: (el) => el.value === "mlforecaster",
+    },
+    {
+      controller: "optimization_backend",
+      targets: ["site"],
+      when: (el) => el.value === "dantzig_wolfe",
+    },
+    {
+      controller: "load_cost_forecast_method",
+      targets: [
+        "load_peak_hour_periods",
+        "tariff_schedule_time_zone",
+        "load_peak_hours_cost",
+        "load_offpeak_hours_cost",
+      ],
+      when: (el) => el.value === "hp_hc_periods",
+    },
+    {
+      controller: "production_price_forecast_method",
+      targets: ["photovoltaic_production_sell_price"],
+      when: (el) => el.value === "constant",
+    },
+    {
+      controller: "set_use_adjusted_pv",
+      targets: [
+        "adjusted_pv_regression_model",
+        "adjusted_pv_solar_elevation_threshold",
+        "adjusted_pv_model_max_age",
+      ],
+      when: (el) => Boolean(el.checked),
+    },
+    {
+      controller: "weather_forecast_method",
+      targets: ["open_meteo_cache_max_age"],
+      when: (el) => el.value === "open-meteo",
+    },
+    {
+      controller: "weather_forecast_method",
+      targets: ["weather_forecast_pv_quantile_bias"],
+      when: (el) => el.value === "solcast",
+    },
+    {
+      controller: "set_use_battery_identification",
+      targets: [
+        "battery_identification_trust_tier",
+        "battery_identification_model_max_age",
+      ],
+      when: (el) => Boolean(el.checked),
+    },
+    {
+      controller: "set_battery_dynamic",
+      targets: ["battery_dynamic_max", "battery_dynamic_min"],
+      when: (el) => Boolean(el.checked),
+    },
+    {
+      controller: "cop_solver",
+      targets: ["cop_solver_tolerance", "cop_hx_approach"],
+      when: (el) => el.value !== "static",
+    },
+    {
+      controller: "inverter_is_hybrid",
+      targets: ["inverter_ac_input_max", "inverter_efficiency_ac_dc"],
+      when: (el) => Boolean(el.checked),
+    },
+    {
+      controller: "inverter_is_hybrid",
+      targets: ["inverter_power_curve_ac_dc"],
+      when: (el) => {
+        const count = parseInverterCount(paramInputOf("number_of_inverters")?.value);
+        return Boolean(el.checked) || (count !== null && count > 1);
+      },
+    },
+    {
+      controller: "number_of_inverters",
+      targets: ["inverter_power_curve_ac_dc"],
+      when: (el) => {
+        const count = parseInverterCount(el.value);
+        const hybrid = Boolean(paramInputOf("inverter_is_hybrid")?.checked);
+        return hybrid || (count !== null && count > 1);
+      },
+    },
+  ];
+
+  function evaluateAllRules() {
+    const targetVisibility = new Map();
+    rules.forEach((rule) => {
+      const ctrl = resolveControllerInput(rule.controller);
+      if (!ctrl) {
+        return;
+      }
+      const visible = rule.when(ctrl);
+      rule.targets.forEach((targetId) => {
+        // Track whether at least one matching rule says visible, vs hidden
+        if (!targetVisibility.has(targetId)) {
+          targetVisibility.set(targetId, visible);
+        } else if (visible) {
+          targetVisibility.set(targetId, true);
+        }
+      });
+    });
+
+    targetVisibility.forEach((visible, targetId) => {
+      const el = document.getElementById(targetId);
+      if (!el || !el.dataset) {
+        return;
+      }
+      el.dataset.dynamicHidden = visible ? "0" : "1";
+    });
+    applyConfigFilters();
+  }
+
+  const boundControllers = new Set();
+  rules.forEach((rule) => {
+    if (boundControllers.has(rule.controller)) {
+      return;
+    }
+    const ctrl = resolveControllerInput(rule.controller);
+    if (!ctrl) {
+      return;
+    }
+    boundControllers.add(rule.controller);
+    const alreadyBound =
+      Boolean(ctrl._boundDynVis) ||
+      ctrl.dataset?.boundDynVis === "1";
+    if (!alreadyBound && typeof ctrl.addEventListener === "function") {
+      ctrl._boundDynVis = true;
+      if (ctrl.dataset) {
+        ctrl.dataset.boundDynVis = "1";
+      }
+      ctrl.addEventListener("change", evaluateAllRules);
+      ctrl.addEventListener("input", evaluateAllRules);
+    }
+  });
+
+  evaluateAllRules();
+}
+
+function applyConfigFilters() {
+  if (typeof document.querySelectorAll !== "function") {
+    return;
+  }
+  const searchEl = document.getElementById("config-search-input");
+  const levelEl = document.getElementById("config-level-filter");
+  const query = searchEl ? searchEl.value.trim().toLowerCase() : "";
+  const level = levelEl ? levelEl.value : "all";
+
+  const params = Array.from(document.querySelectorAll(".section-card .param"));
+  params.forEach((paramDiv) => {
+    const paramId = paramDiv.id || "";
+    const text = paramDiv.textContent ? paramDiv.textContent.toLowerCase() : "";
+    const dynHidden = paramDiv.dataset?.dynamicHidden === "1";
+    const matchQuery = !query || paramId.toLowerCase().includes(query) || text.includes(query);
+    const matchLevel = level === "all" || BASIC_PARAM_IDS.has(paramId);
+
+    // Explicit search surfaces matching parameters even if collapsed by a dynamic toggle
+    const show = query ? matchQuery && matchLevel : !dynHidden && matchLevel;
+    paramDiv.style.display = show ? "" : "none";
+  });
+
+  const cards = Array.from(document.querySelectorAll(".section-card"));
+  cards.forEach((card) => {
+    if (activeConfigTab !== "all" && card.id !== activeConfigTab && !query) {
+      card.style.display = "none";
+      return;
+    }
+    if (!query) {
+      card.style.display = activeConfigTab === "all" || card.id === activeConfigTab ? "" : "none";
+      return;
+    }
+    const visibleParams = Array.from(card.querySelectorAll(".param")).some(
+      (p) => p.style.display !== "none"
+    );
+    card.style.display = visibleParams ? "" : "none";
+  });
+}
+
+let thermalLoadStates = [];
+
+function parseTempArrayText(raw) {
+  if (Array.isArray(raw)) {
+    return raw.map((x) => {
+      if (x === null || x === undefined || x === "") {
+        return null;
+      }
+      const n = Number(x);
+      return Number.isFinite(n) ? n : null;
+    });
+  }
+  const str = String(raw || "").trim();
+  if (!str) {
+    return [];
+  }
+  if (str.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(str);
+      if (Array.isArray(parsed)) {
+        return parsed.map((x) => {
+          if (x === null || x === undefined || x === "") {
+            return null;
+          }
+          const n = Number(x);
+          return Number.isFinite(n) ? n : null;
+        });
+      }
+    } catch (_err) {
+      // fall through to CSV split
+    }
+  }
+  const tokens = [];
+  for (const chunk of str.split(/[,;]/)) {
+    const trimmed = chunk.trim();
+    if (!trimmed) {
+      tokens.push("");
+    } else if (/\s/.test(trimmed)) {
+      tokens.push(...trimmed.split(/\s+/));
+    } else {
+      tokens.push(trimmed);
+    }
+  }
+  return tokens.map((token) => {
+    if (!token || token.toLowerCase() === "null" || token.toLowerCase() === "none") {
+      return null;
+    }
+    const n = Number(token);
+    return Number.isFinite(n) ? n : null;
+  });
+}
+
+// 7 days at 1-minute resolution: upper guard against accidental huge allocations
+const MAX_THERMAL_SCHEDULE_STEPS = 7 * 24 * 60;
+
+function getLocalHourInTimeZone(dateObj, timeZone) {
+  if (timeZone && typeof Intl !== "undefined" && Intl.DateTimeFormat) {
+    try {
+      const parts = new Intl.DateTimeFormat("en-GB", {
+        timeZone,
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      }).formatToParts(dateObj);
+      const hPart = parts.find((p) => p.type === "hour");
+      const mPart = parts.find((p) => p.type === "minute");
+      if (hPart && mPart) {
+        return Number(hPart.value) + Number(mPart.value) / 60;
+      }
+    } catch (_err) {
+      // fall back to local Date methods if timeZone string is invalid
+    }
+  }
+  return dateObj.getHours() + dateObj.getMinutes() / 60;
+}
+
+function getDstAdjustedHorizonSteps(stepMin, days, firstStepDate, timeZone) {
+  if (!Number.isFinite(stepMin) || stepMin <= 0 || !Number.isFinite(days) || days <= 0) {
+    return null;
+  }
+  const baseDate = firstStepDate instanceof Date ? firstStepDate : new Date();
+  const startMs = baseDate.getTime();
+  const wholeDays = Math.max(1, Math.floor(days));
+  const endDate = new Date(
+    baseDate.getFullYear(),
+    baseDate.getMonth(),
+    baseDate.getDate() + wholeDays,
+    baseDate.getHours(),
+    baseDate.getMinutes(),
+    0,
+    0
+  );
+  // If browser timezone differs from configured IANA zone, compute calendar end via elapsed approx
+  // refined to match local hour across DST transitions.
+  let endMs = endDate.getTime();
+  if (timeZone && typeof Intl !== "undefined" && Intl.DateTimeFormat) {
+    try {
+      const targetHour = getLocalHourInTimeZone(baseDate, timeZone);
+      let guessMs = startMs + wholeDays * 24 * 3600 * 1000;
+      for (const offsetMin of [0, -60, 60, -30, 30]) {
+        const cand = new Date(guessMs + offsetMin * 60000);
+        if (Math.abs(getLocalHourInTimeZone(cand, timeZone) - targetHour) < 1e-3) {
+          endMs = cand.getTime();
+          break;
+        }
+      }
+    } catch (_err) {
+      // keep endDate
+    }
+  }
+  const totalMin = Math.max(stepMin, Math.round((endMs - startMs) / 60000));
+  return Math.max(1, Math.round(totalMin / stepMin));
+}
+
+function getConfiguredHorizonSteps() {
+  const stepEl = paramInputOf("optimization_time_step");
+  const daysEl = paramInputOf("delta_forecast_daily");
+  const stepMin = stepEl ? Number(stepEl.value) : 30;
+  const days = daysEl ? Number(daysEl.value) : 1;
+  if (!Number.isFinite(stepMin) || stepMin <= 0 || !Number.isFinite(days) || days <= 0) {
+    return 48;
+  }
+  const tz = paramInputOf("time_zone")?.value || lastLoadedConfig?.time_zone || "";
+  const steps = getDstAdjustedHorizonSteps(stepMin, days, new Date(), tz);
+  return steps ?? Math.max(1, Math.round((days * 24 * 60) / stepMin));
+}
+
+function buildZonedStepDate(referenceDate, targetHour, timeZone) {
+  const h = Math.floor(targetHour);
+  const m = Math.round((targetHour % 1) * 60);
+  if (timeZone && typeof Intl !== "undefined" && Intl.DateTimeFormat) {
+    try {
+      const fmt = new Intl.DateTimeFormat("en-GB", {
+        timeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      });
+      const getParts = (d) => {
+        const map = {};
+        for (const p of fmt.formatToParts(d)) {
+          map[p.type] = Number(p.value);
+        }
+        return map;
+      };
+      const ref = getParts(referenceDate);
+      const targetUtcMs = Date.UTC(ref.year, ref.month - 1, ref.day, h, m, 0, 0);
+      let guessMs = targetUtcMs;
+      for (let iter = 0; iter < 2; iter++) {
+        const cur = getParts(new Date(guessMs));
+        const curAsUtcMs = Date.UTC(cur.year, cur.month - 1, cur.day, cur.hour, cur.minute, 0, 0);
+        const diffMs = targetUtcMs - curAsUtcMs;
+        if (diffMs === 0) {
+          break;
+        }
+        guessMs += diffMs;
+      }
+      return new Date(guessMs);
+    } catch (_err) {
+      // fall back to browser local timezone if timeZone string is invalid
+    }
+  }
+  return new Date(
+    referenceDate.getFullYear(),
+    referenceDate.getMonth(),
+    referenceDate.getDate(),
+    h,
+    m,
+    0,
+    0
+  );
+}
+
+function buildDayNightTempArrays(opts) {
+  const stepEl = paramInputOf("optimization_time_step");
+  const daysEl = paramInputOf("delta_forecast_daily");
+  const stepMin = stepEl ? Number(stepEl.value) : 30;
+  const days = daysEl ? Number(daysEl.value) : 1;
+  if (!Number.isFinite(stepMin) || stepMin <= 0) {
+    return { error: "optimization_time_step must be a positive number of minutes." };
+  }
+  if (!Number.isFinite(days) || days <= 0) {
+    return { error: "delta_forecast_daily must be a positive number of days." };
+  }
+  const rawStart = Number(opts.dayStartHour);
+  const rawEnd = Number(opts.dayEndHour);
+  const rawFirst = Number(opts.firstStepHour);
+  const startH = Number.isFinite(rawStart) ? rawStart : 7;
+  const endH = Number.isFinite(rawEnd) ? rawEnd : 22;
+  const firstStepHour = Number.isFinite(rawFirst) ? rawFirst : 0;
+  const tz =
+    opts.timeZone || paramInputOf("time_zone")?.value || lastLoadedConfig?.time_zone || "";
+
+  const now = opts.referenceDate instanceof Date ? opts.referenceDate : new Date();
+  const firstStepDate = buildZonedStepDate(now, firstStepHour, tz);
+  const horizon =
+    Number.isFinite(Number(opts.horizon)) && Number(opts.horizon) > 0
+      ? Number(opts.horizon)
+      : getDstAdjustedHorizonSteps(stepMin, days, firstStepDate, tz);
+  if (!Number.isFinite(horizon) || horizon < 1 || horizon > MAX_THERMAL_SCHEDULE_STEPS) {
+    return {
+      error: `Computed thermal schedule length (${horizon}) exceeds the supported limit (${MAX_THERMAL_SCHEDULE_STEPS} steps). Check optimization_time_step and delta_forecast_daily.`,
+    };
+  }
+  const minDay = Number(opts.minDay);
+  const minNight = Number(opts.minNight);
+  const maxDay = Number(opts.maxDay);
+  const maxNight = Number(opts.maxNight);
+
+  const minArr = [];
+  const maxArr = [];
+  const startMs = firstStepDate.getTime();
+  for (let i = 0; i < horizon; i++) {
+    const stepDate = new Date(startMs + i * stepMin * 60000);
+    const hour = getLocalHourInTimeZone(stepDate, tz);
+    const isDay =
+      startH <= endH ? hour >= startH && hour < endH : hour >= startH || hour < endH;
+    minArr.push(isDay ? minDay : minNight);
+    maxArr.push(isDay ? maxDay : maxNight);
+  }
+  return { minArr, maxArr };
+}
+
+function renderThermalLoadCards(builderEl, count) {
+  while (thermalLoadStates.length < count) {
+    thermalLoadStates.push({ kind: "standard", extra: {} });
+  }
+
+  // Saved configuration values enter DOM properties, never HTML parsing sinks.
+  const element = (tag, cls = "", text = null) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== null) node.textContent = String(text);
+    return node;
+  };
+  const input = (type, attributes = {}) => {
+    const node = document.createElement("input");
+    node.type = type;
+    for (const [name, value] of Object.entries(attributes)) {
+      if (name === "value") node.value = String(value);
+      else node.setAttribute(name, String(value));
+    }
+    return node;
+  };
+  const field = (parent, labelText, type, value, fieldName, ariaLabel, step) => {
+    const label = element("label", "", labelText);
+    const attrs = { "data-field": fieldName, value, "aria-label": ariaLabel };
+    if (step !== undefined) attrs.step = step;
+    label.append(input(type, attrs));
+    parent.append(label);
+  };
+  const scheduleField = (parent, cls, value, title, aria, step, bounds) => {
+    const attrs = { class: cls, value, title, "aria-label": aria };
+    if (step !== undefined) attrs.step = step;
+    if (bounds) { attrs.min = bounds[0]; attrs.max = bounds[1]; }
+    parent.append(input("number", attrs));
+  };
+  const temperatureFields = (card, minStr, maxStr, idx) => {
+    const group = element("div", "thermal-array-fields");
+    field(group, "min_temperatures (comma-separated °C)", "text", minStr,
+      "min_temperatures", "Load " + idx + " min temperatures");
+    field(group, "max_temperatures (comma-separated °C)", "text", maxStr,
+      "max_temperatures", "Load " + idx + " max temperatures");
+    card.append(group);
+  };
+  const schedule = (card, idx, isBattery) => {
+    const helper = element("div", "thermal-schedule-helper");
+    helper.append(element("span", "",
+      "Day/Night Comfort Schedule (" + getConfiguredHorizonSteps() + " steps):"));
+    const fields = element("div", "thermal-schedule-inputs");
+    const hours = [0, 23];
+    fields.append(document.createTextNode("Start h: "));
+    scheduleField(fields, "sched-first-hour", 0, "First optimization step hour (0-23)",
+      "Load " + idx + " first step hour", undefined, hours);
+    fields.append(document.createTextNode("h | "));
+    scheduleField(fields, "sched-day-start", 7, "Day start hour",
+      "Load " + idx + " day start hour", undefined, hours);
+    fields.append(document.createTextNode("h–"));
+    scheduleField(fields, "sched-day-end", 22, "Day end hour",
+      "Load " + idx + " day end hour", undefined, hours);
+    fields.append(document.createTextNode("h | Min D/N: "));
+    scheduleField(fields, "sched-min-day", 20, "",
+      "Load " + idx + " day min temperature", 0.5);
+    fields.append(document.createTextNode(" / "));
+    scheduleField(fields, "sched-min-night", isBattery ? 18.5 : 18, "",
+      "Load " + idx + " night min temperature", 0.5);
+    fields.append(document.createTextNode(" °C | Max: "));
+    scheduleField(fields, "sched-max-day", isBattery ? 26 : 23, "",
+      "Load " + idx + " max temperature", 0.5);
+    fields.append(document.createTextNode(" °C "));
+    const button = element("button", "tool-btn apply-sched-btn", "Fill Schedule");
+    button.type = "button";
+    button.dataset.loadIndex = String(idx);
+    fields.append(button);
+    helper.append(fields);
+    card.append(helper);
+  };
+
+  const heading = element("div", "thermal-builder-header");
+  const title = element("h4");
+  title.append(document.createTextNode("Thermal & Heat Pump Model Configurator ("));
+  title.append(element("code", "", "def_load_config"));
+  title.append(document.createTextNode(")"));
+  const info = element("p", "section-hint");
+  info.append(document.createTextNode("Configure Simple Thermal Models ("));
+  info.append(element("code", "", "thermal_config"));
+  info.append(document.createTextNode(") or Heat Pumps ("));
+  info.append(element("code", "", "thermal_battery"));
+  info.append(document.createTextNode(") per load with a Day/Night comfort schedule generator anchored to your first optimization step hour."));
+  heading.append(title, info);
+  builderEl.replaceChildren(heading);
+
+  if (count <= 0) {
+    builderEl.append(element("p", "muted-hint",
+      "Set Number of Loads > 0 to configure deferrable or thermal loads."));
+    return;
+  }
+
+  const grid = element("div", "thermal-cards-grid");
+  for (let idx = 0; idx < count; idx++) {
+    const state = thermalLoadStates[idx] || { kind: "standard", extra: {} };
+    const tc = state.thermal_config || {};
+    const tb = state.thermal_battery || {};
+    const extraKeys = state.extra ? Object.keys(state.extra) : [];
+    const card = element("div", "thermal-load-card");
+    card.dataset.loadIndex = String(idx);
+    const head = element("div", "thermal-load-card-head");
+    head.append(element("strong", "", "Load " + idx));
+    const select = element("select", "thermal-kind-select form-select");
+    select.dataset.loadIndex = String(idx);
+    select.setAttribute("aria-label", "Deferrable load " + idx + " thermal model type");
+    const options = [
+      ["standard", "Standard Deferrable Load ({})"],
+      ["thermal_config", "Simple Thermal Load (thermal_config)"],
+      ["thermal_battery", "Heat Pump / Thermal Battery (thermal_battery)"],
+    ];
+    if (state.kind === "passthrough") {
+      options.push(["passthrough", "Custom / Preserved Entry (" + extraKeys.join(", ") + ")"]);
+    }
+    for (const [value, label] of options) {
+      const option = element("option", "", label);
+      option.value = value;
+      option.selected = value === state.kind;
+      select.append(option);
+    }
+    head.append(select);
+    card.append(head);
+
+    if (state.kind === "passthrough") {
+      card.append(element("p", "muted-hint",
+        "Preserving existing configuration keys: " + extraKeys.join(", ") +
+        ". Switch model type above only if you intend to replace them."));
+    } else if (state.kind === "standard") {
+      const hint = element("p", "muted-hint",
+        "Standard electrical load (no thermal envelope simulation attached; exports as ");
+      hint.append(element("code", "", "{}"));
+      hint.append(document.createTextNode(")."));
+      card.append(hint);
+    } else if (state.kind === "thermal_config") {
+      const fields = element("div", "thermal-fields-grid");
+      field(fields, "Heating rate (°C/h)", "number", tc.heating_rate ?? 5.0,
+        "heating_rate", "Load " + idx + " heating rate", "any");
+      field(fields, "Cooling constant", "number", tc.cooling_constant ?? 0.1,
+        "cooling_constant", "Load " + idx + " cooling constant", "any");
+      field(fields, "Thermal inertia (h)", "number", tc.thermal_inertia ?? 0.0,
+        "thermal_inertia", "Load " + idx + " thermal inertia", "any");
+      field(fields, "Start temp (°C)", "number", tc.start_temperature ?? 20.0,
+        "start_temperature", "Load " + idx + " start temperature", "any");
+      const senseLabel = element("label", "", "Sense");
+      const senseSelect = element("select");
+      senseSelect.dataset.field = "sense";
+      senseSelect.setAttribute("aria-label", "Load " + idx + " thermal sense");
+      for (const mode of ["heat", "cool"]) {
+        const option = element("option", "", mode);
+        option.value = mode;
+        option.selected = (tc.sense || "heat") === mode;
+        senseSelect.append(option);
+      }
+      senseLabel.append(senseSelect);
+      fields.append(senseLabel);
+      card.append(fields);
+      schedule(card, idx, false);
+      const mins = Array.isArray(tc.min_temperatures)
+        ? tc.min_temperatures.map(v => v === null ? "null" : String(v)).join(", ") : "20";
+      const maxes = Array.isArray(tc.max_temperatures)
+        ? tc.max_temperatures.map(v => v === null ? "null" : String(v)).join(", ") : "24";
+      temperatureFields(card, mins, maxes, idx);
+    } else if (state.kind === "thermal_battery") {
+      const fields = element("div", "thermal-fields-grid");
+      const specs = [
+        ["Supply temp (°C)", "supply_temperature", 35.0, "supply temperature"],
+        ["Buffer volume (m³/unit)", "volume", 14.91, "volume"],
+        ["Start temp (°C)", "start_temperature", 22.0, "start temperature"],
+        ["Carnot efficiency", "carnot_efficiency", 0.45, "Carnot efficiency"],
+        ["U-value", "u_value", 0.326, "U-value"],
+        ["Envelope area (m²)", "envelope_area", 649.4, "envelope area"],
+        ["Ventilation rate", "ventilation_rate", 0.12, "ventilation rate"],
+        ["Heated volume (m³)", "heated_volume", 573.5, "heated volume"],
+      ];
+      for (const [label, name, fallback, aria] of specs) {
+        field(fields, label, "number", tb[name] ?? fallback, name,
+          "Load " + idx + " " + aria, "any");
+      }
+      card.append(fields);
+      schedule(card, idx, true);
+      const mins = Array.isArray(tb.min_temperatures)
+        ? tb.min_temperatures.map(v => v === null ? "null" : String(v)).join(", ") : "20";
+      const maxes = Array.isArray(tb.max_temperatures)
+        ? tb.max_temperatures.map(v => v === null ? "null" : String(v)).join(", ") : "26";
+      temperatureFields(card, mins, maxes, idx);
+    }
+    grid.append(card);
+  }
+  builderEl.append(grid);
+
+  builderEl.querySelectorAll(".thermal-kind-select").forEach((sel) => {
+    sel.addEventListener("change", () => {
+      const i = Number(sel.dataset?.loadIndex);
+      const kind = sel.value;
+      const existingExtra = thermalLoadStates[i] ? thermalLoadStates[i].extra || {} : {};
+      if (kind === "passthrough") {
+        thermalLoadStates[i] = { kind: "passthrough", extra: existingExtra };
+      } else if (kind === "standard") {
+        thermalLoadStates[i] = { kind: "standard", extra: {} };
+      } else if (kind === "thermal_config") {
+        thermalLoadStates[i] = {
+          kind: "thermal_config",
+          extra: existingExtra,
+          thermal_config: thermalLoadStates[i].thermal_config || {
+            heating_rate: 5.0,
+            cooling_constant: 0.1,
+            thermal_inertia: 0.0,
+            start_temperature: 20.0,
+            sense: "heat",
+            min_temperatures: [20.0],
+            max_temperatures: [24.0],
+          },
+        };
+      } else {
+        thermalLoadStates[i] = {
+          kind: "thermal_battery",
+          extra: existingExtra,
+          thermal_battery: thermalLoadStates[i].thermal_battery || {
+            supply_temperature: 35.0,
+            volume: 14.91,
+            start_temperature: 22.0,
+            carnot_efficiency: 0.45,
+            u_value: 0.326,
+            envelope_area: 649.4,
+            ventilation_rate: 0.12,
+            heated_volume: 573.5,
+            min_temperatures: [20.0],
+            max_temperatures: [26.0],
+          },
+        };
+      }
+      renderThermalLoadCards(builderEl, count);
+      updateConfigSystemOverviewBadges(lastLoadedConfig);
+    });
+  });
+
+  builderEl.querySelectorAll(".thermal-load-card").forEach((card) => {
+    const idx = Number(card.dataset?.loadIndex);
+    card.querySelectorAll("[data-field]").forEach((input) => {
+      const markDirtyAndSync = () => {
+        if (input.dataset) {
+          input.dataset.dirty = "1";
+        }
+        syncSingleThermalState(card, idx);
+      };
+      input.addEventListener("change", markDirtyAndSync);
+      input.addEventListener("input", markDirtyAndSync);
+    });
+    const schedBtn = card.querySelector(".apply-sched-btn");
+    if (schedBtn) {
+      schedBtn.addEventListener("click", () => {
+        const minDay = Number(card.querySelector(".sched-min-day").value);
+        const minNight = Number(card.querySelector(".sched-min-night").value);
+        const maxVal = Number(card.querySelector(".sched-max-day").value);
+        const built = buildDayNightTempArrays({
+          firstStepHour: Number(card.querySelector(".sched-first-hour")?.value ?? 0),
+          dayStartHour: Number(card.querySelector(".sched-day-start").value),
+          dayEndHour: Number(card.querySelector(".sched-day-end").value),
+          minDay,
+          minNight,
+          maxDay: maxVal,
+          maxNight: maxVal,
+        });
+        if (built.error) {
+          errorAlert(built.error);
+          return;
+        }
+        const minInput = card.querySelector('[data-field="min_temperatures"]');
+        const maxInput = card.querySelector('[data-field="max_temperatures"]');
+        if (minInput) {
+          minInput.value = built.minArr.join(", ");
+          if (minInput.dataset) {
+            minInput.dataset.dirty = "1";
+          }
+        }
+        if (maxInput) {
+          maxInput.value = built.maxArr.join(", ");
+          if (maxInput.dataset) {
+            maxInput.dataset.dirty = "1";
+          }
+        }
+        syncSingleThermalState(card, idx);
+      });
+    }
+  });
+}
+
+function syncSingleThermalState(card, idx) {
+  const state = thermalLoadStates[idx];
+  if (!state || state.kind === "standard" || state.kind === "passthrough") {
+    return;
+  }
+  const bucket = state[state.kind] || {};
+  card.querySelectorAll("[data-field]").forEach((el) => {
+    const field = el.dataset?.field;
+    if (field === "min_temperatures" || field === "max_temperatures") {
+      // Preserve loaded temperature arrays verbatim unless this field was explicitly edited
+      if (Array.isArray(bucket[field]) && el.dataset?.dirty !== "1") {
+        return;
+      }
+      bucket[field] = parseTempArrayText(el.value);
+    } else if (field === "sense") {
+      bucket[field] = el.value;
+    } else {
+      const n = Number.parseFloat(el.value);
+      if (Number.isFinite(n)) {
+        bucket[field] = n;
+      }
+    }
+  });
+  state[state.kind] = bucket;
+}
+
+function parseThermalLoadStateItem(item) {
+  const isObj = Boolean(item && typeof item === "object" && !Array.isArray(item));
+  const extra = {};
+  if (isObj) {
+    for (const k of Object.keys(item)) {
+      if (k !== "thermal_config" && k !== "thermal_battery") {
+        extra[k] = item[k];
+      }
+    }
+    if (item.thermal_battery) {
+      return {
+        kind: "thermal_battery",
+        extra,
+        thermal_battery: { ...item.thermal_battery },
+      };
+    }
+    if (item.thermal_config) {
+      return {
+        kind: "thermal_config",
+        extra,
+        thermal_config: { ...item.thermal_config },
+      };
+    }
+  }
+  if (Object.keys(extra).length > 0) {
+    return { kind: "passthrough", extra };
+  }
+  return { kind: "standard", extra: {} };
+}
+
+function setupThermalLoadsBuilder(config) {
+  const builderEl = document.getElementById("thermal-loads-builder");
+  const countInput = document.getElementById("number_of_deferrable_loads");
+  if (!builderEl || !countInput) {
+    return;
+  }
+  const rawList = Array.isArray(config?.def_load_config) ? config.def_load_config : [];
+  const count = Math.max(0, Number.parseInt(countInput.value, 10) || 0);
+  thermalLoadStates = [];
+  for (let i = 0; i < Math.max(count, rawList.length); i++) {
+    thermalLoadStates.push(parseThermalLoadStateItem(rawList[i]));
+  }
+  renderThermalLoadCards(builderEl, count);
+
+  if (
+    typeof countInput.addEventListener === "function" &&
+    !countInput._boundThermalBuilder &&
+    !countInput.dataset?.boundThermalBuilder
+  ) {
+    countInput._boundThermalBuilder = true;
+    if (countInput.dataset) {
+      countInput.dataset.boundThermalBuilder = "1";
+    }
+    countInput.addEventListener("input", () => {
+      const nextCount = Math.max(0, Number.parseInt(countInput.value, 10) || 0);
+      renderThermalLoadCards(builderEl, nextCount);
+    });
+  }
+}
+
+function buildThermalLoadsConfig() {
+  const builderEl = document.getElementById("thermal-loads-builder");
+  const countInput = document.getElementById("number_of_deferrable_loads");
+  if (!builderEl || !countInput) {
+    return null;
+  }
+  const count = Math.max(0, Number.parseInt(countInput.value, 10) || 0);
+  const cards = builderEl.querySelectorAll(".thermal-load-card");
+  cards.forEach((card) => {
+    const idx = Number(card.dataset?.loadIndex);
+    syncSingleThermalState(card, idx);
+  });
+  const result = [];
+  for (let i = 0; i < count; i++) {
+    const state = thermalLoadStates[i];
+    if (state?.kind === "thermal_config") {
+      result.push({
+        ...state.extra,
+        thermal_config: { ...state.thermal_config },
+      });
+    } else if (state?.kind === "thermal_battery") {
+      result.push({
+        ...state.extra,
+        thermal_battery: { ...state.thermal_battery },
+      });
+    } else if (state?.kind === "passthrough") {
+      result.push({ ...state.extra });
+    } else {
+      result.push({ ...state?.extra });
+    }
+  }
+  return result;
+}
+
+function updateConfigSystemOverviewBadges(fallbackConfig) {
+  const strip = document.getElementById("system-overview-badges");
+  if (!strip) {
+    return;
+  }
+  const readBool = (id, defVal) => {
+    const el = paramInputOf(id) || document.getElementById(id);
+    if (el && el.type === "checkbox") return Boolean(el.checked);
+    return fallbackConfig && id in fallbackConfig ? Boolean(fallbackConfig[id]) : defVal;
+  };
+  const readNum = (id, defVal) => {
+    const el = paramInputOf(id) || document.getElementById(id);
+    if (el && el.value !== "") {
+      const v = Number(el.value);
+      if (Number.isFinite(v)) return v;
+    }
+    return fallbackConfig && id in fallbackConfig ? Number(fallbackConfig[id]) : defVal;
+  };
+  const readStr = (id, defVal) => {
+    const el = paramInputOf(id) || document.getElementById(id);
+    if (el?.value) return String(el.value);
+    return fallbackConfig?.[id] ? String(fallbackConfig[id]) : defVal;
+  };
+
+  const badges = [];
+  if (readBool("set_use_pv", false)) {
+    badges.push({ cls: "sys-pv", text: "PV Plant (" + readStr("weather_forecast_method", "csv") + ")" });
+  } else {
+    badges.push({ cls: "sys-muted", text: "No PV" });
+  }
+  if (readBool("set_use_battery", false)) {
+    const nb = Math.max(1, readNum("number_of_batteries", 1));
+    badges.push({ cls: "sys-batt", text: nb > 1 ? nb + " Batteries" : "1 Battery" });
+  } else {
+    badges.push({ cls: "sys-muted", text: "No Battery" });
+  }
+  const ndef = Math.max(0, readNum("number_of_deferrable_loads", 0));
+  badges.push({
+    cls: ndef > 0 ? "sys-loads" : "sys-muted",
+    text: ndef + " Deferrable Load" + (ndef === 1 ? "" : "s"),
+  });
+  let thermalCount = 0;
+  const isBoxMode = document.getElementById("config-box") !== null;
+  if (isBoxMode) {
+    const rawDefCfg =
+      fallbackConfig && Array.isArray(fallbackConfig.def_load_config)
+        ? fallbackConfig.def_load_config
+        : [];
+    for (let i = 0; i < Math.min(ndef, rawDefCfg.length); i++) {
+      const item = rawDefCfg[i];
+      if (
+        item &&
+        typeof item === "object" &&
+        (item.thermal_config || item.thermal_battery || item.thermal_source)
+      ) {
+        thermalCount += 1;
+      }
+    }
+  } else {
+    for (let i = 0; i < Math.min(ndef, thermalLoadStates.length); i++) {
+      if (thermalLoadStates[i] && thermalLoadStates[i].kind !== "standard") {
+        thermalCount += 1;
+      }
+    }
+  }
+  if (thermalCount > 0) {
+    badges.push({
+      cls: "sys-thermal",
+      text: thermalCount + " Thermal Load" + (thermalCount === 1 ? "" : "s"),
+    });
+  }
+  const nInv = Math.max(1, readNum("number_of_inverters", 1));
+  badges.push({
+    cls: "sys-neutral",
+    text: nInv > 1 ? nInv + " Inverters" : readBool("inverter_is_hybrid", false) ? "Hybrid Inverter" : "1 Inverter",
+  });
+  const capContainer = document.getElementById("capacity_cost_per_kw");
+  let hasCapTariff = false;
+  if (capContainer && typeof capContainer.getElementsByClassName === "function") {
+    const capInputs = Array.from(capContainer.getElementsByClassName("param_input"));
+    if (capInputs.length > 0) {
+      hasCapTariff = capInputs.some((inp) => Number(inp.value) > 0);
+    }
+  } else if (fallbackConfig && "capacity_cost_per_kw" in fallbackConfig) {
+    const rawCap = fallbackConfig.capacity_cost_per_kw;
+    hasCapTariff = Array.isArray(rawCap)
+      ? rawCap.some((v) => Number(v) > 0)
+      : Number(rawCap) > 0;
+  }
+  if (hasCapTariff) {
+    badges.push({ cls: "sys-tariff", text: "Capacity Tariff" });
+  }
+  badges.push(
+    { cls: "sys-neutral", text: "Objective: " + readStr("costfun", "profit") },
+    { cls: "sys-load", text: "Load: " + readStr("load_forecast_method", "naive") },
+    { cls: "sys-neutral", text: readNum("optimization_time_step", 30) + " min step" }
+  );
+  if (readStr("optimization_backend", "cvxpy") === "dantzig_wolfe") {
+    badges.push({ cls: "sys-fed", text: "Federated Coordinator" });
+  }
+  // Build badges as DOM nodes: configuration values are text, never HTML.
+  const heading = document.createElement("span");
+  heading.className = "system-overview-title";
+  heading.textContent = "Configured system:";
+  const badgeNodes = badges.map((badge) => {
+    const element = document.createElement("span");
+    element.className = `sys-badge ${badge.cls}`;
+    element.textContent = badge.text;
+    return element;
+  });
+  strip.replaceChildren(heading, ...badgeNodes);
 }

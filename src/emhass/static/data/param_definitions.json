@@ -8,6 +8,81 @@
       "default_value": "profit",
       "unit": "none"
     },
+    "optimization_backend": {
+      "friendly_name": "Optimization backend",
+      "Description": "cvxpy (default): one MILP over every device, as before. dantzig_wolfe: each device (or group, see site) is planned as its own subproblem by EMHASS's own model, and a coordinator makes the plans agree at the meter and every limit in site. Anything the coordinator cannot plan yet runs on cvxpy, with a log line.",
+      "input": "select",
+      "select_options": [
+        "cvxpy",
+        "dantzig_wolfe"
+      ],
+      "default_value": "cvxpy",
+      "unit": "none"
+    },
+    "site": {
+      "friendly_name": "Site",
+      "Description": "Optional, with a coordinator backend: the house in one list. Each element has an id. 'grid' is the main meter (max_import / max_export, W). Every element but the main meter and the limits names its parent ('grid', the main meter, or a node). A node (any other id: an inverter, a panel, a breaker) has its parent, a type (hybrid_inverter, inverter, panel, breaker, meter), max_import / max_export (W) on its connection to its parent, and efficiency_import / efficiency_export. A limit (type 'limit') caps what the devices tagged with it draw together (max_import / max_export, W), wherever they are. A device (pv, battery0 or battery, deferrable0, ...) has a parent, a group (devices in one group are planned together by EMHASS's model) and limits (limit ids). A device left out is planned alone by EMHASS, on the main meter. The main meter's limits and a hybrid_inverter node on it holding just the PV and the battery also set EMHASS's own keys, so the default solver plans the same meter and inverter. Example: [{\"id\": \"inverter\", \"parent\": \"grid\", \"type\": \"hybrid_inverter\", \"max_import\": 4000, \"max_export\": 4000}, {\"id\": \"garage\", \"parent\": \"grid\", \"type\": \"panel\", \"max_import\": 7400, \"max_export\": 0}, {\"id\": \"pv\", \"parent\": \"inverter\"}, {\"id\": \"battery0\", \"parent\": \"inverter\"}, {\"id\": \"deferrable0\", \"parent\": \"garage\", \"group\": \"loads\"}, {\"id\": \"deferrable1\", \"parent\": \"garage\", \"group\": \"loads\"}]",
+      "input": "object",
+      "schema": {
+        "type": ["array", "null"],
+        "maxItems": 64,
+        "items": {
+          "anyOf": [
+            {
+              "title": "the main meter",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id"],
+              "properties": {"id": {"const": "grid"}, "max_import": {"type": "number", "minimum": 0}, "max_export": {"type": "number", "minimum": 0}}
+            },
+            {
+              "title": "a node",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "parent"],
+              "properties": {
+                "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$", "not": {"pattern": "^(pv|battery[0-9]?|deferrable[0-9]{1,3}|grid|ac|solar)$"}},
+                "parent": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$"},
+                "type": {"type": "string", "enum": ["hybrid_inverter", "inverter", "panel", "breaker", "meter"]},
+                "max_import": {"type": "number", "minimum": 0},
+                "max_export": {"type": "number", "minimum": 0},
+                "efficiency_import": {"type": ["number", "null"], "exclusiveMinimum": 0, "maximum": 1},
+                "efficiency_export": {"type": ["number", "null"], "exclusiveMinimum": 0, "maximum": 1}
+              }
+            },
+            {
+              "title": "a limit",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "type"],
+              "anyOf": [{"required": ["max_import"]}, {"required": ["max_export"]}],
+              "properties": {"id": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$", "not": {"pattern": "^(pv|battery[0-9]?|deferrable[0-9]{1,3}|grid|solar)$"}}, "type": {"const": "limit"}, "max_import": {"type": "number", "minimum": 0}, "max_export": {"type": "number", "minimum": 0}}
+            },
+            {
+              "title": "the PV",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "parent"],
+              "properties": {"id": {"const": "pv"}, "parent": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$"}}
+            },
+            {
+              "title": "a device",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "parent"],
+              "properties": {
+                "id": {"type": "string", "pattern": "^(battery[0-9]?|deferrable[0-9]{1,3})$"},
+                "parent": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$"},
+                "solver": {"type": "string", "enum": ["emhass"], "default": "emhass"},
+                "group": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$", "not": {"const": "solar"}},
+                "limits": {"type": "array", "maxItems": 16, "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$"}}
+              }
+            }
+          ]
+        }
+      },
+      "default_value": null
+    },
     "sensor_power_photovoltaics": {
       "friendly_name": "Sensor power photovoltaic",
       "Description": "This is the name of the photovoltaic power-produced sensor in Watts from Home Assistant. For example: ‘sensor.power_photovoltaics’.",
@@ -265,20 +340,6 @@
       "default_value": "temp_air",
       "unit": "none"
     },
-    "set_total_pv_sell": {
-      "friendly_name": "PV straight to grid",
-      "Description": "Set this parameter to true to consider that all the PV power produced is injected to the grid. No direct self-consumption. The default is false, for a system with direct self-consumption.",
-      "input": "boolean",
-      "default_value": false,
-      "unit": "none"
-    },
-    "publish_deferrable_load_states": {
-      "friendly_name": "Publish deferrable load command states",
-      "Description": "When true, EMHASS additionally publishes one interpretable command sensor per deferrable load (sensor.p_deferrableN_state) whose state is 'on', 'off' or 'variable' for the current timestep, with the full optimized on/off/variable plan as a 'schedule' attribute. This lets automations act on a clear command instead of thresholding the power forecast themselves. Defaults to false.",
-      "input": "boolean",
-      "default_value": false,
-      "unit": "none"
-    },
     "num_threads": {
       "friendly_name": "Number of threads to use for the LP solver",
       "Description": "Set the number of threads for the LP solver to use, when supported by the solver. Defaults to 0 (autodetect)",
@@ -299,28 +360,6 @@
       "input": "float",
       "default_value": 0.01,
       "unit": "fraction"
-    },
-    "weather_forecast_method": {
-      "friendly_name": "Weather forecast method",
-      "Description": "This will define the weather forecast method that will be used. options are 'open-meteo', 'Solcast', 'solar.forecast' (forecast.solar) and 'csv' to load a CSV file. When loading a CSV file this will be directly considered as the PV power forecast in Watts.",
-      "input": "select",
-      "select_options": ["open-meteo", "solcast", "solar.forecast", "csv"],
-      "default_value": "open-meteo",
-      "unit": "none"
-    },
-    "weather_forecast_pv_quantile_bias": {
-      "friendly_name": "PV forecast conservative bias",
-      "Description": "Blend factor that biases a central P50 PV forecast toward its conservative P10 (low) companion. 0 (default) uses P50, preserving existing behaviour. 1 uses P10. Intermediate values blend linearly: estimate = bias*P10 + (1-bias)*P50. With weather_forecast_method set to solcast, EMHASS uses Solcast pv_estimate/pv_estimate10. For caller-supplied forecasts, the same blend applies when pv_power_forecast_p10 is supplied alongside pv_power_forecast; without that companion the existing P50-only path is unchanged. Defaults to 0.",
-      "input": "float",
-      "default_value": 0.0,
-      "unit": "none"
-    },
-    "open_meteo_cache_max_age": {
-      "friendly_name": "Open-Meteo Cache Max Age",
-      "Description": "The maximum age, in minutes, of the cached open-meteo json response, after which a new version will be fetched from Open-Meteo. Defaults to 30.",
-      "input": "int",
-      "default_value": 30,
-      "unit": "min"
     },
     "maximum_power_from_grid": {
       "friendly_name": "Max power from grid",
@@ -530,12 +569,55 @@
       "requires": {
         "production_price_forecast_method": "constant"
       }
+    },
+    "capacity_cost_per_kw": {
+      "friendly_name": "Capacity (demand) charge cost",
+      "Description": "Cost in currency per kW applied once to the modelled capacity/demand peak. 0 (default) disables the feature. With capacity_charge_interval_timesteps=1 the peak is the highest eligible positive-import timestep; with N>1 it is the highest eligible completed tariff-interval average. Set this to the marginal billed cost of increasing the applicable peak by 1 kW. A list of two or more rates prices that many independent capacity/demand components in one optimisation (see docs/cookbook/tariff_demand_charge.md, issue #540).",
+      "input": "array.float",
+      "default_value": 0.0,
+      "unit": "¤/kW"
+    },
+    "capacity_charge_interval_timesteps": {
+      "friendly_name": "Capacity charge tariff measurement interval",
+      "Description": "Number of native optimisation timesteps in one tariff demand-measurement interval. 1 (default) preserves per-timestep capacity charging; N>1 prices completed N-timestep average import. Example: 30-minute demand with a 5-minute optimisation step uses 6. Only effective when capacity_cost_per_kw > 0. If capacity_cost_per_kw is a list of K rates, this is a single shared value or a list of exactly K; any other length is rejected (see docs/cookbook/tariff_demand_charge.md, issue #540).",
+      "input": "array.int",
+      "default_value": 1,
+      "unit": "timesteps"
     }
   },
   "Solar System (PV)": {
     "set_use_pv": {
       "friendly_name": "Enable PV system",
       "Description": "Set to True if we should consider an solar PV system. Defaults to False",
+      "input": "boolean",
+      "default_value": false,
+      "unit": "none"
+    },
+    "weather_forecast_method": {
+      "friendly_name": "Weather forecast method",
+      "Description": "This will define the weather forecast method that will be used. options are 'open-meteo', 'Solcast', 'solar.forecast' (forecast.solar) and 'csv' to load a CSV file. When loading a CSV file this will be directly considered as the PV power forecast in Watts.",
+      "input": "select",
+      "select_options": ["open-meteo", "solcast", "solar.forecast", "csv"],
+      "default_value": "open-meteo",
+      "unit": "none"
+    },
+    "weather_forecast_pv_quantile_bias": {
+      "friendly_name": "PV forecast conservative bias",
+      "Description": "Blend factor that biases a central P50 PV forecast toward its conservative P10 (low) companion. 0 (default) uses P50, preserving existing behaviour. 1 uses P10. Intermediate values blend linearly: estimate = bias*P10 + (1-bias)*P50. With weather_forecast_method set to solcast, EMHASS uses Solcast pv_estimate/pv_estimate10. For caller-supplied forecasts, the same blend applies when pv_power_forecast_p10 is supplied alongside pv_power_forecast; without that companion the existing P50-only path is unchanged. Defaults to 0.",
+      "input": "float",
+      "default_value": 0.0,
+      "unit": "none"
+    },
+    "open_meteo_cache_max_age": {
+      "friendly_name": "Open-Meteo Cache Max Age",
+      "Description": "The maximum age, in minutes, of the cached open-meteo json response, after which a new version will be fetched from Open-Meteo. Defaults to 30.",
+      "input": "int",
+      "default_value": 30,
+      "unit": "min"
+    },
+    "set_total_pv_sell": {
+      "friendly_name": "PV straight to grid",
+      "Description": "Set this parameter to true to consider that all the PV power produced is injected to the grid. No direct self-consumption. The default is false, for a system with direct self-consumption.",
       "input": "boolean",
       "default_value": false,
       "unit": "none"
@@ -578,28 +660,6 @@
     "adjusted_pv_model_max_age": {
       "friendly_name": "Adjusted PV model maximum age",
       "Description": "Maximum age in hours before the adjusted PV regression model is re-fitted. If the saved model is older than this value, a new model will be trained using fresh historical data. Set to 0 to force re-fitting on every call. Defaults to 24 hours (1 day).",
-      "input": "int",
-      "default_value": 24,
-      "unit": "h"
-    },
-    "set_use_battery_identification": {
-      "friendly_name": "Use battery self-identification",
-      "Description": "Opt-in, default off. When enabled, EMHASS learns the battery usable capacity and round-trip efficiency from Home Assistant history (signed battery power and measured state of charge) instead of relying only on the hand-entered values. It requires set_use_battery to be true and the sensor_power_battery and sensor_battery_state_of_charge sensors. In v1 this is advisory only: it never changes the configured battery values used by the optimizer. Defaults to false.",
-      "input": "boolean",
-      "default_value": false,
-      "unit": "none"
-    },
-    "battery_identification_trust_tier": {
-      "friendly_name": "Battery identification trust tier",
-      "Description": "Controls what battery self-identification does with its estimate. 'observe' (default) writes the estimate to a JSON file and the log only. 'suggest' additionally publishes two read-only Home Assistant sensors (identified capacity and round-trip efficiency) and logs a recommendation. Neither tier changes the configured battery values used by the optimizer. Defaults to 'observe'.",
-      "input": "select",
-      "select_options": ["observe", "suggest"],
-      "default_value": "observe",
-      "unit": "none"
-    },
-    "battery_identification_model_max_age": {
-      "friendly_name": "Battery identification model maximum age",
-      "Description": "Maximum age in hours before the battery identification estimate is re-fitted from fresh Home Assistant history. If the saved result is older than this value, a new estimate is produced. Set to 0 to force re-fitting on every call. Defaults to 24 hours (1 day).",
       "input": "int",
       "default_value": 24,
       "unit": "h"
@@ -691,7 +751,7 @@
     },
     "operating_hours_of_each_deferrable_load": {
       "friendly_name": "Deferrable load operating hours",
-      "Description": "The total number of hours that each deferrable load should operate. Fractional values are accepted (e.g. 4.5) and the energy delivered is nominal_power * hours; a value that is not a whole number of timesteps runs at least one step below the nominal power and, for semi-continuous loads, is solved as 'Optimal (Relaxed)' (integer constraints not enforced). For whole timesteps at the nominal power naive-mpc-optim accepts operating_timesteps_of_each_deferrable_load at runtime, one entry per load (it makes EMHASS ignore the hours of all loads).",
+      "Description": "The total number of hours that each deferrable load should operate. Fractional values are accepted (e.g. 4.5) and the energy delivered is nominal_power * hours; a value that is not a whole number of timesteps is delivered, for semi-continuous loads, as whole steps at the nominal power plus one last remainder step whose average power over the step is the leftover fraction of the nominal power (the load itself is not modulated), and the remainder formulation does not itself require a relaxed solve when other constraints are feasible. The energy is exact within 1e-5 timesteps (at most 1e-5 * nominal_power * timestep Wh). This applies to ordinary semi-continuous deferrable loads, not sequence/thermal/thermal-battery loads. A switch-only executor must run at nominal power for the remainder fraction of the timestep; the reported wattage is only an interval average, not the load's instantaneous consumption, so instantaneous grid, inverter and equipment limits must be enforced independently of the step average. For whole timesteps at the nominal power naive-mpc-optim accepts operating_timesteps_of_each_deferrable_load at runtime, one entry per load (it makes EMHASS ignore the hours of all loads).",
       "input": "array.float",
       "default_value": 0,
       "unit": "h"
@@ -758,6 +818,13 @@
       "input": "array.int",
       "default_value": 0,
       "unit": "timesteps"
+    },
+    "publish_deferrable_load_states": {
+      "friendly_name": "Publish deferrable load command states",
+      "Description": "When true, EMHASS additionally publishes one interpretable command sensor per deferrable load (sensor.p_deferrableN_state) whose state is 'on', 'off' or 'variable' for the current timestep, with the full optimized on/off/variable plan as a 'schedule' attribute. This lets automations act on a clear command instead of thresholding the power forecast themselves. Defaults to false.",
+      "input": "boolean",
+      "default_value": false,
+      "unit": "none"
     }
   },
   "Battery": {
@@ -776,6 +843,28 @@
       "minimum": 1,
       "maximum": 100,
       "unit": "count"
+    },
+    "set_use_battery_identification": {
+      "friendly_name": "Use battery self-identification",
+      "Description": "Opt-in, default off. When enabled, EMHASS learns the battery usable capacity and round-trip efficiency from Home Assistant history (signed battery power and measured state of charge) instead of relying only on the hand-entered values. It requires set_use_battery to be true and the sensor_power_battery and sensor_battery_state_of_charge sensors. In v1 this is advisory only: it never changes the configured battery values used by the optimizer. Defaults to false.",
+      "input": "boolean",
+      "default_value": false,
+      "unit": "none"
+    },
+    "battery_identification_trust_tier": {
+      "friendly_name": "Battery identification trust tier",
+      "Description": "Controls what battery self-identification does with its estimate. 'observe' (default) writes the estimate to a JSON file and the log only. 'suggest' additionally publishes two read-only Home Assistant sensors (identified capacity and round-trip efficiency) and logs a recommendation. Neither tier changes the configured battery values used by the optimizer. Defaults to 'observe'.",
+      "input": "select",
+      "select_options": ["observe", "suggest"],
+      "default_value": "observe",
+      "unit": "none"
+    },
+    "battery_identification_model_max_age": {
+      "friendly_name": "Battery identification model maximum age",
+      "Description": "Maximum age in hours before the battery identification estimate is re-fitted from fresh Home Assistant history. If the saved result is older than this value, a new estimate is produced. Set to 0 to force re-fitting on every call. Defaults to 24 hours (1 day).",
+      "input": "int",
+      "default_value": 24,
+      "unit": "h"
     },
     "set_nocharge_from_grid": {
       "friendly_name": "Forbid charging battery from grid",
@@ -967,20 +1056,6 @@
       "requires": {
         "set_use_battery": true
       }
-    },
-    "capacity_cost_per_kw": {
-      "friendly_name": "Capacity (demand) charge cost",
-      "Description": "Cost in currency per kW applied once to the modelled capacity/demand peak. 0 (default) disables the feature. With capacity_charge_interval_timesteps=1 the peak is the highest eligible positive-import timestep; with N>1 it is the highest eligible completed tariff-interval average. Set this to the marginal billed cost of increasing the applicable peak by 1 kW. A list of two or more rates prices that many independent capacity/demand components in one optimisation (see docs/cookbook/tariff_demand_charge.md, issue #540).",
-      "input": "array.float",
-      "default_value": 0.0,
-      "unit": "¤/kW"
-    },
-    "capacity_charge_interval_timesteps": {
-      "friendly_name": "Capacity charge tariff measurement interval",
-      "Description": "Number of native optimisation timesteps in one tariff demand-measurement interval. 1 (default) preserves per-timestep capacity charging; N>1 prices completed N-timestep average import. Example: 30-minute demand with a 5-minute optimisation step uses 6. Only effective when capacity_cost_per_kw > 0. If capacity_cost_per_kw is a list of K rates, this is a single shared value or a list of exactly K; any other length is rejected (see docs/cookbook/tariff_demand_charge.md, issue #540).",
-      "input": "array.int",
-      "default_value": 1,
-      "unit": "timesteps"
     },
     "ignore_pv_feedback_during_curtailment": {
       "friendly_name": "Ignore PV feedback during curtailment",

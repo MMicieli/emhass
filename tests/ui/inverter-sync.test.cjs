@@ -80,14 +80,37 @@ test('the JS lists are the backend INVERTER_CAP_PARAMS and INVERTER_BROADCAST_PA
 });
 
 test('the synced lists lose their +/- buttons, the index lists keep them', () => {
-  const body = { innerHTML: '' };
-  const sectionEl = { getElementsByClassName: c => (c === 'section-body' ? [body] : []), querySelectorAll: () => [] };
-  const ctx = { window: {}, console: { ...console, debug() {} }, document: { getElementById: id => (id === 'System' ? sectionEl : null) } };
+  const nodes = [];
+  const createElement = tag => {
+    const node = {
+      tag, className: '', dataset: {}, children: [],
+      append(...children) { this.children.push(...children); },
+      set textContent(value) { this.children = [{ text: String(value) }]; },
+      addEventListener() {},
+    };
+    nodes.push(node);
+    return node;
+  };
+  const body = { append() {} };
+  const sectionEl = {
+    getElementsByClassName: c => (c === 'section-body' ? [body] : []),
+    querySelectorAll: selector => nodes.filter(node => node.className === selector.slice(1)),
+  };
+  const ctx = { window: {}, console: { ...console, debug() {} }, document: {
+    getElementById: id => (id === 'System' ? sectionEl : null),
+    createElement,
+    createTextNode: value => ({ text: String(value) }),
+    createRange: () => ({
+      selectNodeContents() {},
+      createContextualFragment: html => ({ rawHtml: html }),
+    }),
+  } };
   vm.createContext(ctx); vm.runInContext(source, ctx);
   ctx.buildParamContainers('System', defs.System, {}, []);
-  for (const name of LISTS) assert.doesNotMatch(body.innerHTML, new RegExp(`input-plus ${name}"`), name);
+  const plusNames = new Set(nodes.filter(node => node.className === 'input-plus').map(node => node.dataset.paramName));
+  for (const name of LISTS) assert.ok(!plusNames.has(name), name);
   for (const name of ['battery_inverter_index', 'pv_plant_inverter_index', 'mlforecaster_weather_features'])
-    assert.match(body.innerHTML, new RegExp(`input-plus ${name}"`), name);
+    assert.ok(plusNames.has(name), name);
 });
 
 test('one inverter is a no-op on the default and on a saved configuration', () => {
@@ -328,7 +351,7 @@ test('no number_of_inverters row: nothing to sync, nothing thrown', () => {
 
 test('the list view runs the sync once the sections are built', () => {
   const calls = [];
-  const container = { innerHTML: '' };
+  const container = { innerHTML: '', replaceChildren() {} };
   const ctx = { window: {}, console: { ...console, debug() {}, log() {} },
     document: { getElementById: id => (id === 'configuration-container' ? container : null) } };
   vm.createContext(ctx); vm.runInContext(source, ctx);
@@ -336,7 +359,7 @@ test('the list view runs the sync once the sections are built', () => {
   ctx.setupInverterSync = (definitions, config) => calls.push(['sync', definitions, config]);
   const config = { number_of_inverters: 2 };
   const definitions = { Local: {}, System: {} };
-  ctx.loadConfigurationListView(definitions, config, '<div></div>');
+  ctx.loadConfigurationListView(definitions, config, { content: { cloneNode: () => ({}) } });
   assert.deepEqual(calls.map(c => c[0]), ['build', 'build', 'sync']);
   assert.equal(calls[2][1], definitions);
   assert.equal(calls[2][2], config);
