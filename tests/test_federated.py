@@ -194,7 +194,8 @@ def test_the_web_page_shows_which_backend_made_the_plan():
     with mock.patch("emhass.coordinator.backend.optimize", _raises):
         _, res = _plan(*_site(), optimization_backend="dantzig_wolfe")
     page = get_injection_dict(res.copy())
-    assert "backend_used" in page["table2"] and "cvxpy" in page["table2"]
+    assert "backend_used" in page["table2"]
+    assert "cvxpy" in page["table2"]
     assert "coordinator exploded" in page["table2"]
     assert "backend_used" not in page["table1"]
 
@@ -331,6 +332,158 @@ def test_a_load_group_across_groups_is_held_and_priced():
     assert "fed_limit_price_deferrable0+deferrable1" in res.columns
 
 
+@pytest.mark.parametrize(
+    "group, reason",
+    [
+        (
+            {"names": ["deferrable0", "deferrable1"], "max_power": [3000.0] * 48},
+            "deferrable_load_groups ['deferrable0', 'deferrable1']: a per-step max_power list "
+            "across participants",
+        ),
+        (
+            {
+                "names": ["deferrable0", "deferrable1"],
+                "max_power": 3000,
+                "weights": {"deferrable1": 0.5},
+            },
+            "deferrable_load_groups ['deferrable0', 'deferrable1']: weights across participants",
+        ),
+        (
+            {"names": ["deferrable0", "battery0"], "max_power": 4000},
+            "deferrable_load_groups ['deferrable0', 'battery0']: a battery member ['battery0']",
+        ),
+    ],
+    ids=["per_step_list", "weights", "battery_member"],
+)
+def test_a_load_group_feature_the_coordinator_cannot_plan_falls_back(group, reason):
+    """deferrable_load_groups features (#1366) the coordinator does not plan
+    across participants (a per-step max_power list, weights) or at all (a
+    battery member): the default solver plans exactly its own plan, the
+    reason names the feature, and nothing is logged as an error."""
+    rh, oc, pc, data, pv, load, buy, sell = _site()
+    assert len(data) == 48
+    site = (rh, dict(oc, deferrable_load_groups=[group]), pc, data, pv, load, buy, sell)
+    _, milp = _plan(*site)
+    with (
+        mock.patch.object(logger, "error") as error,
+        mock.patch.object(logger, "warning") as warning,
+    ):
+        _, res = _plan(*site, optimization_backend="dantzig_wolfe")
+    _fell_back(res, milp, reason)
+    error.assert_not_called()
+    assert any(reason in str(c) for c in warning.call_args_list)
+
+
+def test_a_one_entry_load_group_list_plans_as_the_number_does():
+    """A one-entry max_power list is the same limit as the number (#1366):
+    the coordinator holds it and makes the plan it makes for the number."""
+    rh, oc, pc, data, pv, load, buy, sell = _site()
+    plans = []
+    for max_power in (3000, [3000.0]):
+        groups = [{"names": ["deferrable0", "deferrable1"], "max_power": max_power}]
+        site = (rh, dict(oc, deferrable_load_groups=groups), pc, data, pv, load, buy, sell)
+        _, res = _plan(*site, optimization_backend="dantzig_wolfe")
+        why = res["backend_fallback_reason"].iloc[0]
+        assert (res["backend_used"] == "dantzig_wolfe").all(), why
+        assert (res["P_deferrable0"] + res["P_deferrable1"]).max() <= 3000 + 1e-3
+        plans.append(res)
+    pd.testing.assert_frame_equal(plans[0], plans[1])
+
+
+def test_a_weighted_load_group_inside_one_participant_keeps_its_weight():
+    """A weighted group (#1366) whose loads are all one participant's stays in
+    that participant's own model, which numbers its loads from 0: the weight
+    follows the load. deferrable1 (750 W, 2 h, on/off) under a 375 W budget
+    can only run at full power at weight 0.5, so it runs its 2 h as 4 steps at
+    750 W. With the weight lost it ran at 375 W for 8 steps."""
+    rh, oc, pc, data, pv, load, buy, sell = _site()
+    groups = [{"names": ["deferrable1"], "max_power": 375, "weights": {"deferrable1": 0.5}}]
+    site = (rh, dict(oc, deferrable_load_groups=groups), pc, data, pv, load, buy, sell)
+    opt, res = _plan(*site, optimization_backend="dantzig_wolfe")
+    assert (res["backend_used"] == "dantzig_wolfe").all(), res["backend_fallback_reason"].iloc[0]
+    assert opt.optim_status in ("Optimal", "Optimal_Inaccurate")
+    p = res["P_deferrable1"].to_numpy()
+    assert (p > 1).sum() == 4
+    np.testing.assert_allclose(p[p > 1], 750.0, atol=1e-3)
+
+
+def test_a_weighted_group_inside_a_two_load_participant_keeps_each_weight_on_its_load():
+    """Both loads in one participant, modulating, weight 0.5 on deferrable1
+    under a 2.5 kW budget: deferrable0 (3 kW) counts in full, so it never runs
+    above 2.5 kW, though the PV would carry 3 kW at noon. With each weight on
+    the other load it would run at 3 kW (counted 1.5 kW)."""
+    rh, oc, pc, data, pv, load, buy, sell = _site()
+    oc = dict(oc, treat_deferrable_load_as_semi_cont=[False, False])
+    groups = [
+        {
+            "names": ["deferrable0", "deferrable1"],
+            "max_power": 2500,
+            "weights": {"deferrable1": 0.5},
+        }
+    ]
+    site = (rh, dict(oc, deferrable_load_groups=groups), pc, data, pv, load, buy, sell)
+    _, milp = _plan(*site)
+    _, res = _plan(*site, optimization_backend="dantzig_wolfe", site=LOADS)
+    assert (res["backend_used"] == "dantzig_wolfe").all(), res["backend_fallback_reason"].iloc[0]
+    row = res["P_deferrable0"] + 0.5 * res["P_deferrable1"]
+    assert row.max() <= 2500 + 1e-3
+    assert res["P_deferrable0"].sum() * 0.5 == pytest.approx(3000.0 * 4, rel=1e-6)
+    assert _bill(res) == pytest.approx(_bill(milp), abs=0.01)
+
+
+def test_two_groups_on_the_same_loads_across_participants_fall_back_by_name():
+    """Two budgets on the same two loads, each load planned on its own: the
+    default solver holds both rows, so the coordinator falls back with a
+    reason that names the overlap, and nothing is logged as an error."""
+    rh, oc, pc, data, pv, load, buy, sell = _site()
+    names = ["deferrable0", "deferrable1"]
+    groups = [{"names": names, "max_power": 3000}, {"names": names, "max_power": 2500}]
+    site = (rh, dict(oc, deferrable_load_groups=groups), pc, data, pv, load, buy, sell)
+    _, milp = _plan(*site)
+    reason = (
+        "deferrable_load_groups ['deferrable0', 'deferrable1']: two overlapping groups "
+        "on the same loads across participants"
+    )
+    with (
+        mock.patch.object(logger, "error") as error,
+        mock.patch.object(logger, "warning") as warning,
+    ):
+        _, res = _plan(*site, optimization_backend="dantzig_wolfe")
+    _fell_back(res, milp, reason)
+    error.assert_not_called()
+    assert any(reason in str(c) for c in warning.call_args_list)
+
+
+def test_a_battery_member_is_read_by_emhass_parser():
+    """_battery_members keeps only the `batteryK` names; a name the parser
+    cannot read, or one that is not a string, is left to the group validator."""
+    from emhass.coordinator.backend import _battery_members
+
+    assert _battery_members(["deferrable0", "oops", "battery", 3]) == []
+    assert _battery_members(["battery0", "oops", "deferrable1", "battery2"]) == [
+        "battery0",
+        "battery2",
+    ]
+
+
+def test_a_per_step_load_group_list_inside_one_participant_is_held():
+    """A per-step max_power list (#1366) on a group whose loads are all one
+    participant's stays in that participant's own model, with deferrable1
+    renumbered to its deferrable0. Without the group it runs in the PV hours;
+    the list is 0 there, so it runs at night, and the plan is the default
+    solver's."""
+    rh, oc, pc, data, pv, load, buy, sell = _site()
+    limit = [750.0] * 12 + [0.0] * 24 + [750.0] * 12
+    groups = [{"names": ["deferrable1"], "max_power": limit}]
+    site = (rh, dict(oc, deferrable_load_groups=groups), pc, data, pv, load, buy, sell)
+    _, milp = _plan(*site)
+    _, res = _plan(*site, optimization_backend="dantzig_wolfe")
+    assert (res["backend_used"] == "dantzig_wolfe").all(), res["backend_fallback_reason"].iloc[0]
+    assert (res["P_deferrable1"].to_numpy() <= np.array(limit) + 1e-3).all()
+    assert res["P_deferrable1"].sum() * 0.5 == pytest.approx(750.0 * 2, rel=1e-6)
+    assert _bill(res) == pytest.approx(_bill(milp), abs=1e-6)
+
+
 def test_a_site_limit_holds_and_is_priced():
     """A limit over the two loads (each planned on its own): their total stays
     within 3.5 kW and its premium is fed_limit_price_<id>; a group that sits
@@ -400,9 +553,11 @@ def test_four_ders_on_one_site():
     assert res["P_hybrid_inverter"].abs().max() <= 4000 + 1e-3
     garage = res["P_deferrable0"] + res["P_deferrable1"]
     assert res["P_deferrable1"].max() <= 500 + 1e-3
-    assert garage.max() <= 3000 + 1e-3 and garage.min() >= -1e-3  # the budget; no backfeed
+    assert garage.max() <= 3000 + 1e-3  # the budget; no backfeed
+    assert garage.min() >= -1e-3
     for node in ("inverter", "garage", "heat"):
-        assert f"fed_local_price_{node}" in res.columns and f"fed_node_power_{node}" in res.columns
+        assert f"fed_local_price_{node}" in res.columns
+        assert f"fed_node_power_{node}" in res.columns
     assert np.allclose(-res["fed_node_power_garage"], garage, atol=1e-3)  # + = up the tree
     shares = {f"fed_share_{p}" for p in ("solar", "battery", "deferrable0", "deferrable1")}
     assert shares <= set(res.columns)
@@ -500,7 +655,8 @@ def test_a_load_with_a_binary_is_never_blended(load):
         rh, oc, pc, "unit_load_cost", "unit_prod_price", "profit", emhass_conf, logger
     )
     p = EmhassParticipant(opt, "deferrable1", False, [1], data, None, None, {}, buy)
-    assert not p.modulating and p.onoff
+    assert not p.modulating
+    assert p.onoff
     plain = EmhassParticipant(
         Optimization(
             rh,
@@ -525,7 +681,8 @@ def test_a_load_with_a_binary_is_never_blended(load):
         {},
         buy,
     )
-    assert plain.modulating and not plain.onoff
+    assert plain.modulating
+    assert not plain.onoff
 
 
 def test_a_sequence_load_runs_its_sequence():
@@ -721,7 +878,8 @@ def test_a_cheaper_plan_with_the_same_power_replaces_the_dearer():
     assert dev.add(Column(power, np.zeros(3), 10.0, "baseline"))
     assert not dev.add(Column(power.copy(), np.zeros(3), 12.0, "price"))
     assert dev.add(Column(power.copy(), np.ones(3), 0.0, "price"))
-    assert len(dev.columns) == 1 and dev.columns[0].cost == 0.0
+    assert len(dev.columns) == 1
+    assert dev.columns[0].cost == 0.0
     assert np.all(dev.columns[0].trajectory == 1.0)
 
 
@@ -948,7 +1106,8 @@ def test_a_plan_past_the_ceiling_with_nothing_to_curtail_scores_infinite_and_is_
 
     with mock.patch.object(DWCoordinator, "run", night_export):
         _, res = _coordinated()
-    assert scored and scored[0] == np.inf
+    assert scored
+    assert scored[0] == np.inf
     assert (res["backend_used"] == "cvxpy").all()
     assert res["backend_fallback_reason"].str.contains("within the export ceiling").all()
 
@@ -997,7 +1156,8 @@ def test_a_thermal_battery_with_an_overshoot_gate_is_never_blended():
         rh, oc, pc, "unit_load_cost", "unit_prod_price", "profit", emhass_conf, logger
     )
     p = EmhassParticipant(opt, "deferrable1", False, [1], data, None, None, {}, buy)
-    assert not p.modulating and p.onoff
+    assert not p.modulating
+    assert p.onoff
 
 
 def test_an_lp_with_every_variable_fixed_is_solved_or_refused():
@@ -1008,7 +1168,9 @@ def test_an_lp_with_every_variable_fixed_is_solved_or_refused():
     A = Triplets((1, 1))
     A[0, 0] = 1.0
     ok = linprog(np.array([2.0]), A, np.array([5.0]), np.array([5.0]), np.array([5.0]))
-    assert ok.status == 0 and np.allclose(ok.x, [5.0]) and ok.fun == pytest.approx(10.0)
+    assert ok.status == 0
+    assert np.allclose(ok.x, [5.0])
+    assert ok.fun == pytest.approx(10.0)
     bad = linprog(np.array([2.0]), A, np.array([4.0]), np.array([5.0]), np.array([5.0]))
     assert bad.status != 0
 
@@ -1044,7 +1206,8 @@ def test_only_main_bus_pv_is_curtailed_for_the_export_ceiling():
     flows = site_meter(co.cfg, co.fc, {k: c.power for k, c in pushed.items()})
     assert np.any(-flows.net > co.export_ceiling + 1e-6)
     assert co._delivered(flows) is None
-    assert co.score(pushed) == np.inf and co.parts(pushed)["total"] == np.inf
+    assert co.score(pushed) == np.inf
+    assert co.parts(pushed)["total"] == np.inf
 
 
 def test_the_coordinators_inputs_are_checked():
@@ -1057,10 +1220,12 @@ def test_the_coordinators_inputs_are_checked():
     h = Horizon(dt=0.5, hours=1.0)
     base = {"buy": np.ones(2), "sell": np.zeros(2), "load": np.zeros(2), "solar": np.zeros(2)}
     for ceiling in (np.array([np.nan, 0.0]), np.array([1.0])):
+        forecasts = Forecasts(**base, export_ceiling=ceiling)
         with pytest.raises(ValueError, match="export_ceiling"):
-            Forecasts(**base, export_ceiling=ceiling).validate(h)
+            forecasts.validate(h)
+    reserved_submeter = SiteConfig(horizon=h, battery=None, submeters=(SubMeter("ac", ("x",)),))
     with pytest.raises(ValueError, match="reserved"):
-        SiteConfig(horizon=h, battery=None, submeters=(SubMeter("ac", ("x",)),)).validate()
+        reserved_submeter.validate()
     assert "reserved" in site_mod.site_problem(
         [{"id": "ac", "parent": "grid", "type": "panel"}, {"id": "deferrable0", "parent": "ac"}]
     )
@@ -1120,7 +1285,8 @@ def test_a_nodes_own_clipping_leaves_the_main_bus_pv_to_curtail():
     co = DWCoordinator(cfg, fc, export_ceiling=np.zeros(2))
     flows = site_meter(cfg, co.fc, {})
     delivered = co._delivered(flows)
-    assert delivered is not None and np.allclose(delivered, 0.0)
+    assert delivered is not None
+    assert np.allclose(delivered, 0.0)
 
 
 def test_a_grid_connection_may_not_take_a_reserved_name():
@@ -1131,8 +1297,9 @@ def test_a_grid_connection_may_not_take_a_reserved_name():
 
     h = Horizon(dt=0.5, hours=1.0)
     for name in ("ac", "set:x"):
+        site = SiteConfig(horizon=h, battery=None, connections=(GridConnection(name),))
         with pytest.raises(ValueError, match="reserved"):
-            SiteConfig(horizon=h, battery=None, connections=(GridConnection(name),)).validate()
+            site.validate()
 
 
 def test_the_soc_miss_is_priced_at_the_participants_own_tariff():
@@ -1231,7 +1398,8 @@ def test_the_ledger_counts_the_pv_the_export_ceiling_curtails():
 
     flows = site_meter(co.cfg, co.fc, {k: c.power for k, c in pushed.items()})
     delivered = co._delivered(flows)
-    assert delivered is not None and np.any(delivered - flows.net > 1e-6)
+    assert delivered is not None
+    assert np.any(delivered - flows.net > 1e-6)
     expected = float((flows.curtail + (delivered - flows.net)).sum() * co.dt)
     assert totals["curtailed_kwh"] == pytest.approx(expected)
 
@@ -1278,7 +1446,8 @@ def test_the_baseline_bills_add_up_under_an_export_ceiling(monkeypatch):
     with mock.patch.object(DWCoordinator, "run", keep):
         _, res = _coordinated(set_nodischarge_to_grid=True)
     (co, plan), (co_dark, plan_dark) = seen[0], seen[1]
-    assert co.fc.export_ceiling is not None and not co.cfg.has_tree
+    assert co.fc.export_ceiling is not None
+    assert not co.cfg.has_tree
     baseline = settlement._baseline
 
     def exporting(c, key):
@@ -1299,7 +1468,7 @@ def _schema_accepts(site) -> bool:
     openapi.json) accepts `site`: the subset of JSON Schema it uses -
     required, properties, additionalProperties, anyOf of required, and per
     value type, const, pattern, not, enum, minimum, maximum,
-    exclusiveMinimum, maxItems and items."""
+    exclusiveMinimum, maxItems, items and nested objects."""
     import json
     import pathlib
     import re
@@ -1318,6 +1487,8 @@ def _schema_accepts(site) -> bool:
         "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
         "array": lambda v: isinstance(v, list),
         "null": lambda v: v is None,
+        "boolean": lambda v: isinstance(v, bool),
+        "object": lambda v: isinstance(v, dict),
     }
 
     def value_ok(schema, v):
@@ -1339,6 +1510,8 @@ def _schema_accepts(site) -> bool:
                 return False
             if "exclusiveMinimum" in schema and v <= schema["exclusiveMinimum"]:
                 return False
+        if isinstance(v, dict) and "properties" in schema and not accepts(schema, v):
+            return False  # an object (a remote's solver): checked as an element is
         if isinstance(v, list):
             if len(v) > schema.get("maxItems", len(v)):
                 return False
@@ -1370,6 +1543,14 @@ def _schema_accepts(site) -> bool:
             {"id": "deferrable0", "parent": "grid", "group": "pool", "limits": ["feed"]},
             {"id": "battery0", "parent": "roof", "solver": "emhass"},
         ],
+        [{"id": "garage", "parent": "grid", "solver": {"url": "https://garage.lan/p"}}],
+        [
+            {
+                "id": "garage",
+                "parent": "grid",
+                "solver": {"url": "http://garage.lan:5000/p", "trusted_network": True},
+            }
+        ],
         [
             {"id": "grid", "max_import": 9000.5, "max_export": 0},
             {"id": "panel", "parent": "grid", "efficiency_import": None, "efficiency_export": 0.97},
@@ -1380,7 +1561,8 @@ def _schema_accepts(site) -> bool:
 def test_the_site_schema_accepts_what_the_site_check_accepts(site):
     from emhass.coordinator import site as site_mod
 
-    assert site_mod.site_problem(site) is None and _schema_accepts(site)
+    assert site_mod.site_problem(site) is None
+    assert _schema_accepts(site)
 
 
 @pytest.mark.parametrize(
@@ -1400,6 +1582,9 @@ def test_the_site_schema_accepts_what_the_site_check_accepts(site):
         [{"id": "panel", "parent": "grid", "efficiency_export": 1.5}],
         [{"id": "deferrable0", "parent": "grid", "limits": "feed"}],  # a list
         [{"id": "grid"}] + [{"id": f"n{k}", "parent": "grid"} for k in range(64)],  # over 64
+        [{"id": "solar", "parent": "grid", "solver": {"url": "https://g.lan/p"}}],  # a remote
+        [{"id": "pv", "parent": "grid", "solver": {"url": "https://g.lan/p"}}],
+        [{"id": "g", "parent": "grid", "solver": {"url": "https://g.lan/p", "trusted_network": 1}}],
     ],
 )
 def test_the_site_schema_refuses_what_the_site_check_refuses(site):

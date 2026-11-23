@@ -55,6 +55,8 @@ from emhass.utils import (
     read_flag,
 )
 
+from .snapshot_state_support import isolated_snapshot_state
+
 root = pathlib.Path(get_root(__file__, num_parent=2))
 logger, _ = get_logger(__name__, {"data_path": root / "data/"}, save_to_file=False)
 SCHEMA = json.loads((root / "docs/api/v1/dry-run.schema.json").read_text(encoding="utf-8"))
@@ -169,13 +171,13 @@ def _one_clock():
 
 @pytest.fixture(autouse=True)
 def _cold_cache():
-    """Each test starts and ends with an empty OptimizationCache, and leaves
-    the in-memory last-run and plan snapshots as it found them."""
-    saved = last_run._cache, plan_store._cache
+    """Each test starts and ends with an empty OptimizationCache and cold
+    last-run and plan snapshots (cache, pending-write flag and persisted copy),
+    and leaves all of them as it found them."""
     OptimizationCache.clear()
-    yield
+    with isolated_snapshot_state():
+        yield
     OptimizationCache.clear()
-    last_run._cache, plan_store._cache = saved
 
 
 # --------------------------------------------------------------------------
@@ -277,7 +279,8 @@ def test_a_live_run_writes_its_results(action, save, config):
         changed = _changed(before, _files(data_path))
     assert isinstance(res, pd.DataFrame)
     assert any(p.endswith(".csv") for p in changed), changed
-    assert "last_run.json" in changed and "plan_latest.json" in changed, changed
+    assert "last_run.json" in changed, changed
+    assert "plan_latest.json" in changed, changed
     if config == "continual_publish":
         assert any(p.startswith("entities") for p in changed), changed
     assert "run_record" not in idd
@@ -295,7 +298,8 @@ def test_a_dry_run_writes_nothing(action, save, config):
         before = _files(data_path)
         idd, res = _run(data_path, action, dry=True, save=save, configure=CONFIGS[config])
         assert _changed(before, _files(data_path)) == []
-    assert isinstance(res, pd.DataFrame) and len(res) > 0
+    assert isinstance(res, pd.DataFrame)
+    assert len(res) > 0
     assert is_dry_run(idd)
     assert idd["run_record"]["action"] == action
     assert idd["run_record"]["status"] == "ok"
@@ -333,7 +337,8 @@ def test_a_dry_run_leaves_the_live_optimisation_untouched():
     configuration and solution to warm-start from."""
     with _data_copy() as data_path:
         _, live = _run(data_path, "dayahead-optim", dry=False)
-        assert isinstance(live, pd.DataFrame) and OptimizationCache._instance is not None
+        assert isinstance(live, pd.DataFrame)
+        assert OptimizationCache._instance is not None
         before = _cache_state()
         prices = [0.5 if i % 2 else 0.01 for i in range(48)]
         _, trial = _run(
@@ -587,7 +592,7 @@ def test_a_live_run_refreshes_a_stale_open_meteo_forecast():
         _log(logging.DEBUG) as (log, _),
         patch(
             "emhass.forecast.aiohttp.ClientSession",
-            lambda *a, **k: _Session(_open_meteo_payload(), calls),
+            return_value=_Session(_open_meteo_payload(), calls),
         ),
         _writes_spied() as opened,
     ):
@@ -602,14 +607,16 @@ def test_a_live_run_refreshes_a_stale_open_meteo_forecast():
         weather = asyncio.run(fetch())
         changed = _changed(before, _files(data_path))
         leftovers = list(data_path.glob("*.tmp"))
-    assert isinstance(weather, pd.DataFrame) and len(weather) > 0
+    assert isinstance(weather, pd.DataFrame)
+    assert len(weather) > 0
     assert len(calls) == 1, calls
     assert {
         "cached-open-meteo-forecast-b.json",
         "weather_forecast_data.pkl",
         "debug-weather-forecast-open-meteo.csv",
     } <= set(changed), changed
-    assert str(json_cache) not in opened and leftovers == []
+    assert str(json_cache) not in opened
+    assert leftovers == []
 
 
 def _stale_open_meteo_caches(data_path: pathlib.Path) -> pathlib.Path:
@@ -649,7 +656,8 @@ def test_a_dry_run_plans_with_the_saved_open_meteo_forecast_however_old():
 
         weather = asyncio.run(fetch())
         assert _changed(before, _files(data_path)) == []
-    assert isinstance(weather, pd.DataFrame) and len(weather) > 0
+    assert isinstance(weather, pd.DataFrame)
+    assert len(weather) > 0
     assert any("saved Open-Meteo forecast" in m and "minutes old" in m for m in messages)
 
 
@@ -681,8 +689,9 @@ def test_with_no_saved_forecast_a_dry_run_calls_no_service(method, dry):
         if dry:
             weather = asyncio.run(fetch())
         else:
+            fetching = fetch()
             with pytest.raises(_Fetched):
-                asyncio.run(fetch())
+                asyncio.run(fetching)
     if dry:
         assert weather is None or weather is False
         assert not budget.called
@@ -722,7 +731,8 @@ def test_the_covariates_are_fetched_only_live(dry, saved):
         assert (data is not None) is saved
         assert changed == []
     else:
-        assert len(calls) == 1 and changed == ["cached-open-meteo-covariates.json"]
+        assert len(calls) == 1
+        assert changed == ["cached-open-meteo-covariates.json"]
 
 
 @pytest.mark.parametrize("dry", [False, True], ids=["live", "dry"])
@@ -777,8 +787,10 @@ def test_the_ml_forecaster_model_is_replaced_whole():
             asyncio.run(command_line.forecast_model_fit(idd, logger, debug=False))
         saved = pickle.loads(target.read_bytes())
         leftovers = list(data_path.glob("*.tmp"))
-    assert isinstance(saved, _Model) and saved.fitted
-    assert opened and str(target) not in opened
+    assert isinstance(saved, _Model)
+    assert saved.fitted
+    assert opened
+    assert str(target) not in opened
     assert leftovers == []
 
 
@@ -796,7 +808,8 @@ def test_replace_file_leaves_the_old_file_until_the_new_one_is_whole(tmp_path):
 
     with patch("emhass.utils.os.replace", replace):
         asyncio.run(utils.replace_file(target, "new"))
-    assert seen == ["old"] and target.read_text() == "new"
+    assert seen == ["old"]
+    assert target.read_text() == "new"
 
     with patch("emhass.utils.os.replace", side_effect=OSError("disk full")):
         with pytest.raises(OSError):
@@ -838,7 +851,8 @@ def test_a_live_run_replaces_the_weather_cache_whole():
         data = asyncio.run(save())
         saved = pickle.loads(cache.read_bytes())
         leftovers = list(data_path.glob("*.tmp"))
-    assert opened and str(cache) not in opened
+    assert opened
+    assert str(cache) not in opened
     pd.testing.assert_frame_equal(saved, data)
     assert leftovers == []
 
@@ -981,8 +995,10 @@ def test_the_dry_run_url_refuses_what_it_cannot_do(action, body):
         status, answer = asyncio.run(post())
     assert status == 400
     _conforms(answer)
-    assert answer["status"] == "not-run" and answer["action"] == action
-    assert answer["errors"] and answer["errors"][-1].endswith("Nothing was run")
+    assert answer["status"] == "not-run"
+    assert answer["action"] == action
+    assert answer["errors"]
+    assert answer["errors"][-1].endswith("Nothing was run")
     build.assert_not_called()
 
 
@@ -1028,12 +1044,72 @@ def test_the_dry_run_url_returns_the_plan_and_writes_nothing(action):
             changed = _changed(before, _files(data_path))
     assert status == 200, answer["errors"]
     _conforms(answer)
-    assert answer["status"] == "ok" and answer["action"] == action
-    assert len(answer["plan"]) > 0 and "optim_status" in answer["plan"][0]
+    assert answer["status"] == "ok"
+    assert answer["action"] == action
+    assert len(answer["plan"]) > 0
+    assert "optim_status" in answer["plan"][0]
     assert headers["Cache-Control"] == "no-store"
     assert changed == []
     inject.assert_not_called()
     start.assert_not_called()
+
+
+def test_a_group_budget_list_of_the_wrong_length_is_a_400():
+    """A per-step deferrable_load_groups max_power list is checked against the
+    run's horizon when the optimization starts (#1366). A wrong length is a 400
+    with the reason on the dry-run URL and on /action, not a 500."""
+    with _data_copy() as data_path:
+        _write_params(data_path)
+        body = {
+            **FORECASTS,
+            "prediction_horizon": 48,
+            "deferrable_load_groups": [
+                {"names": ["deferrable0", "deferrable1"], "max_power": [3000.0, 2000.0, 1000.0]}
+            ],
+        }
+        with _web(data_path) as client, _from_file():
+
+            async def post():
+                response = await client.post("/api/v1/dry-run/naive-mpc-optim", json=body)
+                return response.status_code, await response.get_json()
+
+            status, answer = asyncio.run(post())
+    assert status == 400, answer["errors"]
+    _conforms(answer)
+    assert answer["status"] == "not-run"
+    assert "has 3 entries, but this run has 48 timesteps" in answer["errors"][-1]
+    assert sum("has 3 entries" in error for error in answer["errors"]) == 1
+
+    # An earlier recoverable error (a refused runtime site) does not hide the reason.
+    with _data_copy() as data_path:
+        _write_params(data_path)
+        with _web(data_path) as client, _from_file():
+
+            async def post_with_bad_site():
+                response = await client.post(
+                    "/api/v1/dry-run/naive-mpc-optim", json={**body, "site": "bogus"}
+                )
+                return response.status_code, await response.get_json()
+
+            status, answer = asyncio.run(post_with_bad_site())
+    assert status == 400, answer["errors"]
+    _conforms(answer)
+    assert answer["status"] == "not-run"
+    assert any(error.startswith("site ") for error in answer["errors"]), answer["errors"]
+    assert "has 3 entries, but this run has 48 timesteps" in answer["errors"][-1]
+
+    # The same request as a live run: /action answers 400 with the reason too.
+    with _data_copy() as data_path:
+        _write_params(data_path)
+        with _web(data_path) as client, _from_file():
+
+            async def post_live():
+                response = await client.post("/action/naive-mpc-optim", json=body)
+                return response.status_code, await response.get_data(as_text=True)
+
+            status, text = asyncio.run(post_live())
+    assert status == 400, text
+    assert "has 3 entries, but this run has 48 timesteps" in text
 
 
 def test_the_plan_and_last_run_endpoints_do_not_see_a_dry_run():
@@ -1058,9 +1134,10 @@ def test_the_plan_and_last_run_endpoints_do_not_see_a_dry_run():
 
             before = asyncio.run(endpoints())
             answer = asyncio.run(dry())
-            last_run._cache = None  # read from disk too, not only the in-memory copy
-            plan_store._cache = None
-            after = asyncio.run(endpoints())
+            # read from disk too, not only the in-memory copy; scoped here so the
+            # live snapshot is restored before _cold_cache restores the pre-test state
+            with patch.object(last_run, "_cache", None), patch.object(plan_store, "_cache", None):
+                after = asyncio.run(endpoints())
     assert before[0]["status"] == "ok" and before[1]["action"] == "dayahead-optim"
     assert after == before
     assert [r["P_grid"] for r in answer["plan"]] != live["P_grid"].tolist()
@@ -1088,7 +1165,8 @@ def test_an_empty_body_is_an_empty_request():
             return response.status_code, await response.get_json()
 
         status, answer = asyncio.run(post())
-    assert status == 200 and answer["errors"] == []
+    assert status == 200
+    assert answer["errors"] == []
     assert built.call_args.args[3] == "{}"
 
 
@@ -1129,8 +1207,10 @@ def test_a_dry_run_flag_left_in_saved_params_does_not_make_a_dry_run():
         before = _files(data_path)
         idd, res = _run(data_path, "dayahead-optim", dry=False, configure=stray)
         changed = _changed(before, _files(data_path))
-    assert isinstance(res, pd.DataFrame) and not is_dry_run(idd)
-    assert "last_run.json" in changed and "opt_res_latest.csv" in changed, changed
+    assert isinstance(res, pd.DataFrame)
+    assert not is_dry_run(idd)
+    assert "last_run.json" in changed, changed
+    assert "opt_res_latest.csv" in changed, changed
 
 
 @pytest.mark.parametrize("failure", ["home-assistant", "inputs", "raises"])
@@ -1165,8 +1245,9 @@ def test_a_failed_setup_closes_the_home_assistant_session(failure):
             )
 
         if failure == "raises":
+            building = build()
             with pytest.raises(RuntimeError, match="preparing failed"):
-                asyncio.run(build())
+                asyncio.run(building)
         else:
             assert asyncio.run(build()) is False
     close.assert_awaited_once()
@@ -1194,7 +1275,8 @@ def test_an_oversized_body_is_refused_with_413():
         status, answer = asyncio.run(post())
     assert status == 413
     _conforms(answer)
-    assert answer["errors"] and answer["errors"][-1].endswith("Nothing was run")
+    assert answer["errors"]
+    assert answer["errors"][-1].endswith("Nothing was run")
     build.assert_not_called()
 
 
@@ -1236,8 +1318,10 @@ def test_one_dry_run_runs_at_a_time():
         (first_status, first_body), (second_status, retry, second_body) = asyncio.run(
             asyncio.wait_for(both(), timeout=30)  # a queued second run would deadlock: fail instead
         )
-    assert first_status == 200 and first_body["errors"] == []
-    assert second_status == 429 and retry == "2"
+    assert first_status == 200
+    assert first_body["errors"] == []
+    assert second_status == 429
+    assert retry == "2"
     _conforms(second_body)
     assert "one runs at a time" in second_body["errors"][-1]
     assert built.await_count == 1
@@ -1269,7 +1353,8 @@ def test_a_dry_run_on_another_worker_holds_the_slot():
             finally:
                 utils.unlock_file(other_worker)
         free = asyncio.run(client.post("/api/v1/dry-run/naive-mpc-optim", json={}))
-    assert busy.status_code == 429 and free.status_code == 200
+    assert busy.status_code == 429
+    assert free.status_code == 200
 
 
 def test_accepted_flags_reach_the_run_as_booleans():
@@ -1355,7 +1440,9 @@ def test_a_failing_live_request_does_not_fail_a_dry_run():
         return False
 
     (dry_status, dry_body), live_status, action_log = _overlapping(dry_wrapper, live_wrapper)
-    assert dry_status == 200 and dry_body["errors"] == [] and dry_body["status"] == "ok"
+    assert dry_status == 200
+    assert dry_body["errors"] == []
+    assert dry_body["status"] == "ok"
     _conforms(dry_body)
     assert live_status == 400
     assert "the live solve failed" in action_log
@@ -1379,7 +1466,8 @@ def test_a_failing_dry_run_does_not_fail_a_live_request():
 
     (dry_status, dry_body), live_status, action_log = _overlapping(dry_wrapper, live_wrapper)
     assert live_status == 200
-    assert dry_status == 400 and dry_body["errors"] == ["the trial inputs are infeasible"]
+    assert dry_status == 400
+    assert dry_body["errors"] == ["the trial inputs are infeasible"]
     _conforms(dry_body)
     assert "infeasible" not in action_log
 
@@ -1392,7 +1480,8 @@ def test_a_dry_run_that_raises_answers_500_with_its_error():
         return _plan()
 
     (dry_status, dry_body), live_status, _ = _overlapping(dry_wrapper, live_wrapper)
-    assert dry_status == 500 and live_status == 200
+    assert dry_status == 500
+    assert live_status == 200
     _conforms(dry_body)
     assert any("solver crashed" in e for e in dry_body["errors"])
 
@@ -1426,15 +1515,8 @@ def test_the_command_line_refuses_a_dry_run(asked):
 def test_a_snapshot_is_not_stored():
     """last_run.snapshot builds the record that record() stores, and stores
     nothing itself."""
-    saved = last_run._cache
-    try:
-        last_run._cache = None
-        snap = last_run.snapshot(
-            "dayahead-optim", {"optim_solve": 0.1}, "Infeasible", True, 1.0, "1.0"
-        )
-        assert last_run._cache is None
-    finally:
-        last_run._cache = saved
+    snap = last_run.snapshot("dayahead-optim", {"optim_solve": 0.1}, "Infeasible", True, 1.0, "1.0")
+    assert last_run._cache is None
     assert snap["status"] == "infeasible" and snap["action"] == "dayahead-optim"
     assert set(snap) == set(SCHEMA["allOf"][0]["else"]["required"]) | {"status", "action"}
 
@@ -1498,7 +1580,8 @@ def test_a_failing_coordinator_falls_back_to_the_default_solver(dry, caplog):
         data_path = pathlib.Path(tmp) / "data"
         shutil.copytree(root / "data", data_path)
         res = _coordinated(data_path, {}, dry=dry)
-    assert isinstance(res, pd.DataFrame) and len(res) > 0
+    assert isinstance(res, pd.DataFrame)
+    assert len(res) > 0
     assert (res["optim_status"] == "Optimal").all()
     assert "coordinator raised RuntimeError" in caplog.text
     # ...and the plan says which solver made it, and why
@@ -1527,6 +1610,11 @@ SITE = [
     {"id": "deferrable1", "parent": "garage", "group": "loads"},
     {"id": "deferrable2", "parent": "heat"},
 ]
+REMOTE = {
+    "id": "garage_emhass",
+    "parent": "garage",
+    "solver": {"url": "http://emhass-garage:5000/participant", "token_secret": "garage_token"},
+}
 
 
 def _with(index: int, **change):
@@ -1579,9 +1667,14 @@ def _with(index: int, **change):
         (SITE + [{"id": "garage", "parent": "grid", "type": "breaker"}], "appears twice"),
         ([{"id": "a", "parent": "b"}, {"id": "b", "parent": "a"}], "form a loop"),
         (
-            [{"id": "x", "parent": "grid", "solver": {"url": "http://h/"}}],
-            "may have only",
+            [{"id": "x", "parent": "grid", "solver": {"url": "file:///etc/passwd"}}],
+            "solver must be {url",
         ),
+        (
+            [{"id": "x", "parent": "grid", "solver": {"url": "http://h/", "rogue": 1}}],
+            "solver must be {url",
+        ),
+        ([{**REMOTE, "solver": {**REMOTE["solver"], "token_secret": "A!"}}], "must name a secret"),
     ],
 )
 def test_the_site_is_checked_before_anything_reads_it(site, problem):
@@ -1589,12 +1682,13 @@ def test_the_site_is_checked_before_anything_reads_it(site, problem):
     first; anything unexpected means the default solver, never an exception or
     an unknown name reaching the coordinator."""
     reason = _coordinated_config_problem({"optimization_backend": "dantzig_wolfe", "site": site})
-    assert reason and problem in reason
+    assert reason
+    assert problem in reason
 
 
 def test_a_known_backend_and_a_valid_site_pass():
     assert _coordinated_config_problem({"optimization_backend": "dantzig_wolfe"}) is None
-    for site in (SITE, []):
+    for site in (SITE, SITE + [REMOTE], []):
         assert (
             _coordinated_config_problem({"optimization_backend": "dantzig_wolfe", "site": site})
             is None
@@ -1602,6 +1696,14 @@ def test_a_known_backend_and_a_valid_site_pass():
     assert "unknown backend" in _coordinated_config_problem({"optimization_backend": "rogue"})
     # documented as future work, not offered: it says so and the default solver plans
     assert "later release" in _coordinated_config_problem({"optimization_backend": "admm"})
+
+
+def test_a_remote_solver_comes_from_the_configuration_only():
+    """A site sent with a request may not name a remote solver: no request
+    makes EMHASS call a host of its choosing."""
+    assert site_mod.site_problem(SITE + [REMOTE]) is None
+    reason = site_mod.site_problem(SITE + [REMOTE], from_request=True)
+    assert reason and "from the configuration only" in reason
 
 
 def test_the_published_schema_is_the_check():
@@ -1618,6 +1720,7 @@ def test_the_published_schema_is_the_check():
         "a node": "node",
         "a limit": "limit",
         "a device": "device",
+        "a remote solver": "remote",
     }
     # the PV is a device with a parent and nothing else (the check refuses
     # a solver, group or limits on it), so it has its own alternative
@@ -1626,8 +1729,10 @@ def test_the_published_schema_is_the_check():
         assert kinds[title]["additionalProperties"] is False
         assert set(kinds[title]["properties"]) == site_mod._SITE_KEYS[kind]
     pv = kinds["the PV"]
-    assert pv["additionalProperties"] is False and set(pv["properties"]) == {"id", "parent"}
-    assert pv["properties"]["id"] == {"const": "pv"} and "parent" in pv["required"]
+    assert pv["additionalProperties"] is False
+    assert set(pv["properties"]) == {"id", "parent"}
+    assert pv["properties"]["id"] == {"const": "pv"}
+    assert "parent" in pv["required"]
     device = kinds["a device"]["properties"]
     # the PV's id and the devices' together are exactly the check's device names
     for name in ("pv", "battery", "battery0", "battery9", "deferrable0", "deferrable123"):
@@ -1639,13 +1744,14 @@ def test_the_published_schema_is_the_check():
     assert device["solver"]["enum"] == list(site_mod._SITE_SOLVERS)
     assert kinds["a node"]["properties"]["type"]["enum"] == list(site_mod._SITE_NODE_TYPES)
     assert kinds["a node"]["properties"]["id"]["pattern"] == site_mod._SITE_ID.pattern
-    for title in ("a node", "a device"):
+    for title in ("a node", "a device", "a remote solver"):
         assert "parent" in kinds[title]["required"]
     # null efficiencies, which the check reads as omitted, validate too
     node = kinds["a node"]["properties"]
     for key in ("efficiency_import", "efficiency_export"):
         assert set(node[key]["type"]) == {"number", "null"}
-        assert node[key]["exclusiveMinimum"] == 0 and node[key]["maximum"] == 1
+        assert node[key]["exclusiveMinimum"] == 0
+        assert node[key]["maximum"] == 1
 
 
 def test_the_sites_meter_and_inverter_set_emhass_keys(caplog):
@@ -1750,7 +1856,8 @@ def test_an_omitted_inverter_rating_keeps_the_configured_cap(omitted, plant_key,
 def test_the_input_pipeline_compiles_the_site():
     """Set in the configuration (or a request), the site's inverter and meter
     reach the default solver's plant configuration; a request's site that
-    cannot be used is not, and the configured one stays."""
+    cannot be used - one naming a remote solver - is not, and the configured
+    one stays."""
 
     async def run(runtime: dict):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1775,9 +1882,11 @@ def test_the_input_pipeline_compiles_the_site():
             return idd["opt"].plant_conf, idd["opt"].optim_conf
 
     plant, _ = asyncio.run(run({}))
-    assert plant["inverter_is_hybrid"] is True and plant["inverter_ac_output_max"] == 4000
+    assert plant["inverter_is_hybrid"] is True
+    assert plant["inverter_ac_output_max"] == 4000
     assert plant["maximum_power_to_grid"] == 5000
-    _, optim = asyncio.run(run({"site": [{"id": "battery"}]}))  # no parent
+    # a site that is whole but for its remote: refused for the remote alone
+    _, optim = asyncio.run(run({"site": SITE + [REMOTE]}))
     assert optim["site"] == SITE  # the configured one, kept
 
 
@@ -1826,7 +1935,8 @@ def test_a_malformed_site_in_a_request_still_plans(dry, caplog):
         data_path = pathlib.Path(tmp) / "data"
         shutil.copytree(root / "data", data_path)
         res = _coordinated(data_path, {"site": [{"nodevices": 1}]}, site=None, dry=dry)
-    assert isinstance(res, pd.DataFrame) and len(res) > 0
+    assert isinstance(res, pd.DataFrame)
+    assert len(res) > 0
     # the request's site is refused by the check, by name, and the configured one kept
     assert "site (in the request): site[0] must be an object with an id" in caplog.text
     assert "the configured site is kept" in caplog.text
@@ -1900,7 +2010,8 @@ def test_several_inverters_never_reach_the_coordinator():
         lambda *a, **k: pytest.fail("the coordinator was asked"),
     ):
         res, reason = optimization._coordinated_plan(opt)
-    assert res is None and "number_of_inverters is 3" in reason
+    assert res is None
+    assert "number_of_inverters is 3" in reason
 
 
 INVERTER = {"id": "inverter", "parent": "grid", "type": "hybrid_inverter", "max_export": 4000}
@@ -1934,13 +2045,15 @@ def test_emhass_holds_the_inverter_only_with_the_battery_where_site_puts_it(
 def test_a_parent_that_is_not_a_name_is_refused(parent):
     """A parent of the wrong type is reported, not a TypeError."""
     site = [{"id": "grid"}, {"id": "battery", "parent": parent}]
-    reason = site_mod.site_problem(site)
-    assert reason and "parent must be" in reason
+    reason = site_mod.site_problem(site, from_request=True)
+    assert reason
+    assert "parent must be" in reason
 
 
 @pytest.mark.parametrize("site", [42, "grid", {"id": "grid"}])
 def test_a_site_that_is_not_a_list_still_builds_the_parameters(site):
-    """build_params takes a site of any shape; the site check reports it."""
+    """build_params gathers the remote tokens only from a list; anything else
+    is left to the site check to report."""
     ec = _conf(root / "data")
 
     async def build():
@@ -1949,7 +2062,8 @@ def test_a_site_that_is_not_a_list_still_builds_the_parameters(site):
         config["site"] = site
         return await build_params(ec, secrets, config, logger)
 
-    asyncio.run(build())
+    params = asyncio.run(build())
+    assert "remote_tokens" not in params["retrieve_hass_conf"]
     assert _coordinated_config_problem({"optimization_backend": "dantzig_wolfe", "site": site})
 
 
@@ -1990,4 +2104,60 @@ def test_the_coordinator_gets_the_battery_endpoints_the_default_solver_uses(init
     kw = optimization._soc_endpoints_as_the_default_solver(
         opt, {"soc_init": init, "soc_final": final, "debug": False}
     )
-    assert (kw["soc_init"], kw["soc_final"]) == expected and kw["debug"] is False
+    assert (kw["soc_init"], kw["soc_final"]) == expected
+    assert kw["debug"] is False
+
+
+def test_a_cached_problem_takes_the_remote_tokens_as_configured_now():
+    """A rotated token reaches the coordinator: the token map is part of the
+    cache key (as a digest), so other tokens get their own optimizer - never
+    the one another request may be solving with - and the same tokens reuse it."""
+
+    async def build(data_path, token):
+        params = await _params(data_path)
+        params["retrieve_hass_conf"]["remote_tokens"] = {"garage_token": token}
+        return await set_input_data_dict(
+            _conf(data_path),
+            "profit",
+            orjson.dumps(params).decode(),
+            orjson.dumps(FORECASTS).decode(),
+            "dayahead-optim",
+            logger,
+            get_data_from_file=True,
+        )
+
+    with _data_copy() as data_path:
+        first = asyncio.run(build(data_path, "old"))
+        second = asyncio.run(build(data_path, "rotated"))
+        third = asyncio.run(build(data_path, "rotated"))
+    assert second["opt"] is not first["opt"], "other tokens: another optimizer"
+    assert first["opt"].retrieve_hass_conf["remote_tokens"] == {"garage_token": "old"}
+    assert second["opt"].retrieve_hass_conf["remote_tokens"] == {"garage_token": "rotated"}
+    assert third["opt"] is second["opt"], "the same tokens: the cache"
+
+
+def test_remote_tokens_are_masked_as_the_other_secrets(caplog):
+    """The tokens a coordinator presents never reach the log nor a
+    configuration export."""
+    sentinel = "s3ntinel-" + uuid.uuid4().hex
+
+    async def build(data_path):
+        params = await _params(data_path)
+        params["retrieve_hass_conf"]["remote_tokens"] = {"garage_token": sentinel}
+        idd = await set_input_data_dict(
+            _conf(data_path),
+            "profit",
+            orjson.dumps(params).decode(),
+            orjson.dumps(FORECASTS).decode(),
+            "dayahead-optim",
+            logger,
+            get_data_from_file=True,
+        )
+        return params, idd
+
+    with _data_copy() as data_path, caplog.at_level(logging.DEBUG):
+        params, idd = asyncio.run(build(data_path))
+    assert idd["opt"].retrieve_hass_conf["remote_tokens"] == {"garage_token": sentinel}
+    assert "Initialized Optimization with retrieve_hass_conf" in caplog.text
+    assert sentinel not in caplog.text
+    assert sentinel not in json.dumps(utils.param_to_config(params, logger), default=str)

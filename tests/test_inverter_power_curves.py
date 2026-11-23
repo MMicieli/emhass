@@ -246,7 +246,8 @@ def _build_params(overrides: dict) -> dict:
 def test_default_config_has_empty_curves_and_unchanged_scalars():
     params = _build_params({})
     plant_conf = params["plant_conf"]
-    assert plant_conf[DC_AC] == [] and plant_conf[AC_DC] == []
+    assert plant_conf[DC_AC] == []
+    assert plant_conf[AC_DC] == []
     assert plant_conf["inverter_efficiency_dc_ac"] == 1.0
     assert plant_conf["inverter_efficiency_ac_dc"] == 1.0
 
@@ -285,8 +286,10 @@ def test_curves_invalidate_the_optimization_cache_through_plant_conf_hash():
         )
 
     other = [[1000, 0.8], [5000, 0.92]]
-    assert key() == key()  # default (empty) curves: stable
-    assert key(**{DC_AC: DISCHARGE_CURVE}) == key(**{DC_AC: DISCHARGE_CURVE})
+    default_key = key()
+    assert default_key == key()  # independently generated default keys are stable
+    discharge_key = key(**{DC_AC: DISCHARGE_CURVE})
+    assert discharge_key == key(**{DC_AC: DISCHARGE_CURVE})
     assert key(**{DC_AC: DISCHARGE_CURVE}) != key()
     assert key(**{DC_AC: DISCHARGE_CURVE}) != key(**{DC_AC: other})
     assert key(**{AC_DC: CHARGE_CURVE}) != key()
@@ -307,7 +310,8 @@ def test_inverter_count_and_index_lists_invalidate_the_optimization_cache_key():
             params["optim_conf"], params["plant_conf"], "profit", rh
         )
 
-    assert key() == key()
+    default_key = key()
+    assert default_key == key()
     assert key(number_of_inverters=2) != key()
     assert key(battery_inverter_index=[0]) != key()
     assert key(pv_plant_inverter_index=[0]) != key()
@@ -357,25 +361,25 @@ def test_runtime_curve_is_validated_on_the_runtime_path():
 
     *_, treated_plant = asyncio.run(_treat({AC_DC: CHARGE_CURVE}))
     assert treated_plant[AC_DC] == CHARGE_CURVE
+    treating_bad_curve = _treat({AC_DC: [[1000, 1.1], [2000, 0.9]]})
     with pytest.raises(ValueError, match=AC_DC):
-        asyncio.run(_treat({AC_DC: [[1000, 1.1], [2000, 0.9]]}))
+        asyncio.run(treating_bad_curve)
     # Strict also when the persisted config had no curve and hybrid is off.
     off = _build_params({"inverter_is_hybrid": False})
     off_json = orjson.dumps(off).decode("utf-8")
     off_rh, off_optim, off_plant = utils.get_yaml_parse(off_json, logger)
+    treating_with_hybrid_off = utils.treat_runtimeparams(
+        orjson.dumps({AC_DC: CHARGE_CURVE}).decode("utf-8"),
+        off_json,
+        off_rh,
+        off_optim,
+        off_plant,
+        "dayahead-optim",
+        logger,
+        EMHASS_CONF,
+    )
     with pytest.raises(ValueError, match="inverter_is_hybrid"):
-        asyncio.run(
-            utils.treat_runtimeparams(
-                orjson.dumps({AC_DC: CHARGE_CURVE}).decode("utf-8"),
-                off_json,
-                off_rh,
-                off_optim,
-                off_plant,
-                "dayahead-optim",
-                logger,
-                EMHASS_CONF,
-            )
-        )
+        asyncio.run(treating_with_hybrid_off)
 
 
 # --------------------------------------------------------------------------- #
@@ -436,7 +440,9 @@ def test_a_one_entry_curve_list_is_still_validated_at_one_inverter():
 def test_a_curve_list_of_the_wrong_length_is_a_fault_at_one_inverter(caplog):
     conf = {"inverter_is_hybrid": True, DC_AC: [DISCHARGE_CURVE, []]}
     faults = utils.inverter_power_curve_faults(conf)
-    assert len(faults) == 1 and DC_AC in faults[0] and "number_of_inverters=1" in faults[0]
+    assert len(faults) == 1
+    assert DC_AC in faults[0]
+    assert "number_of_inverters=1" in faults[0]
     assert "give one curve" in faults[0]
     with pytest.raises(ValueError, match="number_of_inverters=1"):
         utils.check_inverter_power_curves(dict(conf), logger)
@@ -453,7 +459,8 @@ def test_a_two_point_curve_is_not_mistaken_for_a_list_of_two_curves():
     conf = _two_inverter_conf(**{DC_AC: DISCHARGE_CURVE})
     faults = utils.inverter_power_curve_faults(conf)
     assert len(faults) == 1
-    assert "single curve" in faults[0] and "not broadcast" in faults[0]
+    assert "single curve" in faults[0]
+    assert "not broadcast" in faults[0]
     assert "number_of_inverters=2" in faults[0]
     with pytest.raises(ValueError, match="single curve"):
         utils.check_inverter_power_curves(dict(conf), logger)
@@ -488,10 +495,8 @@ def test_a_curve_list_of_the_wrong_length_is_a_fault_above_one_inverter(length):
     conf = _two_inverter_conf(**{DC_AC: [DISCHARGE_CURVE] * length})
     faults = utils.inverter_power_curve_faults(conf)
     assert len(faults) == 1
-    assert (
-        f"has {length} {'curve' if length == 1 else 'curves'}" in faults[0]
-        and "number_of_inverters=2" in faults[0]
-    )
+    assert f"has {length} {'curve' if length == 1 else 'curves'}" in faults[0]
+    assert "number_of_inverters=2" in faults[0]
     with pytest.raises(ValueError, match="number_of_inverters=2"):
         utils.check_inverter_power_curves(dict(conf), logger)
     recovered = dict(conf)
@@ -502,7 +507,9 @@ def test_a_curve_list_of_the_wrong_length_is_a_fault_above_one_inverter(length):
 def test_each_curve_entry_is_validated_and_named_above_one_inverter(caplog):
     conf = _two_inverter_conf(**{DC_AC: [DISCHARGE_CURVE, INVALID_CURVE]})
     faults = utils.inverter_power_curve_faults(conf)
-    assert len(faults) == 1 and f"{DC_AC}[1]" in faults[0] and "efficiency" in faults[0]
+    assert len(faults) == 1
+    assert f"{DC_AC}[1]" in faults[0]
+    assert "efficiency" in faults[0]
     with pytest.raises(ValueError, match=rf"{DC_AC}\[1\]"):
         utils.check_inverter_power_curves(dict(conf), logger)
     with caplog.at_level(logging.ERROR):
@@ -538,7 +545,8 @@ def test_curve_ending_below_that_inverters_cap_warns_above_one_inverter(caplog):
         utils.check_inverter_power_curves(conf, logger)
     warnings = _warnings(caplog, "supported power domain")
     assert len(warnings) == 1
-    assert f"{DC_AC}[1]" in warnings[0] and "inverter_ac_output_max[1]=6000" in warnings[0]
+    assert f"{DC_AC}[1]" in warnings[0]
+    assert "inverter_ac_output_max[1]=6000" in warnings[0]
 
 
 def test_a_cap_that_is_not_a_list_skips_the_below_cap_warning(caplog):
@@ -714,7 +722,8 @@ def test_set_config_with_hybrid_off_keeps_a_valid_curve_dormant(web):
     assert status == 200
     saved = json.loads(web.conf["config_path"].read_text())
     assert saved["inverter_is_hybrid"] is False
-    assert saved[DC_AC] == DISCHARGE_CURVE and saved[AC_DC] == CHARGE_CURVE
+    assert saved[DC_AC] == DISCHARGE_CURVE
+    assert saved[AC_DC] == CHARGE_CURVE
 
 
 def test_get_config_still_serves_a_config_whose_persisted_curve_is_invalid(web):
@@ -774,7 +783,8 @@ def test_set_config_saves_the_ui_shaped_lists_as_the_one_inverter_scalars(web):
     assert saved["inverter_efficiency_ac_dc"] == 0.96
     assert saved["inverter_stress_cost"] == 0.0
     assert saved["compute_curtailment"] is False
-    assert saved[DC_AC] == DISCHARGE_CURVE and saved[AC_DC] == []
+    assert saved[DC_AC] == DISCHARGE_CURVE
+    assert saved[AC_DC] == []
     # An empty array input points at nothing: the keys keep their null default
     # instead of gaining a [null] list.
     assert saved["battery_inverter_index"] is None
@@ -786,9 +796,8 @@ def test_set_config_rejects_a_wrong_length_list_at_one_inverter(web):
     before = _web_state(web)
     status, body = web.post({"inverter_efficiency_dc_ac": [0.9, 0.9]})
     assert status == 400
-    assert "inverter_efficiency_dc_ac" in " ".join(body) and "number_of_inverters=1" in " ".join(
-        body
-    )
+    assert "inverter_efficiency_dc_ac" in " ".join(body)
+    assert "number_of_inverters=1" in " ".join(body)
     assert _web_state(web) == before
 
 
@@ -843,7 +852,8 @@ def test_set_config_lists_a_curve_fault_and_the_other_faults_together(web):
     status, body = web.post(_two_inverter_conf(**{DC_AC: [DISCHARGE_CURVE, INVALID_CURVE]}))
     assert status == 400
     assert len(body) == 1
-    assert f"{DC_AC}[1]" in body[0] and "efficiency" in body[0]
+    assert f"{DC_AC}[1]" in body[0]
+    assert "efficiency" in body[0]
     # A fault in the other inverter settings comes after the curve fault.
     status, body = web.post(
         _two_inverter_conf(inverter_ac_output_max=5000, **{DC_AC: [INVALID_CURVE, []]})
@@ -1239,7 +1249,8 @@ def test_two_segment_discharge_curve_is_obeyed_exactly():
 def test_both_directions_enabled_never_flow_together():
     opt, res = _solve({AC_DC: CHARGE_CURVE, DC_AC: DISCHARGE_CURVE})
     n_charge, n_discharge = _assert_curve_equality(res, CHARGE_CURVE, DISCHARGE_CURVE)
-    assert n_charge > 0 and n_discharge > 0
+    assert n_charge > 0
+    assert n_discharge > 0
     p_ac_dc = np.asarray(opt.vars["p_ac_dc"].value).ravel()
     p_dc_ac = np.asarray(opt.vars["p_dc_ac"].value).ravel()
     assert np.minimum(p_ac_dc, p_dc_ac).max() <= 1e-6  # no new simultaneous charge/discharge
@@ -1381,8 +1392,10 @@ def test_charge_derating_remains_a_power_ceiling_with_a_curve():
 def test_soc_and_battery_power_limits_hold_with_curves():
     plant = {AC_DC: CHARGE_CURVE, DC_AC: DISCHARGE_CURVE}
     _, res = _solve(plant)
-    assert res["SOC_opt"].max() <= 0.95 + 1e-6 and res["SOC_opt"].min() >= 0.05 - 1e-6
-    assert res["P_batt"].max() <= CHARGE_MAX + 1.0 and (-res["P_batt"]).max() <= CHARGE_MAX + 1.0
+    assert res["SOC_opt"].max() <= 0.95 + 1e-6
+    assert res["SOC_opt"].min() >= 0.05 - 1e-6
+    assert res["P_batt"].max() <= CHARGE_MAX + 1.0
+    assert (-res["P_batt"]).max() <= CHARGE_MAX + 1.0
 
 
 def test_nodischarge_to_grid_still_binds_with_a_discharge_curve():
@@ -1430,7 +1443,8 @@ def test_default_off_graph_is_identical_for_absent_and_empty():
 
 def test_one_curved_direction_leaves_the_other_scalar():
     opt, res = _solve({AC_DC: CHARGE_CURVE, "inverter_efficiency_dc_ac": 0.9})
-    assert "inv_curve_dc_ac_u" not in opt.vars and "inv_curve_ac_dc_u" in opt.vars
+    assert "inv_curve_dc_ac_u" not in opt.vars
+    assert "inv_curve_ac_dc_u" in opt.vars
     batt = res["P_batt"].to_numpy()
     discharging = batt > 1.0
     np.testing.assert_allclose(

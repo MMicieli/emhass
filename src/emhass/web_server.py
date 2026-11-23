@@ -5,6 +5,7 @@ import asyncio
 import contextvars
 import errno
 import hashlib
+import hmac
 import logging
 import os
 import pickle
@@ -12,6 +13,7 @@ import platform
 import re
 import tempfile
 import time
+import weakref
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -265,6 +267,42 @@ async def _open_lock_slot(path: Path):
         await asyncio.to_thread(slot.close)
 
 
+def _take_live_optim_slot():
+    """The live-optimization slot for a commit that runs after its request is
+    answered (participant API, 202): ("ok", release), ("busy", None) while a
+    live optimization holds it, or ("unavailable", why). `release()` frees
+    it, from the thread that ran the commit."""
+    try:
+        slot = open(_live_optim_slot(), "a+")
+    except OSError as exc:
+        return "unavailable", str(exc)
+    # A participant's own plan stepper holds it a second or two at each slot
+    # boundary, when coordinators tend to commit: waited for, briefly; a live
+    # optimization holds it for longer, and the commit is refused (429)
+    deadline = time.monotonic() + 5.0
+    while not try_lock_file(slot):
+        if time.monotonic() >= deadline:
+            slot.close()
+            return "busy", None
+        time.sleep(0.25)
+
+    def release() -> None:
+        try:
+            unlock_file(slot)
+        finally:
+            slot.close()
+
+    return "ok", release
+
+
+def _web_workers() -> int:
+    """The web workers serving this EMHASS (gunicorn.conf.py's WEB_CONCURRENCY)."""
+    try:
+        return max(1, int(os.getenv("WEB_CONCURRENCY", "1")))
+    except ValueError:
+        return 1
+
+
 # Add custom filter for trusted HTML content
 def mark_safe(value):
     """Mark pre-rendered HTML plots as safe (use only for trusted content)"""
@@ -315,6 +353,88 @@ async def before_serving():
         app.logger.info("Continuing without WebSocket connection...")
         # The initialize() function already sets up all necessary components except WebSocket
         # So we can continue serving requests even if WebSocket connection fails
+    try:
+        await _resume_participant_steps()
+        await _participant_service_for_params()
+    except Exception as exc:  # noqa: BLE001 - serving goes on; the route says why
+        app.logger.warning(f"participant API: not resumed at start-up ({exc})")
+
+
+async def _resume_participant_steps() -> None:
+    """At start-up, a plan this EMHASS was committed to is published again
+    from its current slot - whether or not its participant API serves now
+    (switched off, its token unset): a plan committed runs on regardless."""
+    from emhass import participant_api
+
+    if _web_workers() > 1:
+        return  # no participant API, so no commit to step
+    try:
+        params = await participant_api.read_params(emhass_conf)
+    except Exception:  # noqa: BLE001 - nothing to resume from
+        return
+    if params is not None:
+        await asyncio.to_thread(
+            participant_api.resume_steps, emhass_conf, params, app.logger, _take_live_optim_slot
+        )
+
+
+async def _participant_service_for_params():
+    """The participant API's service for the saved params (None while it is
+    off). Built once per params and token; building it also goes on stepping
+    a committed plan, so at start-up a plan this EMHASS was running before a
+    restart is published again from its current slot, coordinator or not."""
+    from emhass import participant_api
+
+    try:
+        params = await participant_api.read_params(emhass_conf)
+    except Exception:  # noqa: BLE001 - reported by the route when asked
+        return None
+    token = params_secrets.get("participant_token")
+    if (
+        params is None
+        or not isinstance(params["optim_conf"].get("participant_api"), dict)
+        or not token
+        or len(token) < api_auth.MIN_LENGTH
+        or _web_workers() > 1
+    ):
+        return None
+    built_from = orjson.dumps([params, token], option=orjson.OPT_SORT_KEYS, default=str)
+    async with _participant_service_lock():  # built once, however many ask at once
+        return await _participant_service_built(params, token, built_from)
+
+
+_participant_service_locks: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _participant_service_lock() -> asyncio.Lock:
+    """The lock building the participant service, one per event loop."""
+    loop = asyncio.get_running_loop()
+    lock = _participant_service_locks.get(loop)
+    if lock is None:
+        lock = _participant_service_locks[loop] = asyncio.Lock()
+    return lock
+
+
+async def _participant_service_built(params, token, built_from):
+    global _participant_service
+    from emhass import participant_api
+
+    if _participant_service is None or _participant_service[0] != built_from:
+        service = await asyncio.to_thread(
+            participant_api.make_service,
+            emhass_conf,
+            params,
+            token,
+            app.logger,
+            begin=_take_live_optim_slot,
+        )
+        _participant_service = (built_from, service)
+    else:
+        # the same params: a quick check that the committed plan is stepped
+        await asyncio.to_thread(
+            participant_api.resume_steps, emhass_conf, params, app.logger, _take_live_optim_slot
+        )
+    return _participant_service[1]
 
 
 async def _configure_api_auth() -> None:
@@ -1193,11 +1313,205 @@ async def api_v1_plan():
             "plan": None,
         }
     else:
-        response_body = {"status": "ok", **snap}
+        # what made it (a participant API commit) is this server's own bookkeeping
+        served = {k: v for k, v in snap.items() if k not in ("origin", "plan_id")}
+        response_body = {"status": "ok", **served}
 
     response = await make_response(orjson.dumps(response_body))
     response.headers["Content-Type"] = "application/json"
     response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _log_escape(char: str) -> str:
+    """One character as it is safe to log: a backslash is doubled, a printable
+    character is kept, anything else becomes a visible backslash escape."""
+    if char == "\\":
+        return "\\\\"
+    if char.isprintable():
+        return char
+    code = ord(char)
+    kind = "x%02x" if code < 0x100 else "u%04x" if code < 0x10000 else "U%08x"
+    return "\\" + kind % code
+
+
+def _log_safe(value: object, limit: int = 200, *, double_backslash: bool = True) -> str:
+    """Render request-derived text as bounded, single-line log text.
+
+    The API token is masked first: truncating or escaping it beforehand would
+    leave a prefix or a spelling that the record-level masking cannot match.
+    Then at most ``limit`` characters are kept; a backslash and every
+    non-printable character (control characters, DEL, C1, Unicode line and
+    paragraph separators, bidi overrides, zero-width and other format
+    characters) become visible escapes, and printable text is left as it is.
+    An escape is at most ten characters, so the output is at most ``limit * 10``
+    plus the truncation marker. ``double_backslash=False`` keeps a backslash as
+    it is, for text that already carries ``repr``'s escapes.
+    """
+    text = api_auth.mask_text(str(value))
+    cut = len(text) > limit
+    escape = _log_escape if double_backslash else lambda c: c if c == "\\" else _log_escape(c)
+    text = "".join(map(escape, text[:limit]))
+    return text + "...[truncated]" if cut else text
+
+
+def _safe_exc_info(exc: BaseException):
+    """``exc_info`` for logging ``exc`` with its message made log-safe.
+
+    The logging module prints ``Type: message`` from the exception itself, so a
+    request-derived message would reach the log unescaped. The traceback frames
+    are kept; the message is escaped and bounded, and the chained exceptions
+    (whose messages are equally unvetted) are left out.
+    """
+    cls = type(exc)
+    proxy_cls = type(
+        cls.__name__, (Exception,), {"__module__": cls.__module__, "__qualname__": cls.__qualname__}
+    )
+    proxy = proxy_cls(_log_safe(exc)).with_traceback(exc.__traceback__)
+    return proxy_cls, proxy, exc.__traceback__
+
+
+_DRY_RUN_LINE_LIMIT = 1000
+_UNRENDERABLE_RECORD = "A log record could not be rendered safely"
+
+
+def _dry_run_record_safe(record: logging.LogRecord) -> bool:
+    """Make a warning or error that ``app.logger`` records during a dry run safe.
+
+    Request values reach these records from many places: the flag and inverter
+    checks, ``treat_runtimeparams`` and the run itself log them with ``%s`` or
+    ``repr`` on this logger, and the response collects the same text. So the
+    record is made safe once, here, before any handler of this logger sees it:
+    the message is masked, bounded and escaped, and the exception is replaced by
+    :func:`_safe_exc_info`. The text logging cached from the original exception
+    is dropped, so it is rebuilt from the safe one. A message that carries
+    ``repr``'s own backslashes keeps its wording. A record that cannot be
+    rendered becomes a fixed message instead, with no arguments, exception or
+    stack. INFO lines, records of other loggers and every record outside a dry
+    run are left alone.
+    """
+    if record.levelno < logging.WARNING or _dry_run_log.get() is None:
+        return True
+    try:
+        record.msg = _log_safe(record.getMessage(), _DRY_RUN_LINE_LIMIT, double_backslash=False)
+        if record.exc_info and record.exc_info[1] is not None:
+            record.exc_info = _safe_exc_info(record.exc_info[1])
+    except Exception:  # noqa: BLE001 - a log call must not fail the request
+        record.msg = _UNRENDERABLE_RECORD
+        record.exc_info = record.stack_info = None
+    record.args = record.exc_text = None
+    return True
+
+
+app.logger.addFilter(_dry_run_record_safe)
+
+
+_participant_service: tuple[bytes, object] | None = None  # (what it was built from, the service)
+PARTICIPANT_BODY_MAX = 1 << 20  # 1 MiB
+# As Quart's own BODY_TIMEOUT bounds get_data(): a body that stalls is refused.
+PARTICIPANT_BODY_TIMEOUT_S = 30.0
+
+
+async def _problem(status: int, title: str, detail: str = "", retry_after: str | None = None):
+    """An RFC 9457 problem response."""
+    body = {"type": "about:blank", "title": title, "status": status, "detail": detail}
+    response = await make_response(orjson.dumps(body), status)
+    response.headers["Content-Type"] = "application/problem+json"
+    response.headers["Cache-Control"] = "no-store"
+    if retry_after:
+        response.headers["Retry-After"] = retry_after
+    return response
+
+
+# no automatic OPTIONS answer: the hook leaves this route to its own token check,
+# so an OPTIONS request is gated as on every other route
+@app.route("/participant/v1/<path:op>", methods=["GET", "POST"], provide_automatic_options=False)
+async def participant_v1(op: str):
+    """This EMHASS's devices, served to a coordinator elsewhere: the
+    participant API (home-energy-optimizer's participant-api.v1.json) -
+    describe, baseline, query, commit. Off unless `participant_api` is set;
+    every call presents the `participant_token` secret. Only a commit has an
+    effect: the chosen plan is published, under `participant_api.publish_prefix`.
+    """
+    global _participant_service
+    from emhass import participant_api
+
+    if (request.content_length or 0) > PARTICIPANT_BODY_MAX:
+        # A query or a commit is a few kB; refused before the body is read.
+        return await _problem(413, "Content Too Large", f"at most {PARTICIPANT_BODY_MAX} bytes")
+    # A commit this EMHASS cannot take is refused as such (409: nothing ran),
+    # never "unavailable" (503), which a coordinator reads as "it may have run"
+    refused = (409, "Conflict") if op == "commit" else (503, "Service Unavailable")
+    token = params_secrets.get("participant_token")
+    if not token:
+        return await _problem(*refused, "set participant_token in the secrets")
+    if len(token) < api_auth.MIN_LENGTH:
+        # as the API token: a short token is guessable, so it is not served
+        return await _problem(
+            *refused, f"participant_token must be at least {api_auth.MIN_LENGTH} characters"
+        )
+    presented = request.headers.get("Authorization", "").encode()
+    if not hmac.compare_digest(presented, f"Bearer {token}".encode()):
+        # Before any file or body is read: a caller without the token learns
+        # nothing of the configuration and costs nothing more.
+        return await _problem(401, "Unauthorized", "present participant_token as a bearer token")
+    try:
+        params = await participant_api.read_params(emhass_conf)
+    except participant_api.ConfigUnreadable as exc:
+        return await _problem(*refused, str(exc))
+    if params is None or not isinstance(params["optim_conf"].get("participant_api"), dict):
+        return await _problem(404, "Not Found", "the participant API is off (set participant_api)")
+    if _web_workers() > 1:
+        # A coordinator's answers live in one worker's memory: its commit, sent
+        # to another worker, would name an answer that worker never gave.
+        return await _problem(
+            *refused, "the participant API needs one web worker (WEB_CONCURRENCY=1)"
+        )
+    try:
+        service = await _participant_service_for_params()
+    except Exception as exc:  # noqa: BLE001 - nothing ran: said so
+        service = None
+        app.logger.warning(f"participant API: the service could not be started ({exc})")
+    if service is None:
+        return await _problem(*refused, "the participant API could not be started")
+    # A chunked body has no Content-Length: the limit holds on what arrives,
+    # and the whole body must arrive in time.
+    received = bytearray()
+
+    async def receive() -> bool:
+        async for chunk in request.body:
+            received.extend(chunk)
+            if len(received) > PARTICIPANT_BODY_MAX:
+                return False
+        return True
+
+    try:
+        within = await asyncio.wait_for(receive(), PARTICIPANT_BODY_TIMEOUT_S)
+    except TimeoutError:
+        return await _problem(
+            408,
+            "Request Timeout",
+            f"the body did not arrive within {PARTICIPANT_BODY_TIMEOUT_S:g} s",
+        )
+    if not within:
+        return await _problem(413, "Content Too Large", f"at most {PARTICIPANT_BODY_MAX} bytes")
+    body = bytes(received)
+    # A commit ends a live run - it writes the latest results and publishes - so
+    # it takes the live-optimization slot, as POST /action/<optimization> does
+    # (the service's `begin`), and is refused (429) while this EMHASS runs its
+    # own. It is answered at once (202) and runs after, holding the slot until
+    # it has; its outcome is then at GET /participant/v1/commit/<id>. Queries
+    # are not slotted: they write nothing, and belong to another EMHASS's run.
+    status, out = await asyncio.to_thread(
+        service.handle, request.method, f"/v1/{op}", dict(request.headers), body
+    )
+    response = await make_response(orjson.dumps(out), status)
+    response.headers["Content-Type"] = (
+        "application/problem+json" if status >= 400 else "application/json"
+    )
+    response.headers["Cache-Control"] = "no-store"
+    if status in (429, 503):
+        response.headers["Retry-After"] = "2"
     return response
 
 
@@ -1247,7 +1561,10 @@ async def api_v1_dry_run(action_name: str):
         app.logger.error(f"{exc.description} Nothing was run")
         body, code = {"status": "not-run", "plan": None}, exc.code or 400
     except Exception as exc:  # noqa: BLE001 - reported in the response, never raised
-        app.logger.exception(f"Dry run of {action_name} failed: {exc}")
+        app.logger.error(
+            f"Dry run of {_log_safe(action_name)} failed: {_log_safe(exc)}",
+            exc_info=exc,
+        )
         body, code = {"status": "not-run", "plan": None}, 500
     finally:
         _dry_run_log.reset(token)
@@ -1281,7 +1598,8 @@ async def _dry_run(action_name: str) -> tuple[dict, int]:
     }
     if action_name not in DRY_RUN_ACTIONS:
         app.logger.error(
-            f"A dry run is for {', '.join(DRY_RUN_ACTIONS)}, not {action_name!r}. Nothing was run"
+            f"A dry run is for {', '.join(DRY_RUN_ACTIONS)}, not '{_log_safe(action_name)}'. "
+            "Nothing was run"
         )
         return not_run, 400
     raw = await request.get_data()
@@ -1339,6 +1657,13 @@ async def _dry_run(action_name: str) -> tuple[dict, int]:
     except InverterConfigError as exc:
         # Same as /action: a plan the inverter settings rule out is a bad request.
         _explain(str(exc))
+        return not_run, 400
+    except RuntimeParamError as exc:
+        # Same as /action: a runtime value the optimizer can only check once the
+        # run's horizon is known, e.g. a deferrable_load_groups max_power list (#1366).
+        # Logged as an error, not explained, so it shows even after an earlier
+        # recoverable error, such as a runtime site that was refused.
+        app.logger.error(f"{exc}. Nothing was solved")
         return not_run, 400
     finally:
         if "rh" in input_data_dict:
