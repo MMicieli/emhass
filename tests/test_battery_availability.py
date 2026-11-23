@@ -6,7 +6,9 @@ departure and ``battery_discharge_energy_max``.
 Synthetic and self-contained, built on the multi-battery test helper.
 """
 
+import inspect
 import unittest
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -45,6 +47,13 @@ def scenario():
 
 
 def run(opt, **kwargs):
+    # Older sources do not take battery_discharge_availability; drop it there so
+    # the behavioural assertions, not a TypeError, are what fails.
+    if (
+        "battery_discharge_availability"
+        not in inspect.signature(opt.perform_naive_mpc_optim).parameters
+    ):
+        kwargs.pop("battery_discharge_availability", None)
     p_pv, p_load, df_input = scenario()
     kwargs.setdefault("soc_init", [0.5, 0.5])
     kwargs.setdefault("soc_final", [0.5, 0.5])
@@ -60,6 +69,11 @@ def run(opt, **kwargs):
         **kwargs,
     )
     return res
+
+
+def _warned(warning, text):
+    """True if a mocked logger.warning call contained text."""
+    return any(text in str(call.args[0]) for call in warning.call_args_list if call.args)
 
 
 class TestBatteryAvailability(unittest.TestCase):
@@ -182,6 +196,69 @@ class TestBatteryAvailability(unittest.TestCase):
         self.assertEqual(opt.param_soc_low_required[1].value, 1.0)
         self.assertGreaterEqual(res["SOC_opt_1"].to_numpy()[5], 0.2 - 1e-4)
 
+    def test_recovery_check_counts_charge_efficiency(self):
+        """The EV is plugged in for one 30 min step. It charges at 11000 W on the
+        grid side with 0.95 efficiency, so it can store at most
+        11000 * 0.95 * 0.5 = 5225 Wh (not 5500). A 5400 Wh gap to soc_min cannot
+        be closed, so the minimum is dropped with a warning instead of the
+        problem going infeasible. Gaps inside the real reach keep it enforced,
+        including with availability below the efficiency, where the
+        availability ceiling binds (0.5 * 11000 * 0.5 = 2750 Wh).
+        """
+        one_step = [1] + [0] * (N - 1)
+        half_step = [0.5] + [0] * (N - 1)
+        # (soc_init, EV availability, low_gap Wh, recoverable)
+        cases = (
+            (0.11, one_step, 5400, False),
+            (0.115, one_step, 5100, True),
+            (0.155, half_step, 2700, True),
+        )
+        for soc_init, availability, gap, recoverable in cases:
+            with self.subTest(soc_init=soc_init, gap=gap):
+                opt = build_optimization(plant_overrides=HOUSE_AND_EV)
+                with mock.patch.object(opt.logger, "warning", wraps=opt.logger.warning) as warning:
+                    res = run(
+                        opt,
+                        soc_init=[0.5, soc_init],
+                        soc_final=[0.5, 0.2],
+                        battery_availability=[None, availability],
+                    )
+                self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+                self.assertAlmostEqual(opt.param_soc_low_gap[1].value, gap, places=3)
+                warned = _warned(warning, "cannot recover")
+                if recoverable:
+                    self.assertEqual(opt.param_soc_low_required[1].value, 1.0)
+                    self.assertFalse(warned)
+                    self.assertGreaterEqual(res["SOC_opt_1"].to_numpy()[0], 0.2 - 1e-4)
+                else:
+                    self.assertEqual(opt.param_soc_low_required[1].value, 0.0)
+                    self.assertTrue(warned)
+
+    def test_recovery_check_with_derating_below_soc_min(self):
+        """Below soc_min the SoC may not fall before it recovers, so the EV
+        cannot dip under a derating threshold to charge faster. From 0.11 with
+        [[0.1, 0.2]] and three connected steps it stores at most
+        3 * 11000 * 0.2 * 0.5 = 3300 Wh, short of the 5400 Wh gap, so the
+        minimum is dropped with a warning instead of the run going infeasible.
+        From 0.17 the 1800 Wh gap fits and the minimum stays enforced.
+        """
+        plant = dict(HOUSE_AND_EV, battery_charge_power_derating=[[0.1, 0.2]])
+        three_steps = [1, 1, 1] + [0] * (N - 3)
+        for soc_init, recoverable in ((0.11, False), (0.17, True)):
+            with self.subTest(soc_init=soc_init):
+                opt = build_optimization(plant_overrides=plant)
+                with mock.patch.object(opt.logger, "warning", wraps=opt.logger.warning) as warning:
+                    run(
+                        opt,
+                        soc_init=[0.5, soc_init],
+                        soc_final=[0.5, 0.2],
+                        battery_availability=[None, three_steps],
+                    )
+                self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+                warned = _warned(warning, "cannot recover")
+                self.assertEqual(warned, not recoverable)
+                self.assertEqual(opt.param_soc_low_required[1].value, float(recoverable))
+
     def test_absent_ev_below_min_soc_stays_feasible(self):
         """An EV that is not connected at all, with soc_init below soc_min,
         must not make the LP infeasible (no recovery is possible)."""
@@ -255,6 +332,136 @@ class TestBatteryAvailability(unittest.TestCase):
         np.testing.assert_allclose(res["P_batt"].to_numpy()[:6], 0.0, atol=1e-6)
         # read as a time series, not as "unavailable": it works in the second half
         self.assertGreater(np.abs(res["P_batt"].to_numpy()[6:]).max(), 1.0)
+
+
+class TestBatteryDischargeAvailability(unittest.TestCase):
+    """battery_discharge_availability (#1348) caps the discharge only."""
+
+    def test_zero_blocks_discharge_but_not_charge(self):
+        # Counterfactual: free, the EV charges cheap and sells back in the dear half.
+        free = build_optimization(plant_overrides=HOUSE_AND_EV)
+        p_free = run(free, soc_init=[0.5, 0.3], soc_final=[0.5, 0.5])["P_batt_1"].to_numpy()
+        self.assertGreater(p_free.max(), 1.0)
+        opt = build_optimization(plant_overrides=HOUSE_AND_EV)
+        res = run(
+            opt,
+            soc_init=[0.5, 0.3],
+            soc_final=[0.5, 0.5],
+            battery_discharge_availability=[None, 0],
+        )
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        p1 = res["P_batt_1"].to_numpy()
+        self.assertLessEqual(p1.max(), 1e-6)
+        # still charges: battery_availability 0 would freeze it at 0.3
+        self.assertLess(p1.min(), -1.0)
+        self.assertAlmostEqual(res["SOC_opt_1"].to_numpy()[-1], 0.5, delta=1e-4)
+        # the house battery is not affected
+        self.assertGreater(res["P_batt_0"].to_numpy().max(), 1.0)
+
+    def test_fraction_caps_the_discharge_power(self):
+        dis_cap = 0.95 * 0.5 * 7000
+        free = build_optimization(plant_overrides=HOUSE_AND_EV)
+        p_free = run(free, soc_final=[0.5, 0.4])["P_batt_1"].to_numpy()
+        self.assertGreater(p_free.max(), dis_cap + 1.0)
+        opt = build_optimization(plant_overrides=HOUSE_AND_EV)
+        res = run(opt, soc_final=[0.5, 0.4], battery_discharge_availability=[1, 0.5])
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertLessEqual(res["P_batt_1"].to_numpy().max(), dis_cap + 1e-3)
+        np.testing.assert_allclose(opt.param_batt_discharge_ceiling[1].value, 0.5 * 7000)
+        np.testing.assert_allclose(opt.param_batt_charge_ceiling[1].value, 11000)
+
+    def test_multiplies_with_battery_availability(self):
+        opt = build_optimization(plant_overrides=HOUSE_AND_EV)
+        run(
+            opt,
+            battery_availability=[1, [1] * 6 + [0.5] * 6],
+            battery_discharge_availability=[None, [0.5] * 3 + [1] * 9],
+        )
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        np.testing.assert_allclose(
+            opt.param_batt_discharge_ceiling[1].value,
+            np.array([0.5] * 3 + [1] * 3 + [0.5] * 6) * 7000,
+        )
+        np.testing.assert_allclose(
+            opt.param_batt_charge_ceiling[1].value, np.array([1] * 6 + [0.5] * 6) * 11000
+        )
+        np.testing.assert_allclose(opt.param_batt_discharge_ceiling[0].value, 5000)
+
+    def test_default_and_all_ones_are_a_no_op(self):
+        a = build_optimization(plant_overrides=HOUSE_AND_EV)
+        res_a = run(a)
+        for value in (None, 1, [1, [1.0] * N], [None, None]):
+            with self.subTest(battery_discharge_availability=value):
+                b = build_optimization(plant_overrides=HOUSE_AND_EV)
+                res_b = run(b, battery_discharge_availability=value)
+                self.assertEqual(len(a.prob.constraints), len(b.prob.constraints))
+                self.assertEqual(a.prob.value, b.prob.value)
+                for k in range(2):
+                    np.testing.assert_array_equal(
+                        a.param_batt_discharge_ceiling[k].value,
+                        b.param_batt_discharge_ceiling[k].value,
+                    )
+                    np.testing.assert_array_equal(
+                        a.param_soc_high_required[k].value, b.param_soc_high_required[k].value
+                    )
+                    np.testing.assert_array_equal(
+                        res_a[f"P_batt_{k}"].to_numpy(), res_b[f"P_batt_{k}"].to_numpy()
+                    )
+
+    def test_above_soc_max_with_discharge_blocked_stays_feasible(self):
+        """The EV is above its maximum SoC and may not discharge: the maximum is
+        not enforced for it in this run, as with battery_availability 0."""
+        opt = build_optimization(plant_overrides=HOUSE_AND_EV)
+        res = run(
+            opt,
+            soc_init=[0.5, 0.95],
+            soc_final=[0.5, 0.9],
+            battery_discharge_availability=[None, 0],
+        )
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertEqual(opt.param_soc_high_required[1].value, 0.0)
+        self.assertLessEqual(res["P_batt_1"].to_numpy().max(), 1e-6)
+
+    def test_departure_target_ignores_a_discharge_only_zero(self):
+        """A battery that may not discharge is still connected for charging, so a
+        soc_target without timestep stays at the last connected step."""
+        opt = build_optimization(plant_overrides=HOUSE_AND_EV)
+        res = run(
+            opt,
+            soc_init=[0.5, 0.3],
+            soc_final=[0.5, 0.8],
+            battery_availability=[None, [1] * 8 + [0] * (N - 8)],
+            battery_discharge_availability=[None, 0],
+            soc_target=[None, 0.8],
+        )
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        floor1 = opt.param_soc_target_floor[1].value
+        self.assertEqual(int(np.flatnonzero(floor1)[0]), 7)
+        self.assertGreaterEqual(res["SOC_opt_1"].to_numpy()[7], 0.8 - 1e-4)
+
+    def test_short_list_repeats_its_last_value(self):
+        """Like battery_availability, a short list repeats its last value (with a
+        warning), so a hold for the next steps ends with a 1."""
+        opt = build_optimization(plant_overrides=HOUSE_AND_EV)
+        with self.assertLogs(opt.logger, level="WARNING") as logs:
+            run(opt, battery_discharge_availability=[None, [0, 0, 0]])
+        self.assertTrue(any("battery_discharge_availability" in m for m in logs.output))
+        np.testing.assert_allclose(opt.param_batt_discharge_ceiling[1].value, np.zeros(N))
+        ended = build_optimization(plant_overrides=HOUSE_AND_EV)
+        with self.assertLogs(ended.logger, level="WARNING") as logs:
+            run(ended, battery_discharge_availability=[None, [0, 0, 0] + [1] * (N - 3)])
+            ended.logger.warning("end of run")  # so assertLogs never sees an empty log
+        self.assertFalse(any("battery_discharge_availability" in m for m in logs.output))
+        np.testing.assert_allclose(
+            ended.param_batt_discharge_ceiling[1].value, np.array([0] * 3 + [1] * (N - 3)) * 7000
+        )
+
+    def test_invalid_values_raise(self):
+        for value in ([None, 50], [None, [1] * 6 + [-1] * 6], [None, "closed"], [1, 1, 1]):
+            with self.subTest(value=value):
+                opt = build_optimization(plant_overrides=HOUSE_AND_EV)
+                with self.assertRaises(ValueError):
+                    run(opt, battery_discharge_availability=value)
 
 
 class TestBackwardCompatibility(unittest.TestCase):

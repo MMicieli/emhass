@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import copy
 import json
 import logging
@@ -20,7 +21,7 @@ import numpy as np
 import orjson
 import pandas as pd
 
-from emhass import last_run, plan_store, utils
+from emhass import battery_identification, last_run, plan_store, utils
 from emhass.atomic_file import atomic_write
 from emhass.battery_identification import SCHEMA_VERSION as _BATTERY_ID_SCHEMA_VERSION_V1
 from emhass.battery_identification import BatteryIdentification, apply_staleness_fill
@@ -69,8 +70,13 @@ def _record_optim_snapshot(
     opt_res,
     t0_monotonic: float,
     logger: logging.Logger,
-) -> None:
+    origin: str | None = None,
+) -> str | None:
     """Persist a last_run snapshot after an optim wrapper completes.
+
+    ``origin``: what made the plan, when not this EMHASS's own run (see
+    plan_store.record). Returns the saved plan's stamp (plan_store.stamp),
+    or None when the structured plan was not saved.
 
     A dry run stores nothing: the snapshot it would have stored goes in
     ``input_data_dict["run_record"]``, for the dry-run response.
@@ -94,7 +100,7 @@ def _record_optim_snapshot(
         }
         if is_dry_run(input_data_dict):
             input_data_dict["run_record"] = last_run.snapshot(**run)
-            return
+            return None
         ts = last_run.record(input_data_dict["emhass_conf"]["data_path"], **run)
         # Publish the structured plan ONLY for a successful run (OK_OPTIM_STATUSES), reusing
         # the SAME timestamp last_run stamped so /api/v1/plan's generated_at matches
@@ -105,14 +111,16 @@ def _record_optim_snapshot(
         # last_run.OK_OPTIM_STATUSES reuses last_run's own "ok" criterion, so the
         # two endpoints stay consistent (plan published iff last-run is "ok").
         if optim_status in last_run.OK_OPTIM_STATUSES:
-            plan_store.record(
+            return plan_store.record(
                 input_data_dict["emhass_conf"]["data_path"],
                 plan=plan_store.serialize(opt_res),
                 generated_at=ts,
                 schema_version=EMHASS_SCHEMA_VERSION,
+                origin=origin,
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("last_run: failed to record %s snapshot", action, exc_info=exc)
+    return None
 
 
 def _write_results(input_data_dict: dict, opt_res: pd.DataFrame, filename: str) -> None:
@@ -209,6 +217,19 @@ class PublishContext:
         return self.input_data_dict["fcst"]
 
 
+_TOKENS_SALT = os.urandom(16)  # per process: a digest says nothing of a token
+
+
+def _tokens_digest(tokens) -> str:
+    """A salted digest of a remote-token map (empty for none)."""
+    if not isinstance(tokens, dict) or not tokens:
+        return ""
+    import hashlib
+
+    data = json.dumps(sorted((str(k), str(v)) for k, v in tokens.items())).encode()
+    return hashlib.sha256(_TOKENS_SALT + data).hexdigest()[:16]
+
+
 @dataclass(frozen=True)
 class OptimizationCacheKey:
     """
@@ -241,6 +262,10 @@ class OptimizationCacheKey:
     costfun: str
     plant_conf_hash: str
     optim_conf_structural_hash: str  # Hash of optim_conf keys that affect problem structure
+    # The remote solvers' tokens a coordinator presents, as a salted digest (a
+    # field's value is logged when the cache misses): each token map has its
+    # own optimizer, so no request solves with another's tokens
+    remote_tokens_digest: str = ""
 
 
 class OptimizationCache:
@@ -290,6 +315,45 @@ class OptimizationCache:
             if val is None:
                 return None
             return val.total_seconds() if hasattr(val, "total_seconds") else float(val)
+
+        def groups_key(groups) -> tuple:
+            """deferrable_load_groups as the problem bakes them in (#1366).
+
+            Each group is keyed on its names, mutual exclusion flag, weights and
+            max_power. A scalar or a one-entry list is keyed by value, as before. A
+            list of 2 or more entries is keyed by its length only, since its values
+            go into a Parameter refreshed on every run. Unknown group keys are left
+            out. Never raises: a shape the validation would refuse is keyed by repr.
+            """
+            try:
+                key = []
+                for group in groups or []:
+                    max_power = group.get("max_power")
+                    if isinstance(max_power, list):
+                        max_power = (
+                            ("per_step", len(max_power))
+                            if len(max_power) >= 2
+                            else tuple(max_power)
+                        )
+                    weights = group.get("weights")
+                    if isinstance(weights, dict):
+                        weights = tuple(
+                            sorted(
+                                (name, tuple(sorted(w.items())) if isinstance(w, dict) else w)
+                                for name, w in weights.items()
+                            )
+                        )
+                    key.append(
+                        (
+                            tuple(group.get("names", [])),
+                            max_power,
+                            group.get("mutual_exclusion", False),
+                            weights,
+                        )
+                    )
+                return tuple(key)
+            except (AttributeError, TypeError):
+                return (repr(groups),)
 
         def to_tuple(val) -> tuple:
             """Convert lists/arrays to tuples for hashability."""
@@ -367,6 +431,10 @@ class OptimizationCache:
             "cost_forecast_per_deferrable_load",
             # shared_thermal_tanks has its own structural hash field above
             "shared_thermal_tanks",
+            # deferrable_load_groups has its own explicit field below, which keys a
+            # per-step max_power list on its length only: the values go into a
+            # cp.Parameter refreshed on every run (#1366)
+            "deferrable_load_groups",
             # heat_topology is compiled down to the structural fields which ARE
             # part of the cache key (def_load_config_structure,
             # deferrable_load_groups, shared_thermal_tanks). The raw
@@ -469,10 +537,7 @@ class OptimizationCache:
                 optim_conf.get("nominal_power_of_deferrable_loads", [])
             ),
             def_load_config_structure=tuple(def_structure),
-            deferrable_load_groups=tuple(
-                (tuple(g.get("names", [])), g.get("max_power"), g.get("mutual_exclusion", False))
-                for g in optim_conf.get("deferrable_load_groups", [])
-            ),
+            deferrable_load_groups=groups_key(optim_conf.get("deferrable_load_groups")),
             # shared_thermal_tanks change problem structure (new tank state
             # variable + dynamics constraints), so include a structure hash.
             shared_thermal_tanks=tuple(
@@ -501,6 +566,7 @@ class OptimizationCache:
             costfun=costfun,
             plant_conf_hash=config_hash(plant_conf, plant_hash_skips),
             optim_conf_structural_hash=config_hash(optim_conf, optim_conf_runtime_keys),
+            remote_tokens_digest=_tokens_digest(retrieve_hass_conf.get("remote_tokens")),
         )
 
     @classmethod
@@ -702,6 +768,10 @@ async def _retrieve_from_hass(
         # Lets battery identification hold short silences of its sensors at the
         # last recorded state (#1073); every other set_type is unchanged.
         record_staleness=(set_type == "battery_id"),
+        # On the websocket path, a stretch with no statistics reaches battery
+        # identification as a gap, as on REST, instead of being forward filled
+        # (#1360); every other set_type gets the filled frame.
+        keep_websocket_gaps=(set_type == "battery_id"),
     )
     return success, days_list
 
@@ -1247,7 +1317,7 @@ def _battery_identification_last_attempt(entry) -> dict | None:
     recorded failure - a dict with a truthy ``status`` and a parsable
     ``attempted_at`` - else ``None``.
 
-    Both call sites (the N=1 cache-hit branch and :func:`_battery_fit_is_stale`)
+    The backoff readers (the N=1 cache-hit branch and :func:`_battery_fit_is_stale`)
     fall through to a re-fit when this returns ``None``, so a malformed
     last_attempt (missing, not a dict, no status, unparsable attempted_at -
     e.g. a hand-edited or truncated file) can never become a permanent no-fit
@@ -1265,8 +1335,48 @@ def _battery_identification_last_attempt(entry) -> dict | None:
     return attempt
 
 
+def _battery_id_agreement_hold(entry) -> bool:
+    """
+    True when a retained ok record must not be served because a fit attempt
+    since it was stored was held back by the same-source agreement gate and
+    none has passed since (#1072, #1294).
+
+    The gate holds back a fresh fit above the 0.985 one-way efficiency edge
+    when its cross-check agrees, but a record in that range stored before the
+    gate existed, or fitted from a history too short for the cross-check to
+    run, would otherwise keep being served as the retained record (#1052). So
+    the record is held only when its stored ``eta_charge_symmetric`` is above
+    that same edge and its well-formed ``last_attempt`` carries
+    ``agreement_hold: true`` (the failure recorder keeps the flag through
+    later failures until a fit passes). A record at or below the edge is
+    served as before. A record above the edge is held whatever its own
+    cross-check said: newer data agreeing near the ceiling counts against it.
+
+    No sensor pair is checked here. At N>1 the flag only ever means the
+    record's own pair was held (the failure recorder never records a hold
+    for another pair, it only carries one), and the N>1 publish gate already
+    requires the record's sensors to match the current pair before asking.
+
+    Anything malformed returns False and the record is served as before, so a
+    hand-edited file can never become a silent permanent suppression.
+    """
+    if not isinstance(entry, dict) or entry.get("status") != "ok":
+        return False
+    eta = entry.get("eta_charge_symmetric")
+    edge = battery_identification.SQRT_RTE_HIGH - battery_identification.AGREEMENT_EDGE_MARGIN
+    # bool is an int subclass; NaN and infinity fail the chained comparison.
+    if isinstance(eta, bool) or not isinstance(eta, (int, float)) or not edge < eta < float("inf"):
+        return False
+    attempt = _battery_identification_last_attempt(entry)
+    return attempt is not None and attempt.get("agreement_hold") is True
+
+
 def _record_battery_identification_failed_attempt(
-    existing: dict | None, status: str, messages: list[str], sensors: dict | None = None
+    existing: dict | None,
+    status: str,
+    messages: list[str],
+    sensors: dict | None = None,
+    agreement_hold: bool = False,
 ) -> dict:
     """
     Build the payload/slot to persist for a failed identification attempt.
@@ -1287,6 +1397,19 @@ def _record_battery_identification_failed_attempt(
     sensor_battery_state_of_charge on a cache hit), so recording sensors
     there would be dead data.
 
+    ``agreement_hold`` is the result's flag from the same-source agreement
+    gate. Against a retained ok record the flag means "the record's own
+    sensor pair was held and no fit has passed since":
+    ``"agreement_hold": true`` is recorded in ``last_attempt`` when the gate
+    held this attempt and it was made against the record's own pair (always
+    at N=1, which passes no ``sensors``), or when the previous well-formed
+    last_attempt already carried it, whatever pair this attempt used. A gate
+    hold against another pair is not recorded, so it can never suppress this
+    record after the list is edited back. With no retained ok record the
+    flag is recorded as given. Every other attempt keeps the same keys as
+    before. It is what stops a retained near-ceiling record being served
+    (see :func:`_battery_id_agreement_hold`).
+
     ``existing`` must already be known to be the SAME schema shape this
     caller expects (flat v1 at N=1, a v2 container slot at N>1): this
     function only distinguishes "ok" from "not ok" within that shape, it
@@ -1305,7 +1428,24 @@ def _record_battery_identification_failed_attempt(
         attempt["sensors"] = sensors
     if isinstance(existing, dict) and existing.get("status") == "ok":
         new_payload = dict(existing)
+        # Only a hold of the record's own pair counts. A hold lasts until a fit
+        # passes (a pass replaces the record and its last_attempt), so a later
+        # failure for another reason, or against another pair and back, keeps
+        # it rather than serving the record again.
+        own_pair = sensors is None or (
+            isinstance(sensors, dict)
+            and _battery_id_sensors_match(
+                existing.get("sensors"), sensors.get("power"), sensors.get("soc")
+            )
+        )
+        previous = _battery_identification_last_attempt(existing)
+        if (agreement_hold is True and own_pair) or (
+            previous is not None and previous.get("agreement_hold") is True
+        ):
+            attempt["agreement_hold"] = True
     else:
+        if agreement_hold is True:
+            attempt["agreement_hold"] = True
         new_payload = {"schema_version": _BATTERY_ID_SCHEMA_VERSION_V1}
     new_payload["last_attempt"] = attempt
     return new_payload
@@ -1687,6 +1827,17 @@ async def _identify_battery_impl(
                 )
                 payload = None
             if payload is not None and payload.get("status") == "ok":
+                if _battery_id_agreement_hold(payload):
+                    logger.info(
+                        "Battery identification: stored estimate (one-way efficiency %s) is "
+                        "above %.3f and a later fit was held back by the agreement check "
+                        "with none passing since, so it is not served; keeping configured "
+                        "battery values, backing off until max_age.",
+                        _battery_id_safe_log_value(payload.get("eta_charge_symmetric")),
+                        battery_identification.SQRT_RTE_HIGH
+                        - battery_identification.AGREEMENT_EDGE_MARGIN,
+                    )
+                    return
                 _log_battery_identification_summary(logger, payload, plant_conf)
                 if tier == "suggest":
                     _log_battery_identification_recommendation(logger, payload, plant_conf)
@@ -1814,7 +1965,7 @@ async def _identify_battery_impl(
                 )
                 return
             new_payload = _record_battery_identification_failed_attempt(
-                existing, result.status, result.messages
+                existing, result.status, result.messages, agreement_hold=result.agreement_hold
             )
             _atomic_json_write(json_path, new_payload)
             logger.warning(
@@ -1933,6 +2084,18 @@ async def _identify_battery_impl(
                 and entry.get("status") == "ok"
                 and entry_matches_current_pair
             ):
+                if _battery_id_agreement_hold(entry):
+                    logger.info(
+                        "Battery %d identification: stored estimate (one-way efficiency %s) is "
+                        "above %.3f and a later fit was held back by the agreement check "
+                        "with none passing since, so it is not served; keeping configured "
+                        "battery values, backing off until max_age.",
+                        k,
+                        _battery_id_safe_log_value(entry.get("eta_charge_symmetric")),
+                        battery_identification.SQRT_RTE_HIGH
+                        - battery_identification.AGREEMENT_EDGE_MARGIN,
+                    )
+                    continue
                 _log_battery_identification_summary(logger, entry, plant_conf, k=k)
                 if tier == "suggest":
                     _log_battery_identification_recommendation(logger, entry, plant_conf, k=k)
@@ -2018,7 +2181,11 @@ async def _identify_battery_impl(
                 str(k)
             )
             failed_entry = _record_battery_identification_failed_attempt(
-                prior, result.status, result.messages, sensors={"power": power_col, "soc": soc_col}
+                prior,
+                result.status,
+                result.messages,
+                sensors={"power": power_col, "soc": soc_col},
+                agreement_hold=result.agreement_hold,
             )
             _write_battery_identification_container(json_path, logger, k, failed_entry)
             logger.warning(
@@ -2642,6 +2809,24 @@ async def _set_input_data_dict(
                         },
                         logger,
                     )
+        if opt is not None:
+            # Under _solve_lock, as the cache-hit updates above: a cached
+            # optimizer may be solving for another request.
+            lock = getattr(opt, "_solve_lock", None)
+            with lock if lock is not None else contextlib.nullcontext():
+                # A coordinator backend asks remote solvers to run their part of a
+                # live plan only: a dry run has no effect anywhere
+                opt.fed_dry_run = bool((params.get("passed_data") or {}).get("dry_run", False))
+                # The remote solvers' tokens as configured now: a cached problem keeps
+                # the retrieve_hass_conf it was built with, which a rotated token
+                # leaves stale.
+                if (
+                    "remote_tokens" in retrieve_hass_conf
+                    or "remote_tokens" in opt.retrieve_hass_conf
+                ):
+                    opt.retrieve_hass_conf["remote_tokens"] = dict(
+                        retrieve_hass_conf.get("remote_tokens") or {}
+                    )
     # Create SetupContext
     ctx = SetupContext(
         retrieve_hass_conf=retrieve_hass_conf,
@@ -3182,6 +3367,10 @@ async def naive_mpc_optim(
         "battery_discharge_energy_max", None
     )
     def_availability = input_data_dict["params"]["passed_data"].get("def_availability", None)
+    battery_discharge_availability = input_data_dict["params"]["passed_data"].get(
+        "battery_discharge_availability", None
+    )
+    soc_floor = input_data_dict["params"]["passed_data"].get("soc_floor", None)
     current_period_peak = input_data_dict["params"]["passed_data"].get("current_period_peak", None)
     capacity_charge_window = input_data_dict["params"]["passed_data"].get(
         "capacity_charge_window", None
@@ -3233,6 +3422,8 @@ async def naive_mpc_optim(
                     stage_times=input_data_dict["stage_times"],
                     p_pv_plants=input_data_dict.get("p_pv_plants"),
                     pv_plant_inverters=input_data_dict.get("pv_plant_inverters"),
+                    battery_discharge_availability=battery_discharge_availability,
+                    soc_floor=soc_floor,
                 )
         else:
             opt_res_naive_mpc = opt.perform_naive_mpc_optim(
@@ -3258,6 +3449,8 @@ async def naive_mpc_optim(
                 stage_times=input_data_dict["stage_times"],
                 p_pv_plants=input_data_dict.get("p_pv_plants"),
                 pv_plant_inverters=input_data_dict.get("pv_plant_inverters"),
+                battery_discharge_availability=battery_discharge_availability,
+                soc_floor=soc_floor,
             )
     # Save CSV file for publish_data
     if save_data_to_file:

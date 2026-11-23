@@ -310,7 +310,7 @@ class TestTreatRuntimeparams(unittest.IsolatedAsyncioTestCase):
         expected = {n for n in names if "influx" in n or "victoria" in n}
         expected |= {"use_websocket", "hass_url", "long_lived_token", "ssl_no_verify"}
         expected.discard("use_influxdb")
-        self.assertTrue(expected <= RUNTIME_DENIED_KEYS, expected - RUNTIME_DENIED_KEYS)
+        self.assertLessEqual(expected, RUNTIME_DENIED_KEYS, expected - RUNTIME_DENIED_KEYS)
         self.assertNotIn("use_influxdb", RUNTIME_DENIED_KEYS)
         self.assertGreaterEqual(len(RUNTIME_DENIED_KEYS), 23)
 
@@ -517,22 +517,25 @@ class TestTreatRuntimeparams(unittest.IsolatedAsyncioTestCase):
             ("publish-data", {"custom_pv_forecast_id": {"entity_id": "../events/sensor.x"}}),
             ("publish-data", {"publish_prefix": "/../../events/"}),
         ):
-            with self.subTest(set_type=set_type), self.assertRaises(RuntimeParamError):
-                await command_line.set_input_data_dict(
-                    emhass_conf,
-                    "profit",
-                    self.params_json,
-                    orjson.dumps(runtime).decode("utf-8"),
-                    set_type,
-                    logger,
-                )
+            with self.subTest(set_type=set_type):
+                runtime_json = orjson.dumps(runtime).decode("utf-8")
+                with self.assertRaises(RuntimeParamError):
+                    await command_line.set_input_data_dict(
+                        emhass_conf,
+                        "profit",
+                        self.params_json,
+                        runtime_json,
+                        set_type,
+                        logger,
+                    )
         mock_rh.assert_not_called()
 
     @patch("emhass.command_line.Forecast")
     async def test_weather_forecast_cache_rejects_before_fetching(self, mock_fcst):
+        runtime_json = orjson.dumps({"model_type": "../x"}).decode()
         with self.assertRaises(RuntimeParamError):
             await command_line.weather_forecast_cache(
-                emhass_conf, self.params_json, orjson.dumps({"model_type": "../x"}).decode(), logger
+                emhass_conf, self.params_json, runtime_json, logger
             )
         mock_fcst.assert_not_called()
 
