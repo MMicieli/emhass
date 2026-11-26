@@ -1603,7 +1603,9 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         for key in expected_keys:
             self.assertIn(key, params.keys())
         self.assertEqual(params["retrieve_hass_conf"]["time_zone"], "Europe/Paris")
-        self.assertEqual(params["retrieve_hass_conf"]["hass_url"], "https://myhass.duckdns.org/")
+        self.assertEqual(
+            params["retrieve_hass_conf"]["hass_url"], "https://homeassistant.invalid:8123/"
+        )
         self.assertEqual(params["retrieve_hass_conf"]["long_lived_token"], "thatverylongtokenhere")
         # Test Secrets from options.json
         params = {}
@@ -1619,7 +1621,9 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         for key in expected_keys:
             self.assertIn(key, params.keys())
         self.assertEqual(params["retrieve_hass_conf"]["time_zone"], "Europe/Paris")
-        self.assertEqual(params["retrieve_hass_conf"]["hass_url"], "https://myhass.duckdns.org/")
+        self.assertEqual(
+            params["retrieve_hass_conf"]["hass_url"], "https://homeassistant.invalid:8123/"
+        )
         self.assertEqual(params["retrieve_hass_conf"]["long_lived_token"], "thatverylongtokenhere")
         # Test Secrets from secrets_emhass(example).yaml
         params = {}
@@ -1631,7 +1635,9 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         for key in expected_keys:
             self.assertIn(key, params.keys())
         self.assertEqual(params["retrieve_hass_conf"]["time_zone"], "Europe/Paris")
-        self.assertEqual(params["retrieve_hass_conf"]["hass_url"], "https://myhass.duckdns.org/")
+        self.assertEqual(
+            params["retrieve_hass_conf"]["hass_url"], "https://homeassistant.invalid:8123/"
+        )
         self.assertEqual(params["retrieve_hass_conf"]["long_lived_token"], "thatverylongtokenhere")
         # Test Secrets from arguments (command_line cli)
         params = {}
@@ -1663,6 +1669,15 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(secrets["long_lived_token"], "env.key")
         environ["EMHASS_KEY"] = ""
+        # An empty EMHASS_KEY falls back to the Supervisor token, but only for the
+        # Supervisor URL; for another host the token is dropped, not sent.
+        with self.assertLogs(logger, level="ERROR") as logs:
+            _, secrets = await utils.build_secrets(
+                emhass_conf, logger, secrets_path="", no_response=True
+            )
+        self.assertEqual(secrets["long_lived_token"], "")
+        self.assertTrue(any("Supervisor token" in line for line in logs.output))
+        environ["EMHASS_URL"] = "http://supervisor/core/api"
         _, secrets = await utils.build_secrets(
             emhass_conf, logger, secrets_path="", no_response=True
         )
@@ -1670,6 +1685,9 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
 
     async def test_build_secrets_emhass_key_beats_supervisor(self):
         environ = self.enterContext(patch.dict(os.environ))
+        # With no URL at all the example URL counts as unset and the Supervisor is used
+        # (tests/test_placeholder_hass_url.py), so give EMHASS_KEY a URL here.
+        environ["EMHASS_URL"] = "http://homeassistant.local:8123/"
         environ["EMHASS_KEY"] = "env.key"
         environ["SUPERVISOR_TOKEN"] = "supervisor.token"
         with patch("aiohttp.ClientSession") as session:
@@ -1702,6 +1720,106 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         session.assert_not_called()
         self.assertEqual(secrets["long_lived_token"], "env.key")
         self.assertEqual(secrets["hass_url"], "http://options.local:8123/")
+
+    async def test_build_secrets_participant_tokens_from_options(self):
+        """The add-on's Configuration page: participant_token, and each remote
+        solver's token under its name, from options.json - a name a
+        token_secret may not take is skipped, with nothing of it logged."""
+        options = {
+            "participant_token": "participant-token-0123456789",
+            "remote_solver_tokens": [
+                {"name": "garage_token", "token": "garage-token-0123456789"},
+                {"name": "long_lived_token", "token": "s3cret-not-taken"},
+                {"name": "Bad Name", "token": "s3cret-bad-name"},
+                {"name": "shed_token"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            options_path = pathlib.Path(tmp) / "options.json"
+            options_path.write_text(json.dumps(options))
+            with self.assertLogs(logger, level="WARNING") as logs:
+                _, secrets = await utils.build_secrets(
+                    emhass_conf,
+                    logger,
+                    options_path=str(options_path),
+                    secrets_path="",
+                    no_response=True,
+                )
+        self.assertEqual(secrets["participant_token"], "participant-token-0123456789")
+        self.assertEqual(secrets["garage_token"], "garage-token-0123456789")
+        self.assertNotEqual(secrets.get("long_lived_token"), "s3cret-not-taken")
+        self.assertNotIn("shed_token", secrets)
+        warned = "\n".join(logs.output)
+        self.assertIn("entry 2", warned)
+        self.assertIn("entry 3", warned)
+        self.assertIn("entry 4", warned)
+        self.assertNotIn("s3cret", warned)
+        self.assertNotIn("Bad Name", warned)
+        # the remote's token reaches the coordinator through its token_secret
+        site = [
+            {"id": "grid"},
+            {
+                "id": "garage",
+                "parent": "grid",
+                "solver": {"url": "https://garage.lan/participant", "token_secret": "garage_token"},
+            },
+        ]
+        config = orjson.loads((root / "src/emhass/data/config_defaults.json").read_bytes())
+        config["site"] = site
+        params = await utils.build_params(emhass_conf, secrets, config, logger)
+        self.assertEqual(
+            params["retrieve_hass_conf"]["remote_tokens"],
+            {"garage_token": "garage-token-0123456789"},
+        )
+
+    async def test_an_api_token_in_options_is_never_sent_as_a_remotes_token(self):
+        """The command line does not load api_auth: an emhass_api_token set
+        only in options.json is still never sent as a remote's token, and is
+        kept out of the secrets."""
+        self.enterContext(patch.object(utils, "_own_api_tokens", set()))
+        self.enterContext(patch("emhass.api_auth.current_token", return_value=None))
+        options = {
+            "emhass_api_token": "the-api-token-0123456789",
+            "remote_solver_tokens": [{"name": "garage_token", "token": "the-api-token-0123456789"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            options_path = pathlib.Path(tmp) / "options.json"
+            options_path.write_text(json.dumps(options))
+            _, secrets = await utils.build_secrets(
+                emhass_conf,
+                logger,
+                options_path=str(options_path),
+                secrets_path="",
+                no_response=True,
+            )
+        self.assertNotIn("emhass_api_token", secrets)
+        site = [
+            {"id": "grid"},
+            {
+                "id": "garage",
+                "parent": "grid",
+                "solver": {"url": "https://garage.lan/participant", "token_secret": "garage_token"},
+            },
+        ]
+        config = orjson.loads((root / "src/emhass/data/config_defaults.json").read_bytes())
+        config["site"] = site
+        params = await utils.build_params(emhass_conf, secrets, config, logger)
+        self.assertNotIn("remote_tokens", params["retrieve_hass_conf"])
+
+    async def test_build_secrets_without_participant_options_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            options_path = pathlib.Path(tmp) / "options.json"
+            options_path.write_text(json.dumps({"remote_solver_tokens": "not a list"}))
+            with self.assertLogs(logger, level="WARNING") as logs:
+                _, secrets = await utils.build_secrets(
+                    emhass_conf,
+                    logger,
+                    options_path=str(options_path),
+                    secrets_path="",
+                    no_response=True,
+                )
+        self.assertNotIn("participant_token", secrets)
+        self.assertIn("not a list", "\n".join(logs.output))
 
     def test_get_injection_dict_with_thermal(self):
         # Add thermal columns to dummy df
@@ -2146,6 +2264,8 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         ts_list = [ts.isoformat() for ts in idx]
 
         class _FakeResp:
+            status = 200
+
             def __init__(self, payload):
                 self._payload = payload
 
@@ -2309,6 +2429,74 @@ class TestUtils(unittest.IsolatedAsyncioTestCase):
         # Verify use_influxdb was forced False on the RetrieveHass fallback params
         passed_params = rh_cls.call_args[0][4]
         self.assertFalse(passed_params["retrieve_hass_conf"]["use_influxdb"])
+
+    async def test_thermal_influx_reader_refuses_a_redirect(self):
+        # Two loopback servers: the configured one redirects to the other
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        import aiohttp
+
+        reached = []
+
+        class Target(BaseHTTPRequestHandler):
+            def do_GET(self):
+                reached.append(self.headers.get("Authorization"))
+                body = b'{"results": [{}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        target = HTTPServer(("127.0.0.1", 0), Target)
+
+        class Redirector(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(307)
+                self.send_header("Location", f"http://127.0.0.1:{target.server_port}/query")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        redirector = HTTPServer(("127.0.0.1", 0), Redirector)
+        for server in (target, redirector):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+        idx = pd.date_range("2026-11-19 00:00", periods=4, freq="30min", tz="UTC")
+        rh_conf = {
+            "influxdb_host": "127.0.0.1",
+            "influxdb_port": redirector.server_port,
+            "influxdb_username": "user",
+            "influxdb_password": "password",  # pragma: allowlist secret
+        }
+        with (
+            patch.dict(os.environ),
+            self.assertRaises(aiohttp.ClientResponseError) as caught,
+        ):
+            os.environ.pop("INFLUXDB_USERNAME", None)
+            os.environ.pop("INFLUXDB_PASSWORD", None)
+            await utils._fetch_influx_thermal_window(
+                rh_conf,
+                "sensor.t_in",
+                "sensor.t_out",
+                "",
+                "",
+                "",
+                idx[0],
+                idx[-1],
+                30,
+                1000.0,
+                logger,
+            )
+        self.assertEqual(caught.exception.status, 307)
+        self.assertEqual(reached, [])
 
     def test_ui_charts_edge_cases_and_quantile_variants(self):
         idx = pd.date_range("2026-11-19 00:00", periods=6, freq="30min", tz="UTC")
