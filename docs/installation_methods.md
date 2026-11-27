@@ -25,7 +25,7 @@ To install first pull the latest image:
 # pull Docker image
 docker pull ghcr.io/davidusb-geek/emhass:latest
 # run Docker image, mounting the dir storing config.json and secrets_emhass.yaml from host
-docker run --rm -it --restart always  -p 5000:5000 --name emhass-container -v /emhass/share:/share/ -v /emhass/data:/data -v /emhass/secrets_emhass.yaml:/app/secrets_emhass.yaml ghcr.io/davidusb-geek/emhass:latest
+docker run -it --restart always  -p 5000:5000 --name emhass-container -v /emhass/share:/share/ -v /emhass/data:/data -v /emhass/secrets_emhass.yaml:/app/secrets_emhass.yaml ghcr.io/davidusb-geek/emhass:latest
 ```
 
 ```{important}
@@ -56,14 +56,14 @@ Before running the docker container, make sure you have a designated folder for 
 mkdir ~/emhass
 cd ~/emhass 
 cat <<EOT >> ~/emhass/secrets_emhass.yaml
-hass_url: https://myhass.duckdns.org/
+hass_url: https://homeassistant.invalid:8123/
 long_lived_token: thatverylongtokenhere
 time_zone: Europe/Paris
 lat: 45.83
 lon: 6.86
 alt: 4807.8
 EOT
-docker run --rm -it --restart always  -p 5000:5000 --name emhass-container -v /emhass/share:/share -v /emhass/data:/data -v /emhass/secrets_emhass.yaml:/app/secrets_emhass.yaml ghcr.io/davidusb-geek/emhass:latest
+docker run -it --restart always  -p 5000:5000 --name emhass-container -v /emhass/share:/share -v /emhass/data:/data -v /emhass/secrets_emhass.yaml:/app/secrets_emhass.yaml ghcr.io/davidusb-geek/emhass:latest
 ```
 
 ### Docker, things to note 
@@ -81,6 +81,8 @@ docker run --rm -it --restart always  -p 5000:5000 --name emhass-container -v /e
   ```bash
   docker run -it --restart always -p 5000:5000  -e TZ="Europe/Paris" -v /emhass/share:/share -v /emhass/data:/data -v /emhass/secrets_emhass.yaml:/app/secrets_emhass.yaml --name DockerEMHASS <REPOSITORY:TAG>
   ```  
+
+- Inside the container the web server listens on the address in the `IP` environment variable (default `0.0.0.0`, all interfaces) and the port in `PORT` (default `5000`). `server_ip` in `secrets_emhass.yaml` does not change it: it is used only when `web_server.py` is run directly. To choose which host address the port is reachable on, use Docker's port mapping, for example `-p 192.0.2.10:5000:5000`.
 
 ## Method 3) Legacy method using a Python virtual environment *(Legacy CLI)*
 
