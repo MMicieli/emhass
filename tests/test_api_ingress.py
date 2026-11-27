@@ -400,6 +400,7 @@ class TestServerConfigurationIsPinned(AuthSupportBase):
         self.assertEqual(cfg.forwarded_allow_ips, [])
         # uvicorn.workers.UvicornWorker passes exactly this to uvicorn.Config
         loaded = Config(web_server.app, forwarded_allow_ips=cfg.forwarded_allow_ips)
+        self.assertEqual(loaded.forwarded_allow_ips, [])  # no default put in its place
         loaded.load()
         self.assertIsInstance(loaded.loaded_app, ProxyHeadersMiddleware)
         # Assert behaviour, not the middleware's internals, which differ between uvicorn releases:
