@@ -1523,10 +1523,13 @@ class TestNoRestartByRequestCount(unittest.TestCase):
 
     def test_the_uvicorn_worker_gets_a_limit_it_never_reaches(self):
         try:  # gunicorn cannot be imported on Windows
+            from gunicorn.arbiter import Arbiter  # noqa: F401
             from gunicorn.config import Config
-            from uvicorn.workers import UvicornWorker
         except ImportError as exc:
             self.skipTest(f"gunicorn is not importable here: {exc}")
+        # not part of the skip: the container starts with this worker class
+        from uvicorn.workers import UvicornWorker
+
         with patch.dict(os.environ):
             os.environ.pop("MAX_REQUESTS", None)
             conf = runpy.run_path(str(GUNICORN_CONF))

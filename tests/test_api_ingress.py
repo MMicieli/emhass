@@ -5,6 +5,7 @@ They do not run Home Assistant: see docs/api_authentication.md for what is and i
 a real Supervisor.
 """
 
+import asyncio
 import os
 import pathlib
 import runpy
@@ -399,10 +400,25 @@ class TestServerConfigurationIsPinned(AuthSupportBase):
         self.assertEqual(cfg.forwarded_allow_ips, [])
         # uvicorn.workers.UvicornWorker passes exactly this to uvicorn.Config
         loaded = Config(web_server.app, forwarded_allow_ips=cfg.forwarded_allow_ips)
+        self.assertEqual(loaded.forwarded_allow_ips, [])  # no default put in its place
         loaded.load()
         self.assertIsInstance(loaded.loaded_app, ProxyHeadersMiddleware)
-        self.assertEqual(loaded.loaded_app.trusted_hosts, set())
-        self.assertFalse(loaded.loaded_app.always_trust)
+        # Assert behaviour, not the middleware's internals, which differ between uvicorn releases:
+        # a peer that sends forwarded headers stays the peer, loopback and Supervisor included.
+        seen = {}
+
+        async def app(scope, receive, send):
+            seen.update(scope)
+
+        loaded.loaded_app.app = app
+        headers = [(b"x-forwarded-for", b"203.0.113.9"), (b"x-forwarded-proto", b"https")]
+        for peer in ("127.0.0.1", "::1", "172.30.32.2"):
+            with self.subTest(peer=peer):
+                seen.clear()
+                scope = {"type": "http", "scheme": "http", "client": (peer, 50000)}
+                asyncio.run(loaded.loaded_app(scope | {"headers": headers}, None, None))
+                self.assertEqual(seen["client"], (peer, 50000))
+                self.assertEqual(seen["scheme"], "http")
 
 
 class TestIngressRelativeUrls(AuthSupportBase):
